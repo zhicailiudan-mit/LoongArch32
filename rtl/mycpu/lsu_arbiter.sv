@@ -12,6 +12,7 @@ module LsuArbiter (
     input uop_id_t recover_id,
     input logic load_valid, input lsu_entry_t load_entry,
     input logic load_blocked,
+    input logic load_memory_allowed,
     input logic load_forward_valid,
     input logic [31:0] load_forward_rdata,
     output logic load_issue, output logic load_pop,
@@ -58,10 +59,10 @@ module LsuArbiter (
 
     always_comb begin
         load_forward_fire = !flush && (state == IDLE) && !pending_valid &&
-                            load_valid && load_forward_valid;
+                            load_valid && load_forward_valid && load_memory_allowed;
         load_fire = !flush && (state == IDLE) && !pending_valid && load_valid &&
                     !load_forward_valid &&
-                    !load_blocked && dcache_rsp.rready;
+                    !load_blocked && dcache_rsp.rready && load_memory_allowed;
         store_fire = !flush && (state == IDLE) && !pending_valid &&
                      !load_fire && !load_forward_fire &&
                      store_valid && dcache_rsp.wready;
@@ -87,8 +88,8 @@ module LsuArbiter (
 
         perf_dcache_wait = (state == WAIT_LOAD) || (state == WAIT_STORE);
         perf_dcache_backpressure = (state == IDLE) && !pending_valid &&
-            ((!load_forward_valid && !load_blocked && load_valid && !dcache_rsp.rready) ||
-             ((!load_valid || (load_blocked && !load_forward_valid)) &&
+            ((!load_forward_valid && !load_blocked && load_valid && load_memory_allowed && !dcache_rsp.rready) ||
+             ((!load_valid || (load_blocked && !load_forward_valid) || !load_memory_allowed) &&
               store_valid && !dcache_rsp.wready));
 
         load_issue = load_fire || load_forward_fire;

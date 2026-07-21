@@ -46,7 +46,10 @@ module OooBackend (
     output logic                         perf_rob_block,
     output logic                         perf_issue_queue_block,
     output logic                         perf_source_wait,
-    output logic                         perf_serializing_block
+    output logic                         perf_serializing_block,
+
+    output logic                         rob_head_valid,
+    output uop_id_t                      rob_head_id
 );
 
     wire decoded_uop_t decode_uop [0:1];
@@ -58,9 +61,7 @@ module OooBackend (
     wire [`ROB_DEPTH-1:0] rob_live_mask;
     wire [`ROB_TAG_W:0] rob_occupancy;
     wire [2:0] scheduler_occupancy;
-    wire rob_head_valid;
     wire [`ROB_TAG_W-1:0] rob_head_tag;
-    wire uop_id_t rob_head_id;
     wire uop_id_t rob_query_id [0:3];
     wire rob_query_done [0:3];
     wire [31:0] rob_query_value [0:3];

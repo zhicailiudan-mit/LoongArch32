@@ -392,12 +392,8 @@ module DispatchQueue #(
             // speculative, but the read itself must not leave the scheduler
             // until the complete uop identity is at the ROB head.  RAM loads
             // retain normal out-of-order issue.
-            wire [31:0] slot_eff_addr =
-                (alua_sel[q] ? rD1[q] : pc[q]) +
-                (alub_sel[q] ? rD2[q] : ext[q]);
-            wire slot_mmio_load = is_ld_st[q] &&
-                                  (ram_we[q] == `RAM_WE_N) &&
-                                  (slot_eff_addr[31:16] == 16'h1f00);
+            // Address generation is moved out to avoid long combinational path.
+            // RAM loads retain normal out-of-order issue.
             // Wakeup is captured into src*_ready/rD* at the clock edge.
             // Selection and issue use registered readiness only, so a result
             // arriving this cycle cannot traverse compare -> oldest select ->
@@ -417,9 +413,6 @@ module DispatchQueue #(
                                      (rob_head_valid &&
                                       uop_id_equal(uop_id[q], rob_head_id))) &&
                                     (!is_br_jmp[q] || !older_branch_pending[q]) &&
-                                    (!slot_mmio_load ||
-                                    (rob_head_valid &&
-                                     uop_id_equal(uop_id[q], rob_head_id))) &&
                                    (!BRANCH_AT_ROB_HEAD || !is_br_jmp[q] ||
                                     (rob_head_valid &&
                                      uop_id_equal(uop_id[q], rob_head_id)));

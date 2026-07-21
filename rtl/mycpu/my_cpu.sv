@@ -269,6 +269,9 @@ module MyCpu (
         .pipeline_flush       (branch_pipeline_flush)
     );
 
+    wire rob_head_valid;
+    uop_id_t rob_head_id;
+
     LoadStoreUnit u_load_store_unit (
         .cpu_rstn       (cpu_rstn),
         .cpu_clk        (cpu_clk),
@@ -277,6 +280,8 @@ module MyCpu (
         .recover_valid  (recover_valid),
         .system_flush   (recovery_event.system_flush),
         .recover_id     (recover_id),
+        .rob_head_valid (rob_head_valid),
+        .rob_head_id    (rob_head_id),
         .execute_result (execute_result),
         .execute_result1(execute_result1),
         .commit0        (commit0),
@@ -357,7 +362,9 @@ module MyCpu (
         .perf_rob_block      (perf_rob_block),
         .perf_issue_queue_block(perf_issue_queue_block),
         .perf_source_wait    (perf_source_wait),
-        .perf_serializing_block(perf_serializing_block)
+        .perf_serializing_block(perf_serializing_block),
+        .rob_head_valid      (rob_head_valid),
+        .rob_head_id         (rob_head_id)
     );
 
     AddressTranslate u_ifetch_translate (

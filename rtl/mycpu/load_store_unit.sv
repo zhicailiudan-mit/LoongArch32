@@ -16,6 +16,8 @@ module LoadStoreUnit (
     input logic recover_valid,
     input logic system_flush,
     input uop_id_t recover_id,
+    input logic rob_head_valid,
+    input uop_id_t rob_head_id,
     input execute_result_t execute_result,
     input execute_result_t execute_result1,
     input commit_t commit0, input commit_t commit1,
@@ -528,6 +530,10 @@ module LoadStoreUnit (
         end
     end
 
+    wire load_is_mmio = load_l1_entry.address[31:16] == 16'h1f00;
+    wire load_at_rob_head = rob_head_valid && uop_id_equal(load_l1_entry.uop_id, rob_head_id);
+    wire load_memory_allowed = !load_is_mmio || load_at_rob_head;
+
     LsuArbiter u_lsu_arbiter (
         .clk(cpu_clk), .rstn(cpu_rstn),
         .flush(flush),
@@ -536,6 +542,7 @@ module LoadStoreUnit (
         .recover_id(recover_id),
         .load_valid(load_l1_valid), .load_entry(load_l1_entry),
         .load_blocked(load_l1_blocked),
+        .load_memory_allowed(load_memory_allowed),
         .load_forward_valid(load_l1_forward_valid),
         .load_forward_rdata(load_l1_forward_data), .load_issue(load_issue),
         .load_pop(load_pop),
@@ -611,6 +618,47 @@ module LoadStoreUnit (
             $error("flushed LSU operation generated a main completion");
         if (cpu_rstn && flush && direct1_completion.valid)
             $error("flushed LSU operation generated a lane1 completion");
+    end
+`endif
+`ifndef SYNTHESIS
+    // Phase 2B: MMIO Assertions
+    always @(posedge cpu_clk) begin
+        if (cpu_rstn && !flush && !system_flush) begin
+            // 1. MMIO读请求只能来自ROB head
+            if (dcache_req.ren != 0 && load_l1_valid && load_l1_entry.address[31:16] == 16'h1f00) begin
+                if (!rob_head_valid || !uop_id_equal(load_l1_entry.uop_id, rob_head_id)) begin
+                    $fatal(1, "MMIO read request issued but not at ROB head!");
+                end
+            end
+
+            // 2. MMIO Load未到ROB head时不得pop, 不得issue, 不得生成completion
+            if (load_l1_valid && load_l1_entry.address[31:16] == 16'h1f00) begin
+                if (!rob_head_valid || !uop_id_equal(load_l1_entry.uop_id, rob_head_id)) begin
+                    if (load_issue) $fatal(1, "MMIO load issued before ROB head!");
+                    if (load_pop) $fatal(1, "MMIO load popped before ROB head!");
+                    if (main_completion.valid && uop_id_equal(main_completion.uop_id, load_l1_entry.uop_id)) begin
+                        $fatal(1, "MMIO load completed before ROB head!");
+                    end
+                end
+            end
+
+            // 3. 普通Cache Load不得因为不在ROB head而被阻塞
+            // This is verified by checking load_memory_allowed is always 1 for normal loads.
+            if (load_l1_valid && load_l1_entry.address[31:16] != 16'h1f00) begin
+                if (load_memory_allowed !== 1'b1) begin
+                    $fatal(1, "Normal load blocked by ROB head condition!");
+                end
+            end
+            
+            // 5. ROB tag相同但epoch不同不得被判定为head
+            if (load_l1_valid && load_l1_entry.address[31:16] == 16'h1f00 && rob_head_valid) begin
+                if (load_l1_entry.uop_id.rob_tag == rob_head_id.rob_tag && load_l1_entry.uop_id.epoch != rob_head_id.epoch) begin
+                    if (load_at_rob_head) begin
+                        $fatal(1, "MMIO load falsely matched ROB head with wrong epoch!");
+                    end
+                end
+            end
+        end
     end
 `endif
 
