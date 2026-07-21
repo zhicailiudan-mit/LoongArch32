@@ -34,19 +34,7 @@ THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 `include "mycpu_inst.vh"
 `include "defines.vh"
-
-// 修改 SRAM 初始化文件路径
-// Keep the image overridable from the simulator command line.  The previous
-// absolute path pointed at an obsolete checkout and silently loaded an older
-// instruction stream (for example DIV.W instead of MUL.W at 0x1c02bd58).
-`ifndef SRAM_INIT_FILE
-`define SRAM_INIT_FILE        "C:/Users/wanlinc/Desktop/Me/Loogn cpu v1/func_test/func/obj/inst_ram.mif"
-`endif
-
-// 修改 Trace 文件路径（注意末尾的反斜杠）
-`define TRACE_REF_FILE        "C:/Users/wanlinc/Desktop/Me/Loogn cpu v1/func_test/gettrace/golden_trace.txt"
-`define TRACE_REF_WDATA_FILE  "C:/Users/wanlinc/Desktop/Me/Loogn cpu v1/func_test/gettrace/golden_trace_wdata.txt"
-`define TRACE_REF_BJ_FILE     "C:/Users/wanlinc/Desktop/Me/Loogn cpu v1/func_test/gettrace/golden_trace_bj.txt"
+`include "C:/Users/wanlinc/Desktop/Me/Loogn cpu v1/func_test/soc_verify/test_profile.vh"
 `define CONFREG_NUM_REG      soc_lite.u_confreg.num_data
 `define CONFREG_OPEN_TRACE   soc_lite.u_confreg.open_trace
 `define CONFREG_NUM_MONITOR  soc_lite.u_confreg.num_monitor
@@ -445,12 +433,12 @@ module tb_top( );
 
      // Branches and jumps are restricted to the main issue port, so this is
      // the new-architecture equivalent of the old single ID-stage monitor.
-     wire     id_valid = soc_lite.u_cpu.u_mycpu.main_issue_fire;
-     wire     id_is_b  = soc_lite.u_cpu.u_mycpu.main_issue.is_br_jmp &&
-                         (soc_lite.u_cpu.u_mycpu.main_issue.npc_op == `NPC_ALU);
-     wire     id_is_j  = soc_lite.u_cpu.u_mycpu.main_issue.is_br_jmp &&
-                         (soc_lite.u_cpu.u_mycpu.main_issue.npc_op != `NPC_ALU);
-     wire [31:0] id_pc = soc_lite.u_cpu.u_mycpu.main_issue.pc;
+     wire     id_valid = soc_lite.u_cpu.u_mycpu.issue0_fire;
+     wire     id_is_b  = soc_lite.u_cpu.u_mycpu.issue0.is_br_jmp &&
+                         (soc_lite.u_cpu.u_mycpu.issue0.npc_op == `NPC_ALU);
+     wire     id_is_j  = soc_lite.u_cpu.u_mycpu.issue0.is_br_jmp &&
+                         (soc_lite.u_cpu.u_mycpu.issue0.npc_op != `NPC_ALU);
+     wire [31:0] id_pc = soc_lite.u_cpu.u_mycpu.issue0.pc;
      integer bpu_track;
      initial bpu_track = $fopen("bpu_track.txt", "w");
      always @(posedge soc_clk) begin

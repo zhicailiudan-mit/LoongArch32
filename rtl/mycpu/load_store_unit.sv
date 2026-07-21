@@ -150,6 +150,34 @@ module LoadStoreUnit (
         end
     endfunction
 
+    typedef struct packed {
+        logic valid;
+        uop_id_t uop_id;
+        logic [7:0] data;
+    } forward_candidate_t;
+
+    function automatic forward_candidate_t select_younger(
+        input forward_candidate_t a,
+        input forward_candidate_t b
+    );
+        begin
+            if (!a.valid)
+                select_younger = b;
+            else if (!b.valid)
+                select_younger = a;
+            else if (uop_is_younger(b.uop_id, a.uop_id))
+                select_younger = b;
+            else
+                select_younger = a;
+        end
+    endfunction
+
+    forward_candidate_t fwd_cand [0:3][0:15];
+    forward_candidate_t tree_stg1 [0:3][0:7];
+    forward_candidate_t tree_stg2 [0:3][0:3];
+    forward_candidate_t tree_stg3 [0:3][0:1];
+    forward_candidate_t tree_winner [0:3];
+
     always_comb begin
         load0_raw = execute_result.valid && execute_result.is_ld_st &&
                     !execute_result.ldst_unalign &&
@@ -299,25 +327,91 @@ module LoadStoreUnit (
         load_forward_mask = 4'b0;
         load_forward_data = 32'b0;
         load_forward_id_flat = '0;
-        for (order_i = 0; order_i < 2*QDEPTH+1; order_i = order_i + 1) begin
-            if (order_valid[order_i] &&
-                ((order_addr_flat[order_i*32 +: 32] & 32'hffff_fffc) ==
-                 (load_head.address & 32'hffff_fffc))) begin
+
+        for (order_byte = 0; order_byte < 4; order_byte = order_byte + 1) begin
+            for (order_i = 0; order_i < 16; order_i = order_i + 1) begin
+                if (order_i < 2*QDEPTH+1) begin
+                    fwd_cand[order_byte][order_i].valid = order_valid[order_i] &&
+                        ((order_addr_flat[order_i*32 +: 32] & 32'hffff_fffc) == (load_head.address & 32'hffff_fffc)) &&
+                        order_wen_flat[order_i*4 + order_byte];
+                    fwd_cand[order_byte][order_i].uop_id = order_byte_uop_id_flat[(order_i*4 + order_byte)*`UOP_ID_W +: `UOP_ID_W];
+                    fwd_cand[order_byte][order_i].data = order_data_flat[order_i*32 + order_byte*8 +: 8];
+                end else begin
+                    fwd_cand[order_byte][order_i].valid = 1'b0;
+                    fwd_cand[order_byte][order_i].uop_id = '0;
+                    fwd_cand[order_byte][order_i].data = 8'h0;
+                end
+            end
+            
+            // Stage 1 (16 to 8)
+            for (order_i = 0; order_i < 8; order_i = order_i + 1) begin
+                tree_stg1[order_byte][order_i] = select_younger(fwd_cand[order_byte][order_i*2], fwd_cand[order_byte][order_i*2+1]);
+            end
+            // Stage 2 (8 to 4)
+            for (order_i = 0; order_i < 4; order_i = order_i + 1) begin
+                tree_stg2[order_byte][order_i] = select_younger(tree_stg1[order_byte][order_i*2], tree_stg1[order_byte][order_i*2+1]);
+            end
+            // Stage 3 (4 to 2)
+            for (order_i = 0; order_i < 2; order_i = order_i + 1) begin
+                tree_stg3[order_byte][order_i] = select_younger(tree_stg2[order_byte][order_i*2], tree_stg2[order_byte][order_i*2+1]);
+            end
+            // Stage 4 (2 to 1)
+            tree_winner[order_byte] = select_younger(tree_stg3[order_byte][0], tree_stg3[order_byte][1]);
+            
+            load_forward_mask[order_byte] = tree_winner[order_byte].valid;
+            load_forward_data[order_byte*8 +: 8] = tree_winner[order_byte].data;
+            load_forward_id_flat[order_byte*`UOP_ID_W +: `UOP_ID_W] = tree_winner[order_byte].uop_id;
+        end
+
+`ifndef SYNTHESIS
+        begin : ref_model
+            logic [3:0] ref_forward_mask;
+            logic [31:0] ref_forward_data;
+            logic [4*`UOP_ID_W-1:0] ref_forward_id_flat;
+            ref_forward_mask = 4'b0;
+            ref_forward_data = 32'b0;
+            ref_forward_id_flat = '0;
+            
+            for (order_i = 0; order_i < 2*QDEPTH+1; order_i = order_i + 1) begin
+                if (order_valid[order_i] &&
+                    ((order_addr_flat[order_i*32 +: 32] & 32'hffff_fffc) ==
+                     (load_head.address & 32'hffff_fffc))) begin
+                    for (order_byte = 0; order_byte < 4; order_byte = order_byte + 1) begin
+                        if (order_wen_flat[order_i*4 + order_byte] &&
+                            (!ref_forward_mask[order_byte] ||
+                             uop_is_younger(
+                               order_byte_uop_id_flat[(order_i*4 + order_byte)*`UOP_ID_W +: `UOP_ID_W],
+                               ref_forward_id_flat[order_byte*`UOP_ID_W +: `UOP_ID_W]))) begin
+                            ref_forward_mask[order_byte] = 1'b1;
+                            ref_forward_data[order_byte*8 +: 8] =
+                                order_data_flat[order_i*32 + order_byte*8 +: 8];
+                            ref_forward_id_flat[order_byte*`UOP_ID_W +: `UOP_ID_W] =
+                                order_byte_uop_id_flat[(order_i*4 + order_byte)*`UOP_ID_W +: `UOP_ID_W];
+                        end
+                    end
+                end
+            end
+            
+            if (load_head_valid && load_ren != 0) begin
                 for (order_byte = 0; order_byte < 4; order_byte = order_byte + 1) begin
-                    if (order_wen_flat[order_i*4 + order_byte] &&
-                        (!load_forward_mask[order_byte] ||
-                         uop_is_younger(
-                           order_byte_uop_id_flat[(order_i*4 + order_byte)*`UOP_ID_W +: `UOP_ID_W],
-                           load_forward_id_flat[order_byte*`UOP_ID_W +: `UOP_ID_W]))) begin
-                        load_forward_mask[order_byte] = 1'b1;
-                        load_forward_data[order_byte*8 +: 8] =
-                            order_data_flat[order_i*32 + order_byte*8 +: 8];
-                        load_forward_id_flat[order_byte*`UOP_ID_W +: `UOP_ID_W] =
-                            order_byte_uop_id_flat[(order_i*4 + order_byte)*`UOP_ID_W +: `UOP_ID_W];
+                    if (load_ren[order_byte]) begin
+                        if (load_forward_mask[order_byte] !== ref_forward_mask[order_byte]) begin
+                            $fatal(1, "Store-to-Load Forwarding valid mismatch on byte %0d! PC=%x, tree=%b, ref=%b", order_byte, load_head.pc, load_forward_mask[order_byte], ref_forward_mask[order_byte]);
+                        end
+                        if (load_forward_mask[order_byte]) begin
+                            if (load_forward_data[order_byte*8 +: 8] !== ref_forward_data[order_byte*8 +: 8]) begin
+                                $fatal(1, "Store-to-Load Forwarding data mismatch on byte %0d! PC=%x, tree=%x, ref=%x", order_byte, load_head.pc, load_forward_data[order_byte*8 +: 8], ref_forward_data[order_byte*8 +: 8]);
+                            end
+                            if (load_forward_id_flat[order_byte*`UOP_ID_W +: `UOP_ID_W] !== ref_forward_id_flat[order_byte*`UOP_ID_W +: `UOP_ID_W]) begin
+                                $fatal(1, "Store-to-Load Forwarding ID mismatch on byte %0d! PC=%x, tree=%x, ref=%x", order_byte, load_head.pc, load_forward_id_flat[order_byte*`UOP_ID_W +: `UOP_ID_W], ref_forward_id_flat[order_byte*`UOP_ID_W +: `UOP_ID_W]);
+                            end
+                        end
                     end
                 end
             end
         end
+`endif
+
         load_forward_valid = load_head_valid &&
                              ((load_forward_mask & load_ren) == load_ren);
 
