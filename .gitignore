@@ -1,0 +1,24 @@
+# Vivado Project Gitignore
+
+# Logs
+*.jou
+*.log
+*.str
+
+# Backup and temp files
+*.backup.*
+*~
+*.dmp
+*.temp
+
+# Cache and build outputs
+.Xil/
+*.cache/
+*.hw/
+*.ip_user_files/
+*.runs/
+*.sim/
+
+# OS files
+.DS_Store
+Thumbs.db

@@ -1,0 +1,1 @@
+xsim {tb_dispatch_queue4_sim} -testplusarg SEED=1 -testplusarg CYCLES=1000 -testplusarg TEST=all -testplusarg MIN_COVERAGE=0 -testplusarg STOP_ON_ERROR=0 -testplusarg STRICT_AMBIGUITY=0 -testplusarg STAGE=3 -autoloadwcfg -runall
