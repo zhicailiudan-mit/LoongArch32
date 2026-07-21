@@ -13,6 +13,7 @@ module RegAliasTable (
     input  wire [`UOP_EPOCH_W-1:0] alloc_epoch,
     input  wire                  alloc_checkpoint,
     input  wire                  alloc1_valid,
+
     input  wire                  alloc1_rf_we,
     input  wire [4:0]            alloc1_rd,
     input  wire [`ROB_TAG_W-1:0] alloc1_tag,
@@ -20,6 +21,7 @@ module RegAliasTable (
     input  wire                  alloc1_checkpoint,
 
     input  wire                  recover_valid,
+    input  wire                  system_flush,
     input  wire [`ROB_TAG_W-1:0] recover_tag,
     input  wire [`UOP_EPOCH_W-1:0] recover_epoch,
     input  wire [`ROB_DEPTH-1:0] rob_live_mask,
@@ -115,27 +117,38 @@ module RegAliasTable (
                 cp_slot_valid[i]  <= 1'b0;
             end
         end else if (recover_valid) begin
-            // Restore from the snapshot taken at dispatch.
-            is_valid_cp = cp_slot_valid[recover_tag] && (cp_slot_epoch[recover_tag] == recover_epoch);
-            `ifndef SYNTHESIS
-            if (recover_valid && !is_valid_cp) begin
-                // Missing checkpoint. Safe to clear RAT for exception flush.
-            end
-            `endif
-            for (r = 1; r < 32; r = r + 1) begin
-                cp_val = cp_map_valid[recover_tag][r];
-                cp_ep  = cp_map_epoch[recover_tag][r];
-                cp_tg  = cp_map_tag[recover_tag][r];
-                
-                producer_is_committing = (commit_valid && (commit_tag == cp_tg) && (commit_epoch == cp_ep)) ||
-                                         (commit1_valid && (commit1_tag == cp_tg) && (commit1_epoch == cp_ep));
-                                         
-                producer_is_alive = rob_live_mask[cp_tg] && owner_has_dest[cp_tg] && 
-                                    (owner_rd[cp_tg] == r[4:0]) && (owner_epoch[cp_tg] == cp_ep);
-                
-                map_valid[r] <= is_valid_cp && cp_val && producer_is_alive && !producer_is_committing;
-                map_tag[r]   <= cp_tg;
-                map_epoch[r] <= cp_ep;
+            if (system_flush) begin
+                map_valid <= 32'h0;
+                for (i = 0; i < `ROB_DEPTH; i = i + 1) begin
+                    cp_slot_valid[i] <= 1'b0;
+                end
+            end else begin
+                // Restore from the snapshot taken at dispatch.
+                is_valid_cp = cp_slot_valid[recover_tag] && (cp_slot_epoch[recover_tag] == recover_epoch);
+                `ifndef SYNTHESIS
+                if (recover_valid && !is_valid_cp) begin
+                    $fatal(1, "RAT Checkpoint missing for recover_tag=%0d, recover_epoch=%0d, system_flush=%b, cp_slot_valid=%b, cp_slot_epoch=%0d, rob_live_mask=%b", recover_tag, recover_epoch, system_flush, cp_slot_valid[recover_tag], cp_slot_epoch[recover_tag], rob_live_mask);
+                end
+                `endif
+                if (!is_valid_cp) begin
+                    map_valid <= 32'h0; // Fallback for synthesis
+                end else begin
+                    for (r = 1; r < 32; r = r + 1) begin
+                        cp_val = cp_map_valid[recover_tag][r];
+                        cp_ep  = cp_map_epoch[recover_tag][r];
+                        cp_tg  = cp_map_tag[recover_tag][r];
+                        
+                        producer_is_committing = (commit_valid && (commit_tag == cp_tg) && (commit_epoch == cp_ep)) ||
+                                                 (commit1_valid && (commit1_tag == cp_tg) && (commit1_epoch == cp_ep));
+                                                 
+                        producer_is_alive = rob_live_mask[cp_tg] && owner_has_dest[cp_tg] && 
+                                            (owner_rd[cp_tg] == r[4:0]) && (owner_epoch[cp_tg] == cp_ep);
+                        
+                        map_valid[r] <= cp_val && producer_is_alive && !producer_is_committing;
+                        map_tag[r]   <= cp_tg;
+                        map_epoch[r] <= cp_ep;
+                    end
+                end
             end
             map_valid[0] <= 1'b0;
         end else begin

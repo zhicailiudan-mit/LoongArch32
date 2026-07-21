@@ -331,8 +331,8 @@ module DispatchQueue #(
     end
 
     // The SQ receives an entry when address generation completes, not at
-    // dispatch.  Until an older Store has left this queue, its address is
-    // unknown to the LSU.  Conservatively keep a younger Load here rather
+    // dispatch. Until an older Store has left this queue, its address is
+    // unknown to the LSU. Conservatively keep a younger Load here rather
     // than speculate and require a memory-order-violation replay path.
     integer store_q;
     integer store_old;
@@ -406,6 +406,16 @@ module DispatchQueue #(
                                     (!(is_ld_st[q] &&
                                        (ram_we[q] == `RAM_WE_N)) ||
                                      !older_store_pending[q]) &&
+                                    // Store completion feeds the ROB/SQ
+                                    // boundary. Until the independent SQ
+                                    // allocation path is implemented, issue
+                                    // a Store only at the ROB head so a
+                                    // younger Store can never become
+                                    // externally visible before an older one.
+                                    (!(is_ld_st[q] &&
+                                       (ram_we[q] != `RAM_WE_N)) ||
+                                     (rob_head_valid &&
+                                      uop_id_equal(uop_id[q], rob_head_id))) &&
                                     (!is_br_jmp[q] || !older_branch_pending[q]) &&
                                     (!slot_mmio_load ||
                                     (rob_head_valid &&

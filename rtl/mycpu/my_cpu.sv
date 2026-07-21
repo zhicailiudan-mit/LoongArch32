@@ -90,14 +90,11 @@ module MyCpu (
     decoded_uop_t decode_uop1;
     commit_t commit0;
     commit_t commit1;
-    wire sq_alloc0_valid, sq_alloc0_ready, sq_alloc1_valid, sq_alloc1_ready;
-    uop_id_t sq_alloc0_id, sq_alloc1_id;
-    wire [31:0] sq_alloc0_pc, sq_alloc1_pc;
 
-    wire main_issue_valid;
-    wire main_issue_ready;
-    wire main_issue_fire;
-    issue_uop_t main_issue;
+    wire issue0_valid;
+    wire issue0_ready;
+    wire issue0_fire;
+    issue_uop_t issue0;
     wire issue1_valid;
     wire issue1_ready;
     wire issue1_fire;
@@ -149,8 +146,6 @@ module MyCpu (
     wire [31:0] frontend_ifetch_addr;
     wire [31:0] translated_ifetch_addr;
     wire [31:0] translated_daccess_addr;
-    wire [31:0] translated_line_alloc_addr;
-    wire        translated_line_alloc_cacheable;
     wire [31:0] system_effective_addr = system_issue.src0_value + system_issue.imm;
     wire [31:0] translated_system_addr;
     wire [1:0] ifetch_mat, daccess_mat, system_mat;
@@ -162,11 +157,12 @@ module MyCpu (
     assign daccess_addr  = translated_daccess_addr;
     assign daccess_wen   = dcache_req.wen;
     assign daccess_wdata = dcache_req.wdata;
-    assign daccess_line_alloc_valid = store_line_alloc_valid &&
-                                      translated_line_alloc_cacheable;
-    assign daccess_line_alloc_addr = translated_line_alloc_addr;
-    assign daccess_line_alloc_data = store_line_alloc_data;
-    assign daccess_line_alloc_word_mask = store_line_alloc_word_mask;
+    // Full-line StoreBuffer allocation is disabled in correctness mode.  Keep
+    // the legacy sideband at a constant zero so it cannot partially handshake.
+    assign daccess_line_alloc_valid = 1'b0;
+    assign daccess_line_alloc_addr = 32'h00000000;
+    assign daccess_line_alloc_data = '0;
+    assign daccess_line_alloc_word_mask = '0;
 
     always @(*) begin
         dcache_rsp = '0;
@@ -201,9 +197,9 @@ module MyCpu (
         // is never held by those resources, so BPU resolution needs no such
         // global stall qualifier.
         .ex_stall        (1'b0),
-        .issue_uop       (main_issue),
-        .issue_valid     (main_issue_valid),
-        .issue_fire      (main_issue_fire),
+        .issue_uop       (issue0),
+        .issue_valid     (issue0_valid),
+        .issue_fire      (issue0_fire),
         .ex_valid        (execute_result.valid),
         .ex_is_br_jmp    (execute_result.is_br_jmp),
         .ex_is_call      (execute_result.is_call),
@@ -249,14 +245,14 @@ module MyCpu (
         .cpu_clk              (cpu_clk),
         .lane0_result_stall   (ldst_suspend),
         .lane1_result_stall   (ldst1_suspend),
-        .prediction_mispredict(frontend_branch_mispredict),
+        .pred_error           (frontend_branch_mispredict),
         .recover_valid        (recover_valid),
         .system_flush         (recovery_event.system_flush),
         .recover_id           (recover_id),
-        .main_issue_valid     (main_issue_valid),
-        .main_issue_fire      (main_issue_fire),
-        .main_issue           (main_issue),
-        .main_issue_ready     (main_issue_ready),
+        .issue0_valid     (issue0_valid),
+        .issue0_fire      (issue0_fire),
+        .issue0           (issue0),
+        .issue0_ready     (issue0_ready),
         .issue1_valid         (issue1_valid),
         .issue1_fire          (issue1_fire),
         .issue1               (issue1),
@@ -283,8 +279,6 @@ module MyCpu (
         .recover_id     (recover_id),
         .execute_result (execute_result),
         .execute_result1(execute_result1),
-        .sq_alloc0_valid(sq_alloc0_valid), .sq_alloc0_id(sq_alloc0_id), .sq_alloc0_pc(sq_alloc0_pc), .sq_alloc0_ready(sq_alloc0_ready),
-        .sq_alloc1_valid(sq_alloc1_valid), .sq_alloc1_id(sq_alloc1_id), .sq_alloc1_pc(sq_alloc1_pc), .sq_alloc1_ready(sq_alloc1_ready),
         .commit0        (commit0),
         .commit1        (commit1),
         .ldst_suspend   (ldst_suspend),
@@ -305,8 +299,7 @@ module MyCpu (
          .perf_store_issue(perf_store_issue),
          .perf_store_release(perf_store_release),
          .perf_store_drain(perf_store_drain),
-         .store_line_alloc_ready(daccess_line_alloc_ready &&
-                                 translated_line_alloc_cacheable),
+          .store_line_alloc_ready(1'b0),
          .store_line_alloc_valid(store_line_alloc_valid),
          .store_line_alloc_addr(store_line_alloc_addr),
          .store_line_alloc_data(store_line_alloc_data),
@@ -319,6 +312,15 @@ module MyCpu (
     always_comb begin
         issue1_completion = issue1_lsu_completion.valid ?
                             issue1_lsu_completion : issue1_exec_completion;
+`ifndef SYNTHESIS
+        if (issue1_lsu_completion.valid && issue1_exec_completion.valid) begin
+            $fatal(1, "Lane1 Completion Collision: lsu_uop_id=%p, exec_uop_id=%p, is_ld_st=%b, pc=%h, ldst1_suspend=%b, pipeline_flush=%b", 
+                   issue1_lsu_completion.uop_id, issue1_exec_completion.uop_id, execute_result1.is_ld_st, execute_result1.pc, ldst1_suspend, pipeline_flush);
+        end
+        if (!issue1_lsu_completion.valid && !issue1_exec_completion.valid) begin
+            issue1_completion.valid = 1'b0;
+        end
+`endif
     end
 
     OooBackend u_ooo_backend (
@@ -336,18 +338,10 @@ module MyCpu (
         .main_complete       (main_completion),
         .issue1_complete     (issue1_completion),
         .system_complete     (system_completion),
-        .sq_alloc0_ready    (sq_alloc0_ready),
-        .sq_alloc1_ready    (sq_alloc1_ready),
-        .sq_alloc0_valid    (sq_alloc0_valid),
-        .sq_alloc0_id       (sq_alloc0_id),
-        .sq_alloc0_pc       (sq_alloc0_pc),
-        .sq_alloc1_valid    (sq_alloc1_valid),
-        .sq_alloc1_id       (sq_alloc1_id),
-        .sq_alloc1_pc       (sq_alloc1_pc),
-        .main_issue_valid    (main_issue_valid),
-        .main_issue_ready    (main_issue_ready),
-        .main_issue_fire     (main_issue_fire),
-        .main_issue          (main_issue),
+        .issue0_valid    (issue0_valid),
+        .issue0_ready    (issue0_ready),
+        .issue0_fire     (issue0_fire),
+        .issue0          (issue0),
         .issue1_valid        (issue1_valid),
         .issue1_ready        (issue1_ready),
         .issue1_fire         (issue1_fire),
@@ -390,19 +384,6 @@ module MyCpu (
         .cacheable (daccess_cacheable),
         .dmw_hit   (daccess_dmw_hit),
         .page_miss (daccess_page_miss)
-    );
-
-    AddressTranslate u_line_alloc_translate (
-        .vaddr     (store_line_alloc_addr),
-        .is_fetch  (1'b0),
-        .crmd      (privilege_state.crmd),
-        .dmw0      (privilege_state.dmw0),
-        .dmw1      (privilege_state.dmw1),
-        .paddr     (translated_line_alloc_addr),
-        .mat       (),
-        .cacheable (translated_line_alloc_cacheable),
-        .dmw_hit   (),
-        .page_miss ()
     );
 
     AddressTranslate u_system_translate (
@@ -468,9 +449,9 @@ module MyCpu (
         .rstn                   (cpu_rstn),
         .decode_valid           (decode_valid),
         .decode_ready           (decode_ready),
-        .main_issue_valid       (main_issue_valid),
-        .main_issue_ready       (main_issue_ready),
-        .main_issue_fire        (main_issue_fire),
+        .issue0_valid       (issue0_valid),
+        .issue0_ready       (issue0_ready),
+        .issue0_fire        (issue0_fire),
         .issue1_valid           (issue1_valid),
         .issue1_ready           (issue1_ready),
         .issue1_fire            (issue1_fire),
@@ -640,7 +621,7 @@ module MyCpu (
             ipc_decode_count <= ipc_decode_count +
                                 (decode_valid[0] && decode_ready) +
                                 (decode_valid[1] && decode_ready);
-            ipc_issue_count <= ipc_issue_count + main_issue_fire +
+            ipc_issue_count <= ipc_issue_count + issue0_fire +
                                issue1_fire + system_issue_fire;
             ipc_regwrite_count <= ipc_regwrite_count +
                                   (commit0.valid && commit0.reg_write) +
@@ -663,7 +644,7 @@ module MyCpu (
                                  (decode_valid[0] && decode_ready) +
                                  (decode_valid[1] && decode_ready))) /
                          (ipc_cycle_count + 64'd1),
-                         (1.0 * (ipc_issue_count + main_issue_fire +
+                         (1.0 * (ipc_issue_count + issue0_fire +
                                  issue1_fire + system_issue_fire)) /
                          (ipc_cycle_count + 64'd1),
                          ipc_dual_commit_cycles +

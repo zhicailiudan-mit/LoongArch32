@@ -21,10 +21,10 @@ module MulDiv (
     wire is_mul     = is_mul_w | is_mulh_w | is_mulh_wu;
     wire is_unsigned = is_mulh_wu;
 
-    wire [32:0] ext_a = is_unsigned ? {1'b0, a} : {a[31], a};
-    wire [32:0] ext_b = is_unsigned ? {1'b0, b} : {b[31], b};
-    wire [65:0] mul_dout;
-    logic [2:0] mul_wait_cnt;
+    wire  [32:0] ext_a = is_unsigned ? {1'b0, a} : {a[31], a};
+    wire  [32:0] ext_b = is_unsigned ? {1'b0, b} : {b[31], b};
+    wire  [65:0] mul_dout;
+    logic [2 :0] mul_wait_cnt;
     logic [65:0] mul_res_latch;
 
     always @(posedge cpu_clk or negedge cpu_rstn) begin

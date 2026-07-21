@@ -22,19 +22,11 @@ module OooBackend (
     input  completion_t                   main_complete,
     input  completion_t                   issue1_complete,
     input  completion_t                   system_complete,
-    input  logic                          sq_alloc0_ready,
-    input  logic                          sq_alloc1_ready,
-    output logic                          sq_alloc0_valid,
-    output uop_id_t                       sq_alloc0_id,
-    output logic [31:0]                   sq_alloc0_pc,
-    output logic                          sq_alloc1_valid,
-    output uop_id_t                       sq_alloc1_id,
-    output logic [31:0]                   sq_alloc1_pc,
 
-    output logic                         main_issue_valid,
-    input  logic                         main_issue_ready,
-    output logic                         main_issue_fire,
-    output issue_uop_t                   main_issue,
+    output logic                         issue0_valid,
+    input  logic                         issue0_ready,
+    output logic                         issue0_fire,
+    output issue_uop_t                   issue0,
 
     output logic                         issue1_valid,
     input  logic                         issue1_ready,
@@ -95,6 +87,7 @@ module OooBackend (
         .clk                      (clk),
         .rstn                     (rstn),
         .flush                    (flush),
+        .system_flush             (system_flush),
         .redirect_valid           (redirect_valid),
         .decode_valid             (decode_valid),
         .decode_ready             (decode_ready),
@@ -106,8 +99,6 @@ module OooBackend (
         .rob_alloc_ready          (rob_alloc_ready),
         .rob_alloc_id             (rob_alloc_id),
         .scheduler_dispatch_ready(scheduler_dispatch_ready),
-        .sq_alloc0_ready       (sq_alloc0_ready),
-        .sq_alloc1_ready       (sq_alloc1_ready),
         .rob_query_done           (rob_query_done),
         .rob_query_value          (rob_query_value),
         .rob_query_id             (rob_query_id),
@@ -117,14 +108,6 @@ module OooBackend (
 
     assign dispatch_valid[0] = dispatch[0].valid;
     assign dispatch_valid[1] = dispatch[1].valid;
-    wire dispatch_store0 = dispatch[0].valid && dispatch[0].uop.is_ld_st && (dispatch[0].uop.store_mask != `RAM_WE_N);
-    wire dispatch_store1 = dispatch[1].valid && dispatch[1].uop.is_ld_st && (dispatch[1].uop.store_mask != `RAM_WE_N);
-    assign sq_alloc0_valid = dispatch_store0 || dispatch_store1;
-    assign sq_alloc0_id = dispatch_store0 ? dispatch[0].uop.uop_id : dispatch[1].uop.uop_id;
-    assign sq_alloc0_pc = dispatch_store0 ? dispatch[0].uop.pc : dispatch[1].uop.pc;
-    assign sq_alloc1_valid = dispatch_store0 && dispatch_store1;
-    assign sq_alloc1_id = dispatch[1].uop.uop_id;
-    assign sq_alloc1_pc = dispatch[1].uop.pc;
 
     Scheduler u_scheduler (
         .clk                  (clk),
@@ -156,10 +139,10 @@ module OooBackend (
         .rob_head_tag         (rob_head_tag),
         .rob_head_id          (rob_head_id),
         .system_inflight      (system_inflight),
-        .main_issue_valid     (main_issue_valid),
-        .main_issue_ready     (main_issue_ready),
-        .main_issue_fire      (main_issue_fire),
-        .main_issue           (main_issue),
+        .issue0_valid     (issue0_valid),
+        .issue0_ready     (issue0_ready),
+        .issue0_fire      (issue0_fire),
+        .issue0           (issue0),
         .system_issue_valid   (system_issue_valid),
         .system_issue_ready   (system_issue_ready),
         .system_issue_fire    (system_issue_fire),
@@ -211,7 +194,7 @@ module OooBackend (
                             (dispatch[0].valid && !scheduler_dispatch_ready[0]) ||
                             (dispatch[1].valid && !scheduler_dispatch_ready[1]);
     assign perf_source_wait = (scheduler_occupancy != 0) &&
-                              !main_issue_valid && !issue1_valid &&
+                              !issue0_valid && !issue1_valid &&
                               !system_issue_valid && !system_inflight;
     assign perf_serializing_block = system_inflight;
 

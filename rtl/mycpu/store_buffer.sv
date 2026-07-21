@@ -1,19 +1,17 @@
 `timescale 1ns / 1ps
 import cpu_types_pkg::*;
 
-// Committed-store buffer.
-//
-// Entries are still appended in ROB/StoreQueue order.  Adjacent stores to
-// the same cache line share one line entry, while each word retains an age
-// ordered list.  The external interface deliberately remains one word wide:
-// the arbiter drains the oldest pending word, so line merging cannot reorder
-// stores relative to a different line.
+// Correctness-mode committed Store FIFO.
+// Each architectural Store occupies one entry and leaves in FIFO order.
 module StoreBuffer #(parameter integer DEPTH = 4) (
-    input logic clk, input logic rstn,
-    input logic accept_valid, input lsu_entry_t accept_entry,
+    input  logic clk,
+    input  logic rstn,
+    input  logic accept_valid,
+    input  lsu_entry_t accept_entry,
     output logic accept_ready,
-    output logic head_valid, output lsu_entry_t head_entry,
-    input logic pop,
+    output logic head_valid,
+    output lsu_entry_t head_entry,
+    input  logic pop,
     output logic [DEPTH-1:0] valid_vec,
     output logic [DEPTH*32-1:0] addr_flat,
     output logic [DEPTH*`UOP_ID_W-1:0] uop_id_flat,
@@ -21,85 +19,54 @@ module StoreBuffer #(parameter integer DEPTH = 4) (
     output logic [DEPTH*32-1:0] store_data_flat,
     output logic [DEPTH*4*`UOP_ID_W-1:0] store_byte_uop_id_flat,
     output logic [$clog2(DEPTH+1)-1:0] occupancy,
-    // Full-line notification used by the DCache direct-allocation path.
-    input logic line_alloc_ready,
+    // Kept for wrapper compatibility.  Full-line allocation is disabled.
+    input  logic line_alloc_ready,
     output logic line_alloc_valid,
     output logic [31:0] line_alloc_addr,
     output logic [`CACHE_BLK_SIZE-1:0] line_alloc_data,
     output logic [`CACHE_BLK_LEN-1:0] line_alloc_word_mask
 );
+    localparam integer PTR_W = (DEPTH <= 1) ? 1 : $clog2(DEPTH);
     localparam integer COUNT_W = $clog2(DEPTH + 1);
-    localparam integer LINE_WORDS = `CACHE_BLK_LEN;
-    localparam integer WORD_IW = (LINE_WORDS <= 1) ? 1 : $clog2(LINE_WORDS);
-    localparam integer WORD_CW = $clog2(LINE_WORDS + 1);
 
-    logic [31:5] line_addr [0:DEPTH-1];
-    logic [31:0] word_data [0:DEPTH-1][0:LINE_WORDS-1];
-    logic [3:0]  word_wen  [0:DEPTH-1][0:LINE_WORDS-1];
-    logic [31:0] word_pc   [0:DEPTH-1][0:LINE_WORDS-1];
-    uop_id_t     word_uop  [0:DEPTH-1][0:LINE_WORDS-1];
-    uop_id_t     byte_uop  [0:DEPTH-1][0:LINE_WORDS-1][0:3];
-    logic [LINE_WORDS-1:0] word_valid [0:DEPTH-1];
-    logic [WORD_IW-1:0]    word_order [0:DEPTH-1][0:LINE_WORDS-1];
-    logic [WORD_CW-1:0]    word_order_count [0:DEPTH-1];
-    logic                   line_alloc_sent [0:DEPTH-1];
-    logic [COUNT_W-1:0]     line_count;
-    logic [COUNT_W-1:0]     word_count;
+    lsu_entry_t entries [0:DEPTH-1];
+    logic [PTR_W-1:0] read_ptr;
+    logic [PTR_W-1:0] write_ptr;
+    logic [COUNT_W-1:0] count;
 
+    wire pop_do = pop && (count != 0);
+    wire push_do = accept_valid && accept_ready;
+    wire [31:0] accept_addr_aligned = accept_entry.address;
+    wire [COUNT_W:0] count_next = {1'b0, count} +
+                                   {{COUNT_W{1'b0}}, push_do} -
+                                   {{COUNT_W{1'b0}}, pop_do};
+    lsu_entry_t accepted_entry_aligned;
 
-    wire [31:5] accept_line = accept_entry.address[31:5];
-    wire [WORD_IW-1:0] accept_word = accept_entry.address[4 +: WORD_IW];
-    wire tail_same_line = (line_count != 0) &&
-                          (line_addr[line_count-1] == accept_line);
-    wire tail_word_present = tail_same_line &&
-                             word_valid[line_count-1][accept_word];
-    wire can_append_line = (line_count < DEPTH);
-    wire can_merge_line = tail_same_line &&
-                          ((word_count < DEPTH) || tail_word_present);
-    wire pop_do = pop && (line_count != 0) &&
-                  (word_order_count[0] != 0);
-
-    // Do not feed cache-side pop timing back into the StoreQueue ready path.
-    // A simultaneous drain/accept is intentionally converted into a one-cycle
-    // bubble; this is safe and keeps the critical path bounded.
-    always_comb begin
-        integer i, j, b;
-        integer out_slot;
-        integer word_idx;
-        accept_ready = rstn && (can_merge_line || can_append_line) && !pop_do;
-        line_alloc_valid = 1'b0;
-        line_alloc_addr = 32'h0;
-        line_alloc_data = '0;
-        line_alloc_word_mask = '0;
-        if ((line_count != 0) &&
-            (word_order_count[0] == LINE_WORDS) &&
-            !line_alloc_sent[0] &&
-            (line_addr[0][31:16] != 16'hBFAF) &&
-            (line_addr[0][31:16] != 16'hBFD0)) begin
-            line_alloc_valid = 1'b1;
-            // A word-count-complete line is not necessarily byte-complete:
-            // eight byte stores can cover eight words only partially.  Direct
-            // allocation is allowed only when every byte is supplied.
-            for (j = 0; j < LINE_WORDS; j = j + 1)
-                if (word_wen[0][j] != 4'hF)
-                    line_alloc_valid = 1'b0;
-            line_alloc_addr = {line_addr[0], 5'b0};
-            line_alloc_word_mask = word_valid[0];
-            for (j = 0; j < LINE_WORDS; j = j + 1)
-                line_alloc_data[j*32 +: 32] = word_data[0][j];
+    function automatic [PTR_W-1:0] ptr_next(input [PTR_W-1:0] ptr);
+        begin
+            if (ptr == DEPTH-1)
+                ptr_next = 0;
+            else
+                ptr_next = ptr + 1'b1;
         end
+    endfunction
 
-        head_valid = (line_count != 0) && (word_order_count[0] != 0);
+    always @(*) begin
+        accepted_entry_aligned = accept_entry;
+        accepted_entry_aligned.valid = 1'b1;
+        accepted_entry_aligned.address = accept_addr_aligned;
+    end
+
+    always @(*) begin : fifo_outputs
+        integer i;
+        integer b;
+        integer idx;
+
+        accept_ready = rstn && ((count < DEPTH) || pop_do);
+        head_valid = (count != 0);
         head_entry = '0;
-        if (head_valid) begin
-            word_idx = word_order[0][0];
-            head_entry.valid = 1'b1;
-            head_entry.uop_id = word_uop[0][word_idx];
-            head_entry.pc = word_pc[0][word_idx];
-            head_entry.address = {line_addr[0], 5'b0} | (word_idx << 2);
-            head_entry.store_data = word_data[0][word_idx];
-            head_entry.store_wen = word_wen[0][word_idx];
-        end
+        if (head_valid)
+            head_entry = entries[read_ptr];
 
         valid_vec = '0;
         addr_flat = '0;
@@ -107,151 +74,115 @@ module StoreBuffer #(parameter integer DEPTH = 4) (
         store_wen_flat = '0;
         store_data_flat = '0;
         store_byte_uop_id_flat = '0;
-        out_slot = 0;
+        occupancy = count;
+
+        // The flat forwarding view is the same FIFO in age order.  All
+        // fields in one slot come from one fifo_mem entry.
         for (i = 0; i < DEPTH; i = i + 1) begin
-            for (j = 0; j < LINE_WORDS; j = j + 1) begin
-                if ((j < word_order_count[i]) && (out_slot < DEPTH)) begin
-                    word_idx = word_order[i][j];
-                    valid_vec[out_slot] = 1'b1;
-                    addr_flat[out_slot*32 +: 32] = {line_addr[i], 5'b0} |
-                                                   (word_idx << 2);
-                    uop_id_flat[out_slot*`UOP_ID_W +: `UOP_ID_W] =
-                        word_uop[i][word_idx];
-                    store_wen_flat[out_slot*4 +: 4] = word_wen[i][word_idx];
-                    store_data_flat[out_slot*32 +: 32] = word_data[i][word_idx];
-                    for (b = 0; b < 4; b = b + 1)
-                        store_byte_uop_id_flat[(out_slot*4+b)*`UOP_ID_W +: `UOP_ID_W] =
-                            byte_uop[i][word_idx][b];
-                    out_slot = out_slot + 1;
-                end
+            idx = read_ptr + i;
+            if (idx >= DEPTH)
+                idx = idx - DEPTH;
+            if (i < count) begin
+                valid_vec[i] = entries[idx].valid;
+                addr_flat[i*32 +: 32] = entries[idx].address;
+                uop_id_flat[i*`UOP_ID_W +: `UOP_ID_W] = entries[idx].uop_id;
+                store_wen_flat[i*4 +: 4] = entries[idx].store_wen;
+                store_data_flat[i*32 +: 32] = entries[idx].store_data;
+                for (b = 0; b < 4; b = b + 1)
+                    store_byte_uop_id_flat[(i*4+b)*`UOP_ID_W +: `UOP_ID_W] =
+                        entries[idx].uop_id;
             end
         end
-        occupancy = word_count;
+
+        line_alloc_valid = 1'b0;
+        line_alloc_addr = 32'h00000000;
+        line_alloc_data = '0;
+        line_alloc_word_mask = '0;
     end
 
-    always_ff @(posedge clk or negedge rstn) begin
-        integer i, j, b, k;
-        integer found_word;
-        integer merge_idx;
+    always @(posedge clk or negedge rstn) begin
+        integer i;
         if (!rstn) begin
-            line_count <= '0;
-            word_count <= '0;
-            for (i = 0; i < DEPTH; i = i + 1) begin
-                line_addr[i] <= '0;
-                word_valid[i] <= '0;
-                word_order_count[i] <= '0;
-                line_alloc_sent[i] <= 1'b0;
-                for (j = 0; j < LINE_WORDS; j = j + 1) begin
-                    word_data[i][j] <= '0;
-                    word_wen[i][j] <= '0;
-                    word_pc[i][j] <= '0;
-                    word_uop[i][j] <= '0;
-                    word_order[i][j] <= '0;
-                    for (b = 0; b < 4; b = b + 1)
-                        byte_uop[i][j][b] <= '0;
-                end
-            end
+            read_ptr <= 0;
+            write_ptr <= 0;
+            count <= 0;
+            for (i = 0; i < DEPTH; i = i + 1)
+                entries[i] <= '0;
         end else begin
-            // The full-line request is accepted before any word drain.  The
-            // LSU suppresses the normal StoreBuffer head while this valid bit
-            // is asserted, so there is no cache write/allocation collision.
-            if (line_alloc_valid && line_alloc_ready)
-                line_alloc_sent[0] <= 1'b1;
-
-            if (pop_do) begin
-                if (word_order_count[0] > 1) begin
-                    word_valid[0][word_order[0][0]] <= 1'b0;
-                    for (j = 0; j < LINE_WORDS-1; j = j + 1) begin
-                        if (j < word_order_count[0]-1)
-                            word_order[0][j] <= word_order[0][j+1];
-                        else
-                            word_order[0][j] <= '0;
-                    end
-                    word_order[0][LINE_WORDS-1] <= '0;
-                    word_order_count[0] <= word_order_count[0] - 1'b1;
-                    word_count <= word_count - 1'b1;
-                end else begin
-                    for (i = 0; i < DEPTH-1; i = i + 1) begin
-                        line_addr[i] <= line_addr[i+1];
-                        word_valid[i] <= word_valid[i+1];
-                        word_order_count[i] <= word_order_count[i+1];
-                        line_alloc_sent[i] <= line_alloc_sent[i+1];
-                        for (j = 0; j < LINE_WORDS; j = j + 1) begin
-                            word_data[i][j] <= word_data[i+1][j];
-                            word_wen[i][j] <= word_wen[i+1][j];
-                            word_pc[i][j] <= word_pc[i+1][j];
-                            word_uop[i][j] <= word_uop[i+1][j];
-                            word_order[i][j] <= word_order[i+1][j];
-                            for (b = 0; b < 4; b = b + 1)
-                                byte_uop[i][j][b] <= byte_uop[i+1][j][b];
-                        end
-                    end
-                    line_addr[DEPTH-1] <= '0;
-                    word_valid[DEPTH-1] <= '0;
-                    word_order_count[DEPTH-1] <= '0;
-                    line_alloc_sent[DEPTH-1] <= 1'b0;
-                    for (j = 0; j < LINE_WORDS; j = j + 1) begin
-                        word_data[DEPTH-1][j] <= '0;
-                        word_wen[DEPTH-1][j] <= '0;
-                        word_pc[DEPTH-1][j] <= '0;
-                        word_uop[DEPTH-1][j] <= '0;
-                        word_order[DEPTH-1][j] <= '0;
-                        for (b = 0; b < 4; b = b + 1)
-                            byte_uop[DEPTH-1][j][b] <= '0;
-                    end
-                    line_count <= line_count - 1'b1;
-                    word_count <= word_count - 1'b1;
+            case ({push_do, pop_do})
+                2'b10: begin
+                    entries[write_ptr] <= accepted_entry_aligned;
+                    write_ptr <= ptr_next(write_ptr);
+                    count <= count + 1'b1;
                 end
+                2'b01: begin
+                    entries[read_ptr].valid <= 1'b0;
+                    read_ptr <= ptr_next(read_ptr);
+                    count <= count - 1'b1;
+                end
+                2'b11: begin
+                    entries[write_ptr] <= accepted_entry_aligned;
+                    write_ptr <= ptr_next(write_ptr);
+                    read_ptr <= ptr_next(read_ptr);
+                    count <= count;
+                end
+                default: begin
+                    count <= count;
+                end
+            endcase
+        end
+    end
+
+`ifndef SYNTHESIS
+    // Immediate assertions are simulation-only and do not affect hardware.
+    always @(posedge clk) begin : store_buffer_assertions
+        integer j;
+        integer check_idx;
+        if (rstn) begin
+            if (pop && (count == 0))
+                $error("StoreBuffer pop while empty");
+            if ((count == DEPTH) && accept_valid && !pop_do)
+                $error("StoreBuffer push while full without pop");
+            if (count_next > DEPTH)
+                $error("StoreBuffer count overflow");
+            if ((count == 0) && pop_do)
+                $error("StoreBuffer count underflow");
+
+            if (line_alloc_valid)
+                $error("line_alloc_valid must remain low");
+
+            // The head payload and every flat forwarding field must describe
+            // one and the same FIFO slot (including its PC/uop identity).
+            if (head_valid) begin
+                if (uop_id_flat[0 +: `UOP_ID_W] !== head_entry.uop_id)
+                    $error("StoreBuffer head uop mismatch");
+                if (addr_flat[0 +: 32] !== head_entry.address)
+                    $error("StoreBuffer head address mismatch");
+                if (store_data_flat[0 +: 32] !== head_entry.store_data)
+                    $error("StoreBuffer head data mismatch");
+                if (store_wen_flat[0 +: 4] !== head_entry.store_wen)
+                    $error("StoreBuffer head wen mismatch");
             end
 
-            if (accept_valid && accept_ready) begin
-                merge_idx = (line_count == 0) ? 0 : line_count - 1;
-                if (tail_same_line) begin
-                    // Find an existing word in the tail line.  If it exists,
-                    // merge only the newly written bytes; otherwise append a
-                    // new word to the line's age list.
-                    found_word = 0;
-                    for (k = 0; k < LINE_WORDS; k = k + 1)
-                        if ((k < word_order_count[merge_idx]) &&
-                            (word_order[merge_idx][k] == accept_word))
-                            found_word = 1;
-                    if (!found_word) begin
-                        word_order[merge_idx][word_order_count[merge_idx]] <= accept_word;
-                        word_order_count[merge_idx] <= word_order_count[merge_idx] + 1'b1;
-                        word_count <= word_count + 1'b1;
-                    end
-                    for (b = 0; b < 4; b = b + 1) begin
-                        if (accept_entry.store_wen[b]) begin
-                            word_data[merge_idx][accept_word][b*8 +: 8] <=
-                                accept_entry.store_data[b*8 +: 8];
-                            byte_uop[merge_idx][accept_word][b] <= accept_entry.uop_id;
-                        end
-                    end
-                    word_wen[merge_idx][accept_word] <=
-                        word_wen[merge_idx][accept_word] | accept_entry.store_wen;
-                    if (!found_word) begin
-                        word_pc[merge_idx][accept_word] <= accept_entry.pc;
-                        word_uop[merge_idx][accept_word] <= accept_entry.uop_id;
-                        word_valid[merge_idx][accept_word] <= 1'b1;
-                    end
-                    line_alloc_sent[merge_idx] <= 1'b0;
-                end else if (can_append_line) begin
-                    line_addr[line_count] <= accept_line;
-                    word_valid[line_count] <= '0;
-                    word_order_count[line_count] <= 1;
-                    line_alloc_sent[line_count] <= 1'b0;
-                    word_order[line_count][0] <= accept_word;
-                    word_valid[line_count][accept_word] <= 1'b1;
-                    word_data[line_count][accept_word] <= accept_entry.store_data;
-                    word_wen[line_count][accept_word] <= accept_entry.store_wen;
-                    word_pc[line_count][accept_word] <= accept_entry.pc;
-                    word_uop[line_count][accept_word] <= accept_entry.uop_id;
-                    for (b = 0; b < 4; b = b + 1)
-                        byte_uop[line_count][accept_word][b] <= accept_entry.uop_id;
-                    line_count <= line_count + 1'b1;
-                    word_count <= word_count + 1'b1;
+            for (j = 0; j < DEPTH; j = j + 1) begin
+                check_idx = read_ptr + j;
+                if (check_idx >= DEPTH)
+                    check_idx = check_idx - DEPTH;
+                if ((j < count) && valid_vec[j]) begin
+                    if (addr_flat[j*32 +: 32] !== entries[check_idx].address)
+                        $error("StoreBuffer flat address mismatch");
+                    if (store_data_flat[j*32 +: 32] !== entries[check_idx].store_data)
+                        $error("StoreBuffer flat data mismatch");
+                    if (store_wen_flat[j*4 +: 4] !== entries[check_idx].store_wen)
+                        $error("StoreBuffer flat wen mismatch");
+                    if (uop_id_flat[j*`UOP_ID_W +: `UOP_ID_W] !==
+                        entries[check_idx].uop_id)
+                        $error("StoreBuffer flat uop mismatch");
                 end
             end
         end
     end
+
+
+`endif
 endmodule

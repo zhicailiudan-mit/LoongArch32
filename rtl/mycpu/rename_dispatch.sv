@@ -10,6 +10,7 @@ module RenameDispatch (
     input  logic                    clk,
     input  logic                    rstn,
     input  logic                    flush,
+    input  logic                    system_flush,
     input  logic                    redirect_valid,
     input  logic [1:0]              decode_valid,
     output logic                    decode_ready,
@@ -23,8 +24,6 @@ module RenameDispatch (
     input  logic [1:0]              rob_alloc_ready,
     input  uop_id_t                 rob_alloc_id [0:1],
     input  logic [1:0]              scheduler_dispatch_ready,
-    input  logic                    sq_alloc0_ready,
-    input  logic                    sq_alloc1_ready,
 
     input  logic                    rob_query_done [0:3],
     input  logic [31:0]             rob_query_value [0:3],
@@ -49,10 +48,6 @@ module RenameDispatch (
     wire [31:0] source_value [0:3];
     wire dispatch_src_ready [0:1][0:1];
     wire rename_ready;
-    wire rn_store0 = rn_valid[0] && renamed_uop[0].is_ld_st && (renamed_uop[0].store_mask != `RAM_WE_N);
-    wire rn_store1 = rn_valid[1] && renamed_uop[1].is_ld_st && (renamed_uop[1].store_mask != `RAM_WE_N);
-    wire sq_resource_ready = (!rn_store0 || sq_alloc0_ready) &&
-                             (!rn_store1 || (rn_store0 ? sq_alloc1_ready : sq_alloc0_ready));
     wire pair_resources_ready;
     wire single_resources_ready;
 
@@ -95,7 +90,7 @@ module RenameDispatch (
                                      scheduler_dispatch_ready[0];
     assign rename_ready = (rn_valid[1] ? pair_resources_ready :
                                       single_resources_ready) &&
-                          !redirect_valid && sq_resource_ready;
+                          !redirect_valid;
 
     assign dispatch_src_ready[0][0] = !source_used[0] || !rat_pending[0] ||
                                       rob_query_done[0] || complete[0].valid &&
@@ -157,8 +152,9 @@ module RenameDispatch (
         .alloc1_epoch    (rob_alloc_id[1].epoch),
         .alloc1_checkpoint(renamed_uop[1].is_br_jmp |
                            renamed_uop[1].pred.taken),
-        .recover_valid   (recover_valid),
-        .recover_tag     (recover_id.rob_tag),
+        .recover_valid(recover_valid),
+        .system_flush(system_flush),
+        .recover_tag  (recover_id.rob_tag),
         .recover_epoch   (recover_id.epoch),
         .rob_live_mask   (rob_live_mask),
         .commit_valid    (commit[0].valid),

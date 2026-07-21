@@ -10,9 +10,9 @@ module PerformanceCounters (
     input  logic                    rstn,
     input  logic [1:0]              decode_valid,
     input  logic                    decode_ready,
-    input  logic                    main_issue_valid,
-    input  logic                    main_issue_ready,
-    input  logic                    main_issue_fire,
+    input  logic                    issue0_valid,
+    input  logic                    issue0_ready,
+    input  logic                    issue0_fire,
     input  logic                    issue1_valid,
     input  logic                    issue1_ready,
     input  logic                    issue1_fire,
@@ -47,7 +47,7 @@ module PerformanceCounters (
     input  logic                    recovery
 );
 `ifndef SYNTHESIS
-    wire [1:0] issue_width = {1'b0, main_issue_fire} +
+    wire [1:0] issue_width = {1'b0, issue0_fire} +
                              {1'b0, issue1_fire} +
                              {1'b0, system_issue_fire};
     wire [1:0] retire_width = {1'b0, commit0_valid} +
@@ -79,7 +79,7 @@ module PerformanceCounters (
     (* keep = "true", mark_debug = "true" *) logic [63:0] perf_rob_block_cycles;
     (* keep = "true", mark_debug = "true" *) logic [63:0] perf_issue_queue_block_cycles;
     (* keep = "true", mark_debug = "true" *) logic [63:0] perf_source_wait_cycles;
-    (* keep = "true", mark_debug = "true" *) logic [63:0] perf_main_issue_block_cycles;
+    (* keep = "true", mark_debug = "true" *) logic [63:0] perf_issue0_block_cycles;
     (* keep = "true", mark_debug = "true" *) logic [63:0] perf_issue1_block_cycles;
     (* keep = "true", mark_debug = "true" *) logic [63:0] perf_system_issue_block_cycles;
     (* keep = "true", mark_debug = "true" *) logic [63:0] perf_serializing_block_cycles;
@@ -126,7 +126,7 @@ module PerformanceCounters (
             perf_rob_block_cycles <= 0;
             perf_issue_queue_block_cycles <= 0;
             perf_source_wait_cycles <= 0;
-            perf_main_issue_block_cycles <= 0;
+            perf_issue0_block_cycles <= 0;
             perf_issue1_block_cycles <= 0;
             perf_system_issue_block_cycles <= 0;
             perf_serializing_block_cycles <= 0;
@@ -179,7 +179,7 @@ module PerformanceCounters (
             if (rob_block) perf_rob_block_cycles <= perf_rob_block_cycles + 1;
             if (issue_queue_block) perf_issue_queue_block_cycles <= perf_issue_queue_block_cycles + 1;
             if (source_wait) perf_source_wait_cycles <= perf_source_wait_cycles + 1;
-            if (main_issue_valid && !main_issue_ready) perf_main_issue_block_cycles <= perf_main_issue_block_cycles + 1;
+            if (issue0_valid && !issue0_ready) perf_issue0_block_cycles <= perf_issue0_block_cycles + 1;
             if (issue1_valid && !issue1_ready) perf_issue1_block_cycles <= perf_issue1_block_cycles + 1;
             if (system_issue_valid && !system_issue_ready) perf_system_issue_block_cycles <= perf_system_issue_block_cycles + 1;
             if (serializing_block) perf_serializing_block_cycles <= perf_serializing_block_cycles + 1;

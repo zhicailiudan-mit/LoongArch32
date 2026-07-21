@@ -123,7 +123,7 @@ module sram_bus_master(
         .r_hold         (rd_mem_en    ),
         // Cache Read Interface
         .dev_rrdy       (ic_rfifo_rdy ),
-        .cpu_ren        ({4{ic_cpu_ren}}),
+        .cpu_ren        (ic_cpu_ren   ),
         .cpu_raddr      (ic_cpu_raddr ),
         .cpu_rburst     (1'b1         ),
         .dev_rvalid     (ic_dev_rvalid),

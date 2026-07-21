@@ -41,10 +41,10 @@ module Scheduler (
     input  uop_id_t                  rob_head_id,
     input  logic                     system_inflight,
 
-    output logic                     main_issue_valid,
-    input  logic                     main_issue_ready,
-    output logic                     main_issue_fire,
-    output issue_uop_t               main_issue,
+    output logic                     issue0_valid,
+    input  logic                     issue0_ready,
+    output logic                     issue0_fire,
+    output issue_uop_t               issue0,
 
     output logic                     system_issue_valid,
     input  logic                     system_issue_ready,
@@ -104,7 +104,7 @@ module Scheduler (
                              (dq_issue[0].is_ld_st ||
                               (dq_issue[0].result_sel == `WD_ALU));
     wire steal_main_to_lane1 = dq_issue_valid[0] && !dq_is_system &&
-                               !main_issue_ready && issue1_ready &&
+                               !issue0_ready && issue1_ready &&
                                dq0_fast_eligible && !dq_issue_valid[1] &&
                                !system_inflight &&
                                !flush;
@@ -112,7 +112,7 @@ module Scheduler (
     assign dq_issue_ready[0] = dq_is_system ?
                                 (system_issue_ready && system_at_head &&
                                  !system_inflight) :
-                                ((steal_main_to_lane1 || main_issue_ready) &&
+                                ((steal_main_to_lane1 || issue0_ready) &&
                                  !system_inflight);
     assign dq_issue_ready[1] = issue1_ready && !flush &&
                                 !system_inflight && !dq_is_system &&
@@ -120,9 +120,9 @@ module Scheduler (
 
     assign dispatch0_ready = dq_enq_ready[0];
     assign dispatch1_ready = dq_enq_ready[1];
-    assign main_issue_valid = dq_issue_valid[0] && !dq_is_system &&
+    assign issue0_valid = dq_issue_valid[0] && !dq_is_system &&
                                !system_inflight && !steal_main_to_lane1;
-    assign main_issue_fire = main_issue_valid && main_issue_ready;
+    assign issue0_fire = issue0_valid && issue0_ready;
     assign system_issue_valid = dq_issue_valid[0] && dq_is_system &&
                                 system_at_head && !system_inflight;
     assign system_issue_fire = system_issue_valid && system_issue_ready;
@@ -156,7 +156,7 @@ module Scheduler (
         .occupancy      (dq_occupancy)
     );
 
-    assign main_issue = dq_issue[0];
+    assign issue0 = dq_issue[0];
     assign system_issue = dq_issue[0];
     assign issue1 = steal_main_to_lane1 ? dq_issue[0] : dq_issue[1];
 

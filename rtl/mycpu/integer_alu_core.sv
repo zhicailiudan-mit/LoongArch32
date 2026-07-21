@@ -5,7 +5,7 @@
 // Integer execution lane 0.  Multiply/divide and branch comparison are
 // deliberately separate units; this unit contains only the single-cycle
 // integer result operations used by the main execution lane.
-module IntegerAlu (
+module IntegerAluCore (
     input  logic [4:0]  alu_op,
     input  logic [31:0] a,
     input  logic [31:0] b,

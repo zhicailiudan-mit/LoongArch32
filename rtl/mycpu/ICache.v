@@ -55,38 +55,38 @@ module ICache (
     // be tracked by an equally ordered FIFO in IF_stage without transaction IDs.
     localparam REQ_DEPTH = 4;
     localparam REQ_PTR_W = 2;
-    reg [31:0] req_addr_q [REQ_DEPTH-1:0];
+    reg [31:0] req_addr_q      [REQ_DEPTH-1:0];
     reg        req_cacheable_q [REQ_DEPTH-1:0];
-    reg        req_dual_q [REQ_DEPTH-1:0];
+    reg        req_dual_q      [REQ_DEPTH-1:0];
     reg [REQ_PTR_W-1:0] req_rptr;
     reg [REQ_PTR_W-1:0] req_wptr;
-    reg [REQ_PTR_W:0] req_count;
-    wire core_req_ready;
-    wire req_pop = core_req_ready && (req_count != 0) && !pred_error;
-    wire req_push = inst_rreq && inst_ready;
-    wire core_inst_rreq = req_pop;
-    wire [31:0] core_inst_addr = req_addr_q[req_rptr];
-    wire core_inst_cacheable = req_cacheable_q[req_rptr];
-    wire core_inst_dual = req_dual_q[req_rptr];
+    reg [REQ_PTR_W:0]   req_count;
+    wire        core_req_ready;
+    wire        req_pop             = core_req_ready && (req_count != 0) && !pred_error;
+    wire        req_push            = inst_rreq && inst_ready;
+    wire        core_inst_rreq      = req_pop;
+    wire [31:0] core_inst_addr      = req_addr_q[req_rptr];
+    wire        core_inst_cacheable = req_cacheable_q[req_rptr];
+    wire        core_inst_dual      = req_dual_q[req_rptr];
 
     assign inst_ready = cpu_rstn && !pred_error &&
                         ((req_count < REQ_DEPTH) || req_pop);
 
     always @(posedge cpu_clk or negedge cpu_rstn) begin
         if (!cpu_rstn) begin
-            req_rptr <= {REQ_PTR_W{1'b0}};
-            req_wptr <= {REQ_PTR_W{1'b0}};
+            req_rptr  <= {REQ_PTR_W{1'b0}};
+            req_wptr  <= {REQ_PTR_W{1'b0}};
             req_count <= {(REQ_PTR_W+1){1'b0}};
         end else if (pred_error) begin
-            req_rptr <= {REQ_PTR_W{1'b0}};
-            req_wptr <= {REQ_PTR_W{1'b0}};
+            req_rptr  <= {REQ_PTR_W{1'b0}};
+            req_wptr  <= {REQ_PTR_W{1'b0}};
             req_count <= {(REQ_PTR_W+1){1'b0}};
         end else begin
             if (req_push) begin
-                req_addr_q[req_wptr] <= inst_addr;
+                req_addr_q[req_wptr]      <= inst_addr;
                 req_cacheable_q[req_wptr] <= inst_cacheable;
-                req_dual_q[req_wptr] <= inst_dual;
-                req_wptr <= req_wptr + 1'b1;
+                req_dual_q[req_wptr]      <= inst_dual;
+                req_wptr                  <= req_wptr + 1'b1;
             end
             if (req_pop)
                 req_rptr <= req_rptr + 1'b1;
@@ -98,9 +98,6 @@ module ICache (
         end
     end
 
-    // =========================================================
-    // 1. 地址缓存与流水线前馈逻辑
-    // =========================================================
     reg [31:0] inst_addr_r;
     reg        inst_dual_r;
     reg        inst_cacheable_r;
@@ -136,16 +133,12 @@ module ICache (
         core_inst_rreq ? core_inst_addr[INDEX_WID + OFFSET_WID - 1 : OFFSET_WID]
                   : inst_addr_r[INDEX_WID + OFFSET_WID - 1 : OFFSET_WID];
 
-    // =========================================================
-    // 2. 缓存当前正在 REFILL 的 miss 块信息
-    // =========================================================
     reg [31:0]          miss_addr_wr;
     reg [TAG_WID-1:0]   tag_from_cpu_wr;
     reg [INDEX_WID-1:0] cache_idx_wr;
     reg [2:0]           miss_word_offset_wr;
     reg                 miss_cacheable_wr;
 
-    // 当前 BRAM 输出对应的 index，用于防同步 BRAM 旧数据假命中
     wire cache_we;
     wire [INDEX_WID-1:0] bram_index;
     reg [`CACHE_BLK_NUM-1:0] line_enabled;
@@ -162,9 +155,6 @@ module ICache (
     wire bram_line_ready =
         (bram_index_r == index_from_cpu);
 
-    // =========================================================
-    // 3. Cache Line 取 word
-    // =========================================================
     function [31:0] get_word_from_line;
         input [`CACHE_BLK_SIZE-1:0] line;
         input [2:0]                 idx;
@@ -183,9 +173,6 @@ module ICache (
         end
     endfunction
 
-    // =========================================================
-    // 4. Cache Line 写 word
-    // =========================================================
     function [`CACHE_BLK_SIZE-1:0] set_word_to_line;
         input [`CACHE_BLK_SIZE-1:0] line;
         input [2:0]                 idx;
@@ -211,9 +198,6 @@ module ICache (
         end
     endfunction
 
-    // =========================================================
-    // 5. Cache 块数据解析与普通命中判定
-    // =========================================================
     wire [BLK_WID-1:0] cache_line_r;
 
     wire               valid_bit      = cache_line_r[BLK_WID-1];
@@ -234,7 +218,6 @@ module ICache (
         get_word_from_line(cache_line_r[`CACHE_BLK_SIZE-1:0],
                            word_offset + 3'd1);
 
-    // miss 确认时锁存本次缺失块信息
     always @(posedge cpu_clk or negedge cpu_rstn) begin
         if (!cpu_rstn) begin
             miss_addr_wr         <= `PC_INIT_VAL;
@@ -254,16 +237,6 @@ module ICache (
         end
     end
 
-    // =========================================================
-    // 6. REFILL 接收逻辑
-    //
-    // CWF_EN=1 后桥接器返回顺序：
-    // miss_word_offset,
-    // miss_word_offset+1,
-    // ...,
-    // 回绕到 0,
-    // ...
-    // =========================================================
     reg [OFFSET_WID:0]        recv_cnt;
     reg [`CACHE_BLK_SIZE-1:0] cache_line_data;
     reg [`CACHE_BLK_LEN-1:0]  refill_word_valid;
@@ -294,9 +267,6 @@ module ICache (
         end
     end
 
-    // =========================================================
-    // 7. REFILL 状态下的半成品命中逻辑
-    // =========================================================
     reg cwf_new_req;
     reg discard_active;
 
@@ -364,22 +334,18 @@ module ICache (
         if (!cpu_rstn) begin
             cwf_new_req <= 1'b0;
         end else begin
-            // 当前 miss 请求进入 REFILL 后就是待处理请求
             if (current_state == RD_MEM && dev_rrdy) begin
                 cwf_new_req <= 1'b1;
             end
 
-            // REFILL 中收到新的取指请求，说明又有待处理请求
             else if (current_state == REFILL && core_inst_rreq) begin
                 cwf_new_req <= 1'b1;
             end
 
-            // 半成品命中返回，且本拍没有新请求，则当前待处理请求完成
             else if (current_state == REFILL && cwf_hit) begin
                 cwf_new_req <= 1'b0;
             end
 
-            // 离开 REFILL 后，半成品逻辑不再持有请求
             else if (current_state != REFILL) begin
                 cwf_new_req <= 1'b0;
             end
@@ -393,9 +359,6 @@ module ICache (
             core_inst_rreq
         );
 
-    // =========================================================
-    // 8. 返回指令给 CPU
-    // =========================================================
     always @(*) begin
         inst_valid = hit | cwf_hit;
         inst1_valid = (hit | cwf_hit) & inst_dual_r;
@@ -412,11 +375,6 @@ module ICache (
         end
     end
 
-    // =========================================================
-    // 9. BRAM 写入控制
-    // 关键字优先后，最后一个返回的 word 不一定是 word7，
-    // 所以必须使用 cache_line_data_next。
-    // =========================================================
     assign cache_we =
         (current_state == REFILL) &&
         dev_rvalid &&
@@ -440,12 +398,12 @@ module ICache (
     localparam M_APPLY  = 3'd2;
     localparam M_ALL    = 3'd3;
     localparam M_DONE   = 3'd4;
-    reg [2:0] maint_state;
+    reg [2:0]           maint_state;
     reg [INDEX_WID-1:0] maint_index_r;
     reg [INDEX_WID-1:0] maint_count;
-    reg [TAG_WID-1:0] maint_tag_r;
-    reg [1:0] maint_mode_r;
-    reg [31:0] maint_ctag_r;
+    reg [TAG_WID-1:0]   maint_tag_r;
+    reg [1:0]           maint_mode_r;
+    reg [31:0]          maint_ctag_r;
 
     wire maint_active = (maint_state != M_IDLE);
     assign core_req_ready = (maint_state == M_IDLE) &&
@@ -472,16 +430,16 @@ module ICache (
 
     always @(posedge cpu_clk or negedge cpu_rstn) begin
         if (!cpu_rstn) begin
-            maint_state <= M_IDLE;
+            maint_state   <= M_IDLE;
             maint_index_r <= {INDEX_WID{1'b0}};
-            maint_count <= {INDEX_WID{1'b0}};
-            maint_tag_r <= {TAG_WID{1'b0}};
-            maint_mode_r <= 2'b00;
-            maint_ctag_r <= 32'h0;
-            line_enabled <= {`CACHE_BLK_NUM{1'b0}};
-            maint_done <= 1'b0;
+            maint_count   <= {INDEX_WID{1'b0}};
+            maint_tag_r   <= {TAG_WID{1'b0}};
+            maint_mode_r  <= 2'b00;
+            maint_ctag_r  <= 32'h0;
+            line_enabled  <= {`CACHE_BLK_NUM{1'b0}};
+            maint_done    <= 1'b0;
         end else begin
-            maint_done <= 1'b0;
+            maint_done    <= 1'b0;
             if (cache_we)
                 line_enabled[cache_idx_wr] <= 1'b1;
 
@@ -489,10 +447,10 @@ module ICache (
                 M_IDLE: begin
                     if (maint_valid && maint_ready) begin
                         maint_index_r <= maint_addr[INDEX_WID+OFFSET_WID-1:OFFSET_WID];
-                        maint_tag_r <= maint_addr[31:INDEX_WID+OFFSET_WID];
-                        maint_mode_r <= maint_mode;
-                        maint_ctag_r <= maint_ctag;
-                        maint_count <= {INDEX_WID{1'b0}};
+                        maint_tag_r   <= maint_addr[31:INDEX_WID+OFFSET_WID];
+                        maint_mode_r  <= maint_mode;
+                        maint_ctag_r  <= maint_ctag;
+                        maint_count   <= {INDEX_WID{1'b0}};
                         if (maint_all)
                             maint_state <= M_ALL;
                         else if ((maint_mode == 2'b10) || (maint_mode == 2'b00))
@@ -522,7 +480,7 @@ module ICache (
                         maint_count <= maint_count + 1'b1;
                 end
                 M_DONE: begin
-                    maint_done <= 1'b1;
+                    maint_done    <= 1'b1;
                     maint_state <= M_IDLE;
                 end
                 default: maint_state <= M_IDLE;
@@ -530,9 +488,6 @@ module ICache (
         end
     end
 
-    // =========================================================
-    // 10. 状态机
-    // =========================================================
     always @(posedge cpu_clk or negedge cpu_rstn) begin
         if (!cpu_rstn)
             current_state <= IDLE;
@@ -595,12 +550,6 @@ module ICache (
         endcase
     end
 
-    // =========================================================
-    // 11. 面向读总线的请求信号
-    //
-    // 关键字优先阶段必须发送真实 miss 地址，
-    // 让 CWF_EN=1 的桥接器知道先读哪个 word。
-    // =========================================================
     always @(*) begin
         if (current_state == RD_MEM && dev_rrdy)
             cpu_ren = 4'b1111;
@@ -610,9 +559,6 @@ module ICache (
         cpu_raddr = miss_addr_wr;
     end
 
-    // =========================================================
-    // 12. ICache 存储体
-    // =========================================================
     blk_mem_gen_0 U_isram (
         .clka   (cpu_clk),
         .wea    (bram_we),

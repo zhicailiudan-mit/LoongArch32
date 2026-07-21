@@ -35,8 +35,8 @@ module BranchUnit (
         case (npc_op)
             `NPC_ALU : if (compare_taken) target = pc + offset;
             `NPC_RET : target = src0 + offset;
-            `NPC_CALL: target = pc + offset;
-            default  : target = pc + 32'd4;
+            `NPC_CALL: target = pc   + offset;
+            default  : target = pc   + 32'd4;
         endcase
 
         condition = compare_taken;

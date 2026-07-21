@@ -10,7 +10,7 @@ module ImmExtend (
 
     always @(*) begin
         case (ext_op)
-            `EXT_5_Z : ext = {27'h0000000,din[14:10]};
+            `EXT_5_Z  : ext = {27'h0000000,din[14:10]};
             `EXT_12_S : ext = (din[21] ? {20'hfffff,din[21:10]} : {20'h00000,din[21:10]});
             `EXT_12_Z : ext = {20'h00000,din[21:10]};
             `EXT_16_S : ext = (din[25] ? {14'h3fff,din[25:10],2'b00} : {14'h0000,din[25:10],2'b00});

@@ -2,9 +2,9 @@
 `include "defines.vh"
 import cpu_types_pkg::*;
 
-// One-load/one-store LSU boundary.  The two integer lanes may finish memory
+// One-load/one-store LSU boundary. The two integer lanes may finish memory
 // address generation together, but only one Load is admitted to the DCache
-// pipeline and only one Store is admitted to SQ in a cycle.  This keeps the
+// pipeline and only one Store is admitted to SQ in a cycle. This keeps the
 // externally visible memory path single-ported and age ordered.
 module LoadStoreUnit (
     input logic cpu_rstn, input logic cpu_clk,
@@ -18,10 +18,6 @@ module LoadStoreUnit (
     input uop_id_t recover_id,
     input execute_result_t execute_result,
     input execute_result_t execute_result1,
-    input logic sq_alloc0_valid, input uop_id_t sq_alloc0_id, input logic [31:0] sq_alloc0_pc,
-    output logic sq_alloc0_ready,
-    input logic sq_alloc1_valid, input uop_id_t sq_alloc1_id, input logic [31:0] sq_alloc1_pc,
-    output logic sq_alloc1_ready,
     input commit_t commit0, input commit_t commit1,
     output logic ldst_suspend,
     output logic ldst1_suspend,
@@ -42,9 +38,6 @@ module LoadStoreUnit (
     output logic perf_store_issue,
     output logic perf_store_release,
     output logic perf_store_drain,
-    // Full-line StoreBuffer allocation path.  It is consumed by the SRAM
-    // DCache only; the AXI wrapper may tie ready low without changing the
-    // scalar load/store protocol.
     input logic store_line_alloc_ready,
     output logic store_line_alloc_valid,
     output logic [31:0] store_line_alloc_addr,
@@ -90,6 +83,13 @@ module LoadStoreUnit (
     logic [31:0] load_forward_data;
     logic [4*`UOP_ID_W-1:0] load_forward_id_flat;
     logic load_forward_valid;
+    // L0/L1 load-order stage.  The wide SQ/SB search is completed before
+    // this register; the arbiter and DCache only see the registered result.
+    logic load_l1_valid;
+    lsu_entry_t load_l1_entry;
+    logic load_l1_blocked;
+    logic load_l1_forward_valid;
+    logic [31:0] load_l1_forward_data;
     logic arb_completion_valid;
     lsu_entry_t arb_completion_entry;
     logic [31:0] arb_completion_rdata;
@@ -106,6 +106,12 @@ module LoadStoreUnit (
     completion_t main_completion_next;
     integer order_i;
     integer order_byte;
+
+    // Full-line allocation is disabled in the correctness phase.
+    assign store_line_alloc_valid = 1'b0;
+    assign store_line_alloc_addr = 32'h00000000;
+    assign store_line_alloc_data = 0;
+    assign store_line_alloc_word_mask = 0;
 
     function automatic [3:0] make_store_wen(input [3:0] mask, input [1:0] off);
         begin
@@ -179,10 +185,8 @@ module LoadStoreUnit (
         load1_valid = 1'b0;
         store_valid = store0_selected || store1_selected;
         store1_valid = 1'b0;
-        // Stores already own a dispatch-reserved SQ entry. Execution only
-        // writes address/data into that entry, so it is never an enqueue.
-        store0_accept = store0_selected && !flush;
-        store1_accept = store1_selected && !flush;
+        store0_accept = store0_selected && store_ready && !flush;
+        store1_accept = store1_selected && store_ready && !flush;
         // Stores complete at address/data generation.  Their architectural
         // side effect remains deferred until ROB commit moves them from the
         // StoreQueue into the StoreBuffer.
@@ -218,7 +222,6 @@ module LoadStoreUnit (
         store_entry.store_wen = store_wen;
         store_entry.reg_write = 1'b0;
         store_entry.arch_rd = 5'd0;
-
 
         load1_entry = '0;
         load1_entry.valid = load1_raw;
@@ -262,11 +265,10 @@ module LoadStoreUnit (
         // creates a circular wait because they cannot commit until this load
         // retires.  StoreBuffer entries have already committed and are thus
         // necessarily older than every live, unretired load.
-        for (order_i = 0; order_i < QDEPTH; order_i = order_i + 1) begin
+        for (order_i = 0; order_i < QDEPTH; order_i = order_i + 1)
             store_order_valid[order_i] = store_valid_vec[order_i] &&
                 !uop_is_younger(store_uop_id_flat[order_i*`UOP_ID_W +: `UOP_ID_W],
                                 load_head.uop_id);
-        end
         // Include an older Store currently held at the execution boundary.
         // Without this extra slot, a younger queued Load could issue in the
         // cycle before that Store becomes visible in SQ and observe stale
@@ -323,16 +325,20 @@ module LoadStoreUnit (
         // cache response itself does not stop independent work.
         ldst_suspend = !flush &&
                        ((load0_raw && (!load0_selected || !load_ready)) ||
-                        (store0_raw && !store0_selected));
+                        (store0_raw && (!store0_selected || !store_ready)));
         ldst1_suspend = !flush &&
                         ((load1_raw && (!load1_selected || !load_ready)) ||
-                         (store1_raw && !store1_selected));
+                         (store1_raw && (!store1_selected || !store_ready)));
         perf_lq_occupancy = lq_occupancy;
         perf_sq_occupancy = sq_occupancy;
         perf_sb_occupancy = sb_occupancy;
-        perf_order_block = load_head_valid && load_blocked && !load_forward_valid;
+        perf_order_block = load_l1_valid && load_l1_blocked &&
+                           !load_l1_forward_valid;
         perf_load_issue = load_issue;
-        perf_load_forward = load_issue && load_forward_valid;
+        // load_issue is generated from the registered L1 decision.  Use the
+        // same registered qualifier here so the debug counter cannot report a
+        // forward for a different (newer) L0 head.
+        perf_load_forward = load_issue && load_l1_forward_valid;
         perf_load_response = load_pop;
         perf_store_issue = store0_accept || store1_accept;
         perf_store_release = store_release_fire;
@@ -358,9 +364,10 @@ module LoadStoreUnit (
         .flush(flush),
         .recover_valid(recover_valid), .system_flush(system_flush),
         .recover_id(recover_id),
-        .alloc0_valid(sq_alloc0_valid), .alloc0_id(sq_alloc0_id), .alloc0_pc(sq_alloc0_pc), .alloc0_ready(sq_alloc0_ready),
-        .alloc1_valid(sq_alloc1_valid), .alloc1_id(sq_alloc1_id), .alloc1_pc(sq_alloc1_pc), .alloc1_ready(sq_alloc1_ready),
-        .write_valid(store_valid), .write_entry(store_accept_entry),
+        .accept_valid(store_valid), .accept_entry(store_accept_entry),
+        .accept_ready(store_ready),
+        .accept1_valid(1'b0), .accept1_entry('0),
+        .accept1_ready(store1_ready),
         .commit0(commit0), .commit1(commit1),
         .release_valid(store_release_valid), .release_entry(store_release_entry),
         .release_fire(store_release_fire),
@@ -382,11 +389,11 @@ module LoadStoreUnit (
         .store_wen_flat(buffer_wen_flat), .store_data_flat(buffer_data_flat),
         .store_byte_uop_id_flat(buffer_byte_uop_id_flat),
         .occupancy(sb_occupancy),
-        .line_alloc_ready(store_line_alloc_ready),
-        .line_alloc_valid(store_line_alloc_valid),
-        .line_alloc_addr(store_line_alloc_addr),
-        .line_alloc_data(store_line_alloc_data),
-        .line_alloc_word_mask(store_line_alloc_word_mask)
+        .line_alloc_ready(1'b0),
+        .line_alloc_valid(),
+        .line_alloc_addr(),
+        .line_alloc_data(),
+        .line_alloc_word_mask()
     );
     assign store_release_fire = store_release_valid && buffer_ready && !flush;
 
@@ -398,20 +405,47 @@ module LoadStoreUnit (
         .blocked(load_blocked)
     );
 
+    // L1 register for the load-order result.  This breaks the combinational
+    // path from SQ/SB byte-age comparison through the DCache ready and
+    // completion network.  A flush kills the stage before it can issue.
+    always_ff @(posedge cpu_clk or negedge cpu_rstn) begin
+        if (!cpu_rstn) begin
+            load_l1_valid <= 1'b0;
+            load_l1_entry <= '0;
+            load_l1_blocked <= 1'b0;
+            load_l1_forward_valid <= 1'b0;
+            load_l1_forward_data <= 32'h0;
+        end else if (flush) begin
+            load_l1_valid <= 1'b0;
+            load_l1_entry <= '0;
+            load_l1_blocked <= 1'b0;
+            load_l1_forward_valid <= 1'b0;
+            load_l1_forward_data <= 32'h0;
+        end else begin
+            if (load_l1_valid && load_pop)
+                load_l1_valid <= 1'b0;
+            if (!load_l1_valid && load_head_valid && (!load_blocked || load_forward_valid)) begin
+                load_l1_valid <= 1'b1;
+                load_l1_entry <= load_head;
+                load_l1_blocked <= load_blocked;
+                load_l1_forward_valid <= load_forward_valid;
+                load_l1_forward_data <= load_forward_data;
+            end
+        end
+    end
+
     LsuArbiter u_lsu_arbiter (
         .clk(cpu_clk), .rstn(cpu_rstn),
         .flush(flush),
+        .branch_flush(branch_flush),
         .recover_valid(recover_valid), .system_flush(system_flush),
         .recover_id(recover_id),
-        .load_valid(load_head_valid), .load_entry(load_head),
-        .load_blocked(load_blocked),
-        .load_forward_valid(load_forward_valid),
-        .load_forward_rdata(load_forward_data), .load_issue(load_issue),
+        .load_valid(load_l1_valid), .load_entry(load_l1_entry),
+        .load_blocked(load_l1_blocked),
+        .load_forward_valid(load_l1_forward_valid),
+        .load_forward_rdata(load_l1_forward_data), .load_issue(load_issue),
         .load_pop(load_pop),
-        // A complete line is allocated before any of its scalar words drain.
-        // This prevents the first word write from racing the direct-allocation
-        // BRAM update and avoids a line-allocation/read-modify-write cycle.
-        .store_valid(buffer_head_valid && !store_line_alloc_valid),
+        .store_valid(buffer_head_valid),
         .store_entry(buffer_head), .store_pop(store_pop),
         .store_line_alloc_valid(store_line_alloc_valid),
         .store_line_alloc_addr(store_line_alloc_addr),
@@ -444,9 +478,11 @@ module LoadStoreUnit (
         main_completion_next = '0;
         if (direct_valid) begin
             main_completion_next = direct_completion;
-        end else if (arb_completion_valid &&
-                     (arb_completion_entry.store_wen == `RAM_WE_N)) begin
-            main_completion_next.valid = 1'b1;
+        end else begin
+            // Cut the long completion path that includes StoreBuffer and LsuArbiter:
+            // unconditionally map the datapath fields. The backend only uses them if valid.
+            main_completion_next.valid = arb_completion_valid &&
+                                         (arb_completion_entry.store_wen == `RAM_WE_N);
             main_completion_next.uop_id = arb_completion_entry.uop_id;
             main_completion_next.value = aligned_load_data;
             main_completion_next.reg_write = arb_completion_entry.reg_write;
@@ -460,6 +496,8 @@ module LoadStoreUnit (
     always_ff @(posedge cpu_clk or negedge cpu_rstn) begin
         if (!cpu_rstn)
             main_completion <= '0;
+        else if (flush)
+            main_completion <= '0;
         else
             main_completion <= main_completion_next;
 
@@ -470,5 +508,16 @@ module LoadStoreUnit (
         else
             lane1_completion <= direct1_completion;
     end
+
+`ifndef SYNTHESIS
+    always @(posedge cpu_clk) begin
+        if (cpu_rstn && direct_valid && arb_completion_valid)
+            $fatal(1, "LSU completion collision");
+        if (cpu_rstn && flush && main_completion_next.valid)
+            $error("flushed LSU operation generated a main completion");
+        if (cpu_rstn && flush && direct1_completion.valid)
+            $error("flushed LSU operation generated a lane1 completion");
+    end
+`endif
 
 endmodule

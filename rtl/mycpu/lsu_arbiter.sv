@@ -7,6 +7,7 @@ import cpu_types_pkg::*;
 module LsuArbiter (
     input logic clk, input logic rstn,
     input logic flush,
+    input logic branch_flush,
     input logic recover_valid, input logic system_flush,
     input uop_id_t recover_id,
     input logic load_valid, input lsu_entry_t load_entry,
@@ -109,7 +110,9 @@ module LsuArbiter (
         completion_valid = 1'b0;
         completion_entry = '0;
         completion_rdata = '0;
-        if (pending_valid && !squash_pending && !direct_completion.valid) begin
+        if (flush) begin
+            completion_valid = 1'b0;
+        end else if (pending_valid && !squash_pending && !direct_completion.valid) begin
             completion_valid = 1'b1;
             completion_entry = pending_entry;
             completion_rdata = pending_rdata;
@@ -119,6 +122,8 @@ module LsuArbiter (
             completion_rdata = response_rdata;
         end
     end
+
+    wire surviving_load_response = branch_flush && load_response_seen && !active_killed && !uop_is_younger(active_entry.uop_id, recover_id);
 
     always_ff @(posedge clk or negedge rstn) begin
         if (!rstn) begin
@@ -154,7 +159,7 @@ module LsuArbiter (
 
             if (response_event) begin
                 state <= IDLE;
-                if (direct_completion.valid && !flush) begin
+                if ((direct_completion.valid && !flush) || surviving_load_response) begin
                     pending_valid <= 1'b1;
                     pending_entry <= response_entry;
                     pending_rdata <= response_rdata;
@@ -162,5 +167,55 @@ module LsuArbiter (
             end
         end
     end
+
+`ifndef SYNTHESIS
+    always @(posedge clk) begin
+        if (rstn) begin
+            // 1. branch flush survivor response 必须保存
+            if ($past(surviving_load_response) && !$past(squash_active) && !pending_valid)
+                $fatal(1, "surviving load response not saved to pending");
+
+            // 2. survivor identity 稳定
+            if ($past(surviving_load_response) && !$past(squash_active)) begin
+                if (pending_entry.uop_id != $past(active_entry.uop_id) ||
+                    pending_entry.pc != $past(active_entry.pc) ||
+                    pending_entry.address != $past(active_entry.address) ||
+                    pending_entry.load_ext_op != $past(active_entry.load_ext_op))
+                    $fatal(1, "surviving load identity corrupted");
+            end
+
+            // 3. 被 squash 的年轻 Load不能完成
+            if (branch_flush && load_response_seen && uop_is_younger(active_entry.uop_id, recover_id)) begin
+                if (completion_valid && completion_entry.uop_id == active_entry.uop_id)
+                    $fatal(1, "squashed young load completed");
+            end
+
+            // 4. system_flush 后不能保留 pending
+            if ($past(system_flush) && pending_valid)
+                $fatal(1, "system_flush failed to clear pending");
+
+            // 5. pending 不得被覆盖
+            if ($past(pending_valid) && !$past(completion_valid) && !$past(squash_pending)) begin
+                if (!pending_valid || pending_entry != $past(pending_entry) || pending_rdata != $past(pending_rdata))
+                    $fatal(1, "pending overwritten or lost");
+            end
+
+            // 6. Load completion唯一性
+            if ($past(completion_valid) && completion_valid && completion_entry.uop_id == $past(completion_entry.uop_id))
+                $fatal(1, "Load completion duplicated");
+
+            // 7. load_pop 守恒
+            if (load_pop && !load_forward_event && !squash_active) begin
+                if (!completion_valid && !surviving_load_response && !(direct_completion.valid && !flush))
+                    $fatal(1, "load_pop without completion or pending write. uop_id=%p, recover_id=%p, state=%d, flush=%b, branch_flush=%b, system_flush=%b, dcache_rsp.valid=%b, pending_valid=%b", active_entry.uop_id, recover_id, state, flush, branch_flush, system_flush, dcache_rsp.valid, pending_valid);
+            end
+
+            if (surviving_load_response) begin
+                $display("[LSU-COVER] preserved older load response across branch flush\n  active uop_id=%p, recover_id=%p, PC=%h, address=%h, data=%h",
+                         active_entry.uop_id, recover_id, active_entry.pc, active_entry.address, dcache_rsp.rdata);
+            end
+        end
+    end
+`endif
 
 endmodule

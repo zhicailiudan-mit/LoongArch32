@@ -51,11 +51,6 @@ module mycpu_top(
     wire        dc2cpu_wready;
     wire        dc2cpu_wposted;
     wire        dc2cpu_wresp ;
-    wire        dc_line_alloc_valid;
-    wire [31:0] dc_line_alloc_addr;
-    wire [`CACHE_BLK_SIZE-1:0] dc_line_alloc_data;
-    wire [`CACHE_BLK_LEN-1:0] dc_line_alloc_word_mask;
-    wire        dc_line_alloc_ready;
 
     wire        dev2dc_wrdy  ;
     wire        dev2dc_wdone ;
@@ -102,11 +97,11 @@ module mycpu_top(
         .daccess_wready (dc2cpu_wready),
         .daccess_wposted(dc2cpu_wposted),
         .daccess_wresp  (dc2cpu_wresp),
-        .daccess_line_alloc_valid(dc_line_alloc_valid),
-        .daccess_line_alloc_addr(dc_line_alloc_addr),
-        .daccess_line_alloc_data(dc_line_alloc_data),
-        .daccess_line_alloc_word_mask(dc_line_alloc_word_mask),
-        .daccess_line_alloc_ready(dc_line_alloc_ready),
+        .daccess_line_alloc_valid(),
+        .daccess_line_alloc_addr(),
+        .daccess_line_alloc_data(),
+        .daccess_line_alloc_word_mask(),
+        .daccess_line_alloc_ready(1'b0),
         .icache_maint_valid(ic_maint_valid),
         .icache_maint_ready(ic_maint_ready),
         .icache_maint_done (ic_maint_done),
@@ -163,11 +158,13 @@ module mycpu_top(
         .data_wready    (dc2cpu_wready),
         .data_wposted   (dc2cpu_wposted),
         .data_wresp     (dc2cpu_wresp ),
-        .line_alloc_valid(dc_line_alloc_valid),
-        .line_alloc_addr(dc_line_alloc_addr),
-        .line_alloc_data(dc_line_alloc_data),
-        .line_alloc_word_mask(dc_line_alloc_word_mask),
-        .line_alloc_ready(dc_line_alloc_ready),
+        // Full-line allocation is intentionally disabled.  Keep the legacy
+        // DCache sideband tied off instead of allowing a partial handshake.
+        .line_alloc_valid(1'b0),
+        .line_alloc_addr(32'h00000000),
+        .line_alloc_data(0),
+        .line_alloc_word_mask(0),
+        .line_alloc_ready(),
         // Interface to Bus
         .dev_wrdy       (dev2dc_wrdy  ),
         .dev_wdone      (dev2dc_wdone ),

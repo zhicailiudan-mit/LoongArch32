@@ -56,6 +56,15 @@ module DCache (
     localparam OFFSET_WID = $clog2(`CACHE_BLK_LEN) + 2;     // 5 bit
     localparam TAG_WID    = 32 - INDEX_WID - OFFSET_WID;    // 22 bit
     localparam BLK_WID    = `CACHE_BLK_SIZE + TAG_WID + 1;  // 279 bit
+    localparam LINE_WORD_IW = $clog2(`CACHE_BLK_LEN);
+    localparam LINE_LAST_WORD = `CACHE_BLK_LEN - 1;
+
+`ifndef SYNTHESIS
+    initial begin
+        if ((`CACHE_BLK_LEN != 8) || (`CACHE_BLK_SIZE != 256))
+            $error("DCache correctness implementation requires an 8-word/32-byte line");
+    end
+`endif
 
     // =========================================================
     // 读写状态机参数定义
@@ -85,7 +94,7 @@ module DCache (
     reg [2:0] r_state, r_nstat;
     reg [2:0] w_state, w_nstat;
     reg [2:0] maint_state;
-    reg [2:0] recv_cnt;
+    reg [LINE_WORD_IW-1:0] recv_cnt;
     reg [255:0] cache_line_data;
     reg [255:0] refill_commit_data;
 
@@ -98,32 +107,12 @@ module DCache (
     reg [ 3:0] req_wen_r;
     reg [31:0] req_wdata_r;
     reg        req_cacheable_r;
-    reg        line_alloc_pending;
-    reg [31:0] line_alloc_addr_r;
-    reg [`CACHE_BLK_SIZE-1:0] line_alloc_data_r;
-    reg [`CACHE_BLK_LEN-1:0] line_alloc_word_mask_r;
     wire refill_commit = (r_state == R_REFILL) && dev_rvalid &&
-                         (recv_cnt == 7) && req_cacheable_r;
+                         (recv_cnt == LINE_LAST_WORD) && req_cacheable_r;
     reg [`CACHE_BLK_NUM-1:0] line_enabled0;
     reg [`CACHE_BLK_NUM-1:0] line_enabled1;
     reg [`CACHE_BLK_NUM-1:0] replace_way;
     reg                      refill_way_r;
-    reg                      refill_response_sent;
-    reg                      hm_probe_valid;
-    reg [31:0]               hm_probe_addr;
-    reg                      hm_response_pending;
-    reg [31:0]               hm_response_data;
-    // Per-word validity for the line currently being refilled.  A secondary
-    // request to that line waits for its own word instead of allocating a
-    // second miss transaction.
-    reg [7:0]                 refill_word_valid_mask;
-    // One-entry victim buffer.  The current DCache is write-through, so the
-    // victim is clean; it is used to avoid an SRAM refill when a recently
-    // evicted line is requested again.
-    reg                      victim_valid;
-    reg [INDEX_WID-1:0]      victim_index;
-    reg [TAG_WID-1:0]        victim_tag;
-    reg [`CACHE_BLK_SIZE-1:0] victim_data;
 
     wire is_idle = (r_state == R_IDLE && w_state == W_IDLE) &&
                    !data_valid && !data_wresp;
@@ -141,19 +130,10 @@ module DCache (
     wire uncached = !req_cacheable_r ||
                     (req_addr_r[31:16] == 16'hBFAF) ||
                     (req_addr_r[31:16] == 16'hBFD0);
-    wire hm_window = (r_state == R_REFILL) && (w_state == W_IDLE) &&
-                     !data_valid && !data_wresp && !hm_response_pending;
-
-    wire victim_hit = (r_state == R_TAG_CHK) && !uncached &&
-                      victim_valid && (victim_index == cache_index) &&
-                      (victim_tag == tag_from_cpu);
-    wire line_alloc_accept = line_alloc_valid && line_alloc_ready;
-    wire line_alloc_commit = line_alloc_pending && is_idle &&
-                             (maint_state == M_IDLE);
-    assign line_alloc_ready = is_idle && !line_alloc_pending &&
-                              (maint_state == M_IDLE);
-    // A full-line allocation owns the DCache write port for this cycle.
-    assign data_wready = is_idle && !line_alloc_valid && !line_alloc_pending;
+    // Full-line allocation is intentionally disabled in this correctness
+    // phase.  Keep the wrapper sideband quiescent.
+    assign line_alloc_ready = 1'b0;
+    assign data_wready = is_idle;
     // A cacheable store is owned by this request slot once accepted. MMIO
     // remains strongly ordered and reports completion only after the bus ACK.
     assign data_wposted = is_idle && (|data_wen) && !incoming_uncached;
@@ -166,35 +146,14 @@ module DCache (
         if (!cpu_rstn) begin
             req_addr_r <= 0; req_ren_r <= 0; req_wen_r <= 0; req_wdata_r <= 0;
             req_cacheable_r <= 1'b0;
-            line_alloc_pending <= 1'b0;
-            line_alloc_addr_r <= 32'h0;
-            line_alloc_data_r <= 0;
-            line_alloc_word_mask_r <= 0;
         end else if (is_idle && has_req) begin
             req_addr_r  <= data_addr;
             req_ren_r   <= data_ren;
             req_wen_r   <= data_wen;
             req_wdata_r <= data_wdata;
             req_cacheable_r <= data_cacheable;
-        end else begin
-            if (line_alloc_accept) begin
-                line_alloc_pending <= 1'b1;
-                line_alloc_addr_r <= line_alloc_addr;
-                line_alloc_data_r <= line_alloc_data;
-                line_alloc_word_mask_r <= line_alloc_word_mask;
-            end else if (line_alloc_commit) begin
-                line_alloc_pending <= 1'b0;
-            end
         end
     end
-
-    // 主存地址分解已在请求锁存区前置定义，保证第1拍即可驱动 BRAM。
-    wire [INDEX_WID-1:0] alloc_index = line_alloc_pending ?
-                                       line_alloc_addr_r[INDEX_WID+OFFSET_WID-1:OFFSET_WID] :
-                                       cache_index;
-    wire [TAG_WID-1:0] alloc_tag = line_alloc_pending ?
-                                    line_alloc_addr_r[31:INDEX_WID+OFFSET_WID] :
-                                    tag_from_cpu;
 
     // =========================================================
     // 2. Cache 块数据解析与命中判定
@@ -218,93 +177,7 @@ module DCache (
     wire miss_way = (!valid_bit0 || !line_enabled0[cache_index]) ? 1'b0 :
                     ((!valid_bit1 || !line_enabled1[cache_index]) ? 1'b1 :
                      replace_way[cache_index]);
-    wire alloc_hit0 = valid_bit0 && line_enabled0[alloc_index] &&
-                      (tag_from_cache0 == alloc_tag);
-    wire alloc_hit1 = valid_bit1 && line_enabled1[alloc_index] &&
-                      (tag_from_cache1 == alloc_tag);
-    wire alloc_way = alloc_hit0 ? 1'b0 :
-                     alloc_hit1 ? 1'b1 :
-                     ((!valid_bit0 || !line_enabled0[alloc_index]) ? 1'b0 :
-                      ((!valid_bit1 || !line_enabled1[alloc_index]) ? 1'b1 :
-                       replace_way[alloc_index]));
-    wire alloc_source_valid = alloc_way ?
-                              (valid_bit1 && line_enabled1[alloc_index]) :
-                              (valid_bit0 && line_enabled0[alloc_index]);
-    wire [TAG_WID-1:0] alloc_source_tag = alloc_way ? tag_from_cache1 : tag_from_cache0;
-    wire [`CACHE_BLK_SIZE-1:0] alloc_source_data = alloc_way ?
-                                                    cache_line_r1[`CACHE_BLK_SIZE-1:0] :
-                                                    cache_line_r0[`CACHE_BLK_SIZE-1:0];
-    wire [BLK_WID-1:0] cache_line_hm0;
-    wire [BLK_WID-1:0] cache_line_hm1;
-    wire cache_hm_valid0 = cache_line_hm0[BLK_WID-1];
-    wire cache_hm_valid1 = cache_line_hm1[BLK_WID-1];
-    wire [TAG_WID-1:0] cache_hm_tag0 = cache_line_hm0[BLK_WID-2 : `CACHE_BLK_SIZE];
-    wire [TAG_WID-1:0] cache_hm_tag1 = cache_line_hm1[BLK_WID-2 : `CACHE_BLK_SIZE];
-    wire [INDEX_WID-1:0] hm_index = data_addr[INDEX_WID+OFFSET_WID-1:OFFSET_WID];
-    wire [TAG_WID-1:0] hm_tag = data_addr[31:INDEX_WID+OFFSET_WID];
-    wire hm_probe_match = hm_window && hm_probe_valid && (|data_ren) &&
-                          (data_addr == hm_probe_addr);
-    wire hm_hit0 = hm_probe_match && cache_hm_valid0 &&
-                   line_enabled0[hm_index] && (cache_hm_tag0 == hm_tag);
-    wire hm_hit1 = hm_probe_match && cache_hm_valid1 &&
-                   line_enabled1[hm_index] && (cache_hm_tag1 == hm_tag);
-    wire hm_refill_line_match = hm_probe_match &&
-                                 (hm_probe_addr[31:5] == req_addr_r[31:5]);
-    wire hm_refill_hit = hm_refill_line_match &&
-                         refill_word_valid_mask[hm_probe_addr[4:2]];
-    wire hm_hit = hm_hit0 || hm_hit1 || hm_refill_hit;
-    assign data_rready = is_idle || hm_hit || victim_hit;
-    always @(posedge cpu_clk or negedge cpu_rstn) begin
-        if (!cpu_rstn) begin
-            hm_probe_valid <= 1'b0;
-            hm_probe_addr <= 32'h0;
-        end else if (hm_window && (|data_ren) && !hm_hit) begin
-            hm_probe_valid <= 1'b1;
-            hm_probe_addr <= data_addr;
-        end else if (!hm_window || hm_hit) begin
-            hm_probe_valid <= 1'b0;
-        end
-    end
-    wire [BLK_WID-1:0] hm_selected_line = hm_hit0 ? cache_line_hm0 : cache_line_hm1;
-    reg [31:0] hm_hit_rdata;
-    always @(*) begin
-        if (hm_refill_hit) begin
-            case (hm_probe_addr[4:2])
-                3'd0: hm_hit_rdata = cache_line_data[31:0];
-                3'd1: hm_hit_rdata = cache_line_data[63:32];
-                3'd2: hm_hit_rdata = cache_line_data[95:64];
-                3'd3: hm_hit_rdata = cache_line_data[127:96];
-                3'd4: hm_hit_rdata = cache_line_data[159:128];
-                3'd5: hm_hit_rdata = cache_line_data[191:160];
-                3'd6: hm_hit_rdata = cache_line_data[223:192];
-                default: hm_hit_rdata = cache_line_data[255:224];
-            endcase
-        end else begin
-            case (data_addr[4:2])
-                3'd0: hm_hit_rdata = hm_selected_line[31:0];
-                3'd1: hm_hit_rdata = hm_selected_line[63:32];
-                3'd2: hm_hit_rdata = hm_selected_line[95:64];
-                3'd3: hm_hit_rdata = hm_selected_line[127:96];
-                3'd4: hm_hit_rdata = hm_selected_line[159:128];
-                3'd5: hm_hit_rdata = hm_selected_line[191:160];
-                3'd6: hm_hit_rdata = hm_selected_line[223:192];
-                default: hm_hit_rdata = hm_selected_line[255:224];
-            endcase
-        end
-    end
-    reg [31:0] victim_rdata;
-    always @(*) begin
-        case (offset[4:2])
-            3'd0: victim_rdata = victim_data[31:0];
-            3'd1: victim_rdata = victim_data[63:32];
-            3'd2: victim_rdata = victim_data[95:64];
-            3'd3: victim_rdata = victim_data[127:96];
-            3'd4: victim_rdata = victim_data[159:128];
-            3'd5: victim_rdata = victim_data[191:160];
-            3'd6: victim_rdata = victim_data[223:192];
-            default: victim_rdata = victim_data[255:224];
-        endcase
-    end
+    assign data_rready = is_idle;
     wire hit_r = (r_state == R_TAG_CHK) && hit;
     wire hit_w = (w_state == W_TAG_CHK) && hit;
 
@@ -328,11 +201,11 @@ module DCache (
                 end else r_nstat = R_IDLE;
             end
             
-            R_TAG_CHK:  r_nstat = (hit_r || victim_hit) ? R_IDLE : R_RD_MEM;
+            R_TAG_CHK:  r_nstat = hit_r ? R_IDLE : R_RD_MEM;
             R_RD_MEM:   r_nstat = dev_rrdy ? R_REFILL : R_RD_MEM;
             // The requested word is returned as soon as its refill beat
             // arrives; the remaining beats continue filling the selected way.
-            R_REFILL:   r_nstat = (dev_rvalid && recv_cnt == 7) ? R_IDLE : R_REFILL;
+            R_REFILL:   r_nstat = (dev_rvalid && recv_cnt == LINE_LAST_WORD) ? R_IDLE : R_REFILL;
             
             // The read bridge response is transferred with a synchronized
             // event and may arrive on the same cpu_clk edge that accepts the
@@ -370,7 +243,8 @@ module DCache (
     // =========================================================
     // The refill bus may return the requested word first.  The three-bit
     // addition naturally wraps within the eight-word cache line.
-    wire [2:0] refill_word_sel = req_addr_r[4:2] + recv_cnt;
+    wire [LINE_WORD_IW-1:0] refill_word_sel =
+        req_addr_r[OFFSET_WID-1:2] + recv_cnt;
 
     always @(posedge cpu_clk or negedge cpu_rstn) begin
         if (!cpu_rstn) recv_cnt <= 0;
@@ -409,25 +283,13 @@ module DCache (
         end
     end
 
-    always @(posedge cpu_clk or negedge cpu_rstn) begin
-        if (!cpu_rstn) begin
-            refill_word_valid_mask <= 8'h00;
-        end else if ((r_state == R_TAG_CHK) && !hit) begin
-            refill_word_valid_mask <= 8'h00;
-        end else if ((r_state == R_REFILL) && dev_rvalid) begin
-            refill_word_valid_mask[refill_word_sel] <= 1'b1;
-        end else if (refill_commit) begin
-            refill_word_valid_mask <= 8'h00;
-        end
-    end
-
     // === 写命中 (Write Hit) 时，利用写掩码更新指定字节 ===
     reg [255:0] updated_data_blk;
     integer i;
     always @(*) begin
         updated_data_blk = selected_cache_line[255:0]; // 默认保留命中路数据
         for (i=0; i<8; i=i+1) begin
-            if (offset[4:2] == i) begin
+            if (offset[OFFSET_WID-1:2] == i) begin
                 // 利用动态切片语法精确修改特定字节
                 if (req_wen_r[0]) updated_data_blk[i*32 + 0  +: 8] = req_wdata_r[7:0];
                 if (req_wen_r[1]) updated_data_blk[i*32 + 8  +: 8] = req_wdata_r[15:8];
@@ -438,112 +300,28 @@ module DCache (
     end
 
     // Cache 写使能：读重填结束，或写命中时触发
-    wire cache_we = refill_commit || hit_w || victim_hit || line_alloc_commit;
+    wire cache_we = refill_commit || hit_w;
     wire cache_we0 = cache_we &&
-                     ((refill_commit ? refill_way_r :
-                       (line_alloc_commit ? alloc_way :
-                        (victim_hit ? miss_way : hit_way))) == 1'b0);
+                     ((refill_commit ? refill_way_r : hit_way) == 1'b0);
     wire cache_we1 = cache_we &&
-                     ((refill_commit ? refill_way_r :
-                       (line_alloc_commit ? alloc_way :
-                        (victim_hit ? miss_way : hit_way))) == 1'b1);
+                     ((refill_commit ? refill_way_r : hit_way) == 1'b1);
     wire refill_word_valid = (r_state == R_REFILL) && dev_rvalid &&
-                             !refill_response_sent &&
-                             (recv_cnt == 3'd0);
-`ifndef SYNTHESIS
-    // Phase-0/2 observation points. These counters are simulation-only and
-    // intentionally do not feed any functional control signal.
-    (* keep = "true", mark_debug = "true" *) reg [63:0] perf_dcache_hits;
-    (* keep = "true", mark_debug = "true" *) reg [63:0] perf_dcache_misses;
-    (* keep = "true", mark_debug = "true" *) reg [63:0] perf_secondary_miss_hits;
-    (* keep = "true", mark_debug = "true" *) reg [63:0] perf_hit_under_miss;
-    (* keep = "true", mark_debug = "true" *) reg [63:0] perf_critical_word_returns;
-    (* keep = "true", mark_debug = "true" *) reg [63:0] perf_refill_cycles;
-    (* keep = "true", mark_debug = "true" *) reg [63:0] perf_bus_read_beats;
-    always @(posedge cpu_clk or negedge cpu_rstn) begin
-        if (!cpu_rstn) begin
-            perf_dcache_hits <= 0;
-            perf_dcache_misses <= 0;
-            perf_secondary_miss_hits <= 0;
-            perf_hit_under_miss <= 0;
-            perf_critical_word_returns <= 0;
-            perf_refill_cycles <= 0;
-            perf_bus_read_beats <= 0;
-        end else begin
-            if (hit_r) perf_dcache_hits <= perf_dcache_hits + 1;
-            if ((r_state == R_TAG_CHK) && !hit)
-                perf_dcache_misses <= perf_dcache_misses + 1;
-            if (hm_window && hm_refill_hit)
-                perf_secondary_miss_hits <= perf_secondary_miss_hits + 1;
-            if (hm_window && (hm_hit0 || hm_hit1))
-                perf_hit_under_miss <= perf_hit_under_miss + 1;
-            if (refill_word_valid)
-                perf_critical_word_returns <= perf_critical_word_returns + 1;
-            if (r_state == R_REFILL)
-                perf_refill_cycles <= perf_refill_cycles + 1;
-            if ((r_state == R_REFILL) && dev_rvalid)
-                perf_bus_read_beats <= perf_bus_read_beats + 1;
-        end
-    end
-`endif
+                              (recv_cnt == {LINE_WORD_IW{1'b0}});
 
     always @(posedge cpu_clk or negedge cpu_rstn) begin
         if (!cpu_rstn) begin
             refill_way_r <= 1'b0;
-            refill_response_sent <= 1'b0;
         end else begin
             if ((r_state == R_TAG_CHK) && !hit) begin
                 refill_way_r <= miss_way;
-                refill_response_sent <= 1'b0;
-            end else if (refill_word_valid) begin
-                refill_response_sent <= 1'b1;
-            end else if (refill_commit) begin
-                refill_response_sent <= 1'b0;
             end
         end
     end
 
-    // Capture the line that is about to be replaced.  A victim hit swaps the
-    // cached line into this slot; a direct full-line Store allocation also
-    // preserves the evicted clean line for a possible immediate reuse.
-    always @(posedge cpu_clk or negedge cpu_rstn) begin
-        if (!cpu_rstn) begin
-            victim_valid <= 1'b0;
-            victim_index <= 0;
-            victim_tag <= 0;
-            victim_data <= 0;
-        end else if (victim_hit) begin
-            victim_valid <= (miss_way ?
-                             (valid_bit1 && line_enabled1[cache_index]) :
-                             (valid_bit0 && line_enabled0[cache_index]));
-            victim_index <= cache_index;
-            victim_tag <= miss_way ? tag_from_cache1 : tag_from_cache0;
-            victim_data <= miss_way ? cache_line_r1[`CACHE_BLK_SIZE-1:0] :
-                                      cache_line_r0[`CACHE_BLK_SIZE-1:0];
-        end else if (line_alloc_commit) begin
-            victim_valid <= alloc_source_valid && !alloc_hit0 && !alloc_hit1;
-            victim_index <= alloc_index;
-            victim_tag <= alloc_source_tag;
-            victim_data <= alloc_source_data;
-        end else if ((r_state == R_TAG_CHK) && !hit && !victim_hit) begin
-            victim_valid <= (miss_way ?
-                             (valid_bit1 && line_enabled1[cache_index]) :
-                             (valid_bit0 && line_enabled0[cache_index]));
-            victim_index <= cache_index;
-            victim_tag <= miss_way ? tag_from_cache1 : tag_from_cache0;
-            victim_data <= miss_way ? cache_line_r1[`CACHE_BLK_SIZE-1:0] :
-                                      cache_line_r0[`CACHE_BLK_SIZE-1:0];
-        end
-    end
-    
     // 待写入的 Cache 块拼接
-    wire [BLK_WID-1:0] cache_line_w = line_alloc_commit ?
-                                      {1'b1, alloc_tag, line_alloc_data_r} :
-                                      victim_hit ?
-                                      {1'b1, victim_tag, victim_data} :
-                                      ((w_state == W_TAG_CHK) ?
+    wire [BLK_WID-1:0] cache_line_w = (w_state == W_TAG_CHK) ?
                                       {1'b1, selected_cache_tag, updated_data_blk} : // Hit: 写回修改后的整块
-                                       {1'b1, tag_from_cpu, refill_commit_data}); // Miss: 拼装主存数据
+                                       {1'b1, tag_from_cpu, refill_commit_data}; // Miss: 拼装主存数据
 
     // =========================================================
     // 6. 输出信号生成 (规避 concurrent assignment 报错)
@@ -553,7 +331,7 @@ module DCache (
     // BRAM/tag/word-select 组合路径直接进入流水线全局暂停与写回网络。
     reg [31:0] hit_rdata;
     always @(*) begin
-        case (offset[4:2])
+        case (offset[OFFSET_WID-1:2])
             3'd0: hit_rdata = selected_cache_line[31:0];
             3'd1: hit_rdata = selected_cache_line[63:32];
             3'd2: hit_rdata = selected_cache_line[95:64];
@@ -569,28 +347,12 @@ module DCache (
         if (!cpu_rstn) begin
             data_valid <= 1'b0;
             data_rdata <= 32'h0;
-            hm_response_pending <= 1'b0;
-            hm_response_data <= 32'h0;
         end else begin
             data_valid <= 1'b0;
 
-            if (hm_response_pending) begin
-                data_valid <= 1'b1;
-                data_rdata <= hm_response_data;
-                hm_response_pending <= 1'b0;
-            end else if (refill_word_valid) begin
+            if (refill_word_valid) begin
                 data_valid <= 1'b1;
                 data_rdata <= dev_rdata;
-                if (hm_hit) begin
-                    hm_response_pending <= 1'b1;
-                    hm_response_data <= hm_hit_rdata;
-                end
-            end else if (hm_hit) begin
-                data_valid <= 1'b1;
-                data_rdata <= hm_hit_rdata;
-            end else if (victim_hit) begin
-                data_valid <= 1'b1;
-                data_rdata <= victim_rdata;
             end else if (hit_r) begin
                 data_valid <= 1'b1;
                 data_rdata <= hit_rdata;
@@ -639,6 +401,21 @@ module DCache (
             
         end
     end
+
+`ifndef SYNTHESIS
+    // The bus write address must remain the address captured when this Store
+    // entered the DCache request slot.  This catches accidental line/index
+    // reconstruction and stale-request reuse.
+    always @(posedge cpu_clk) begin
+        if (cpu_rstn && (cpu_wen != 4'h0) &&
+            (cpu_waddr !== req_addr_r))
+            $error("DCache cpu_waddr differs from latched Store address");
+        // Older unit benches omit the optional sideband port, leaving it
+        // floating.  Treat only an asserted 1 as a protocol violation.
+        if (cpu_rstn && (line_alloc_valid === 1'b1))
+            $error("DCache line allocation must remain disabled");
+    end
+`endif
     // =========================================================
     // 7. CACOP maintenance and BRAM port arbitration
     // =========================================================
@@ -652,21 +429,10 @@ module DCache (
     // CACOP 0x01 is index invalidate.  CACOP 0x09 selects mode01 below;
     // because this D-cache is write-through and has no dirty state, clearing
     // valid is architecturally sufficient for writeback-invalidate.
-    wire maint_store_we = 1'b0;
-    wire bram_we = cache_we | maint_store_we;
-    wire [BLK_WID-1:0] maint_line_w = {
-        maint_ctag_r[0],
-        maint_ctag_r[TAG_WID:1],
-        selected_cache_line[`CACHE_BLK_SIZE-1:0]
-    };
-    wire [BLK_WID-1:0] bram_line_w = maint_store_we ?
-                                       maint_line_w : cache_line_w;
     wire [INDEX_WID-1:0] bram_index = maint_active ?
-                                         maint_index_r :
-                                         (line_alloc_pending ? alloc_index : cache_index);
-    wire [INDEX_WID-1:0] hm_bram_index = hm_window ? hm_index : bram_index;
+                                         maint_index_r : cache_index;
     assign maint_ready = (maint_state == M_IDLE) && is_idle && !has_req &&
-                         !line_alloc_pending;
+                         1'b1;
 
     always @(posedge cpu_clk or negedge cpu_rstn) begin
         if (!cpu_rstn) begin
@@ -688,20 +454,6 @@ module DCache (
                 else
                     line_enabled1[cache_index] <= 1'b1;
                 replace_way[cache_index] <= ~refill_way_r;
-            end
-            if (line_alloc_commit) begin
-                if (alloc_way == 1'b0)
-                    line_enabled0[alloc_index] <= 1'b1;
-                else
-                    line_enabled1[alloc_index] <= 1'b1;
-                replace_way[alloc_index] <= ~alloc_way;
-            end
-            if (victim_hit) begin
-                if (miss_way == 1'b0)
-                    line_enabled0[cache_index] <= 1'b1;
-                else
-                    line_enabled1[cache_index] <= 1'b1;
-                replace_way[cache_index] <= ~miss_way;
             end
             if (hit_r || hit_w)
                 replace_way[cache_index] <= ~hit_way;
@@ -779,20 +531,21 @@ module DCache (
         .dina   (cache_line_w),
         .douta  (cache_line_r1)
     );
-    blk_mem_gen_0 U_dsram_hm_way0 (
-        .clka   (cpu_clk),
-        .wea    (cache_we0),
-        .addra  (hm_bram_index),
-        .dina   (cache_line_w),
-        .douta  (cache_line_hm0)
-    );
-    blk_mem_gen_0 U_dsram_hm_way1 (
-        .clka   (cpu_clk),
-        .wea    (cache_we1),
-        .addra  (hm_bram_index),
-        .dina   (cache_line_w),
-        .douta  (cache_line_hm1)
-    );
+
+`ifndef SYNTHESIS
+    reg [31:0] w_wait_cnt;
+    always @(posedge cpu_clk or negedge cpu_rstn) begin
+        if (!cpu_rstn) w_wait_cnt <= 0;
+        else if (w_state == W_WR_WAIT) w_wait_cnt <= w_wait_cnt + 1;
+        else w_wait_cnt <= 0;
+    end
+    always @(posedge cpu_clk) begin
+        if (cpu_rstn && w_wait_cnt > 100) begin
+            $display("[T=%0t] DCache watchdog timeout! w_state=%d, req_addr_r=%h, dev_wdone=%b", $time, w_state, req_addr_r, dev_wdone);
+            $fatal(1, "W_WR_WAIT watchdog");
+        end
+    end
+`endif
 
 `else
 

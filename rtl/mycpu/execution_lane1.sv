@@ -6,7 +6,7 @@ import cpu_types_pkg::*;
 
 // Independent second integer/MDU/address-generation lane. Ordered branch and
 // system side effects remain on lane 0; memory packets use LSU input 1.
-module IntegerAluLane1 (
+module ExecutionLane1 (
     input  logic                    clk,
     input  logic                    rstn,
     input  logic                    flush,
@@ -98,7 +98,7 @@ module IntegerAluLane1 (
         execute_result.select_ram = (load_ext_op_q != `N_RAM_EXT);
     end
 
-    IntegerAlu u_integer_alu (
+    IntegerAluCore u_integer_alu_core (
         .alu_op (alu_op_q),
         .a      (src_a_sel_q ? src0_q : pc_q),
         .b      (src_b_sel_q ? src1_q : imm_q),

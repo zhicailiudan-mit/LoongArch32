@@ -29,4 +29,16 @@ module CompletionRouter (
         complete1.valid = issue1_complete_in.valid &&
                           rob_live_mask[issue1_complete_in.uop_id.rob_tag];
     end
+
+`ifndef SYNTHESIS
+    always_comb begin
+        if (system_complete_in.valid && main_complete_in.valid) begin
+            $fatal(1, "Completion collision in CompletionRouter: system_uop_id=%p, main_uop_id=%p, sys_val=%h, main_val=%h, sys_reg_write=%b, main_reg_write=%b", 
+                   system_complete_in.uop_id, main_complete_in.uop_id, system_complete_in.value, main_complete_in.value, system_complete_in.reg_write, main_complete_in.reg_write);
+        end
+        if (complete0.valid && !rob_live_mask[complete0.uop_id.rob_tag]) begin
+            $fatal(1, "CompletionRouter: complete0 uop_id=%p is not in rob_live_mask", complete0.uop_id);
+        end
+    end
+`endif
 endmodule

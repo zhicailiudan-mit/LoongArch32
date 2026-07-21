@@ -13,9 +13,6 @@ module MemoryOrderChecker #(parameter integer STORE_SLOTS = 8) (
         blocked = 1'b0;
         for (i = 0; i < STORE_SLOTS; i = i + 1)
             if (load_valid && store_valid[i] &&
-                // A reserved older Store with an unresolved address is a
-                // conservative memory-order barrier.  It must not disappear
-                // merely because it has not reached the execute stage yet.
                 (!store_addr_ready[i] ||
                  (((load_addr & 32'hffff_fffc) ==
                    (store_addr_flat[i*32 +: 32] & 32'hffff_fffc)) &&

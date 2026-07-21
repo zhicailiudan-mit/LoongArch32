@@ -41,6 +41,7 @@ module cache_wreq_bridge(
         .empty      (fifo_empty)
     );
 
+    // fifo_empty 只表示当前没有待读写项，不能表示 SRAM 已完成写入。
     assign dev_wrdy = rstn && !fifo_full;
 
     // ==========================================
@@ -79,6 +80,8 @@ module cache_wreq_bridge(
     assign bus_we    = data_valid ? fifo_we : 4'h0; // 此时 fifo_we 已经是正确的 'f' 了！
     assign bus_wdata = fifo_wdata;
 
+    // SRAM 没有显式 B 响应，以 bus_uclk 域真正发出写使能的时刻作为完成点。
+    // 通过 toggle 跨时钟域，避免短脉冲被 cpu_clk 漏采样。
     reg done_toggle_bus;
     reg done_toggle_cpu1;
     reg done_toggle_cpu2;
