@@ -22,3 +22,9 @@
 # OS files
 .DS_Store
 Thumbs.db
+rtl/mycpu/xsim.dir/
+rtl/mycpu/xvlog.pb
+*.sdb
+*.wdb
+*.jou
+*.log
