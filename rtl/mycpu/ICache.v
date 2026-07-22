@@ -333,6 +333,12 @@ module ICache (
     always @(posedge cpu_clk or negedge cpu_rstn) begin
         if (!cpu_rstn) begin
             cwf_new_req <= 1'b0;
+        end else if (pred_error) begin
+            // The frontend drops all metadata on a redirect.  Cancel the
+            // matching critical-word-first response as well; the outstanding
+            // refill may still finish and populate the cache, but it must not
+            // be presented as the response for a corrected-path request.
+            cwf_new_req <= 1'b0;
         end else begin
             if (current_state == RD_MEM && dev_rrdy) begin
                 cwf_new_req <= 1'b1;
@@ -505,7 +511,13 @@ module ICache (
             end
 
             TAG_CHK: begin
-                if (!bram_line_ready) begin
+                // A redirect invalidates inst_addr_r even when the synchronous
+                // tag/data RAM has not returned yet.  Check it before
+                // bram_line_ready so the old lookup cannot become a miss on
+                // the following cycle and get paired with new-path metadata.
+                if (pred_error) begin
+                    next_state = IDLE;
+                end else if (!bram_line_ready) begin
                     next_state = TAG_CHK;
                 end else if (hit) begin
                     if (core_inst_rreq)
@@ -513,14 +525,7 @@ module ICache (
                     else
                         next_state = IDLE;
                 end else begin
-                    if (pred_error) begin
-                        if (core_inst_rreq)
-                            next_state = TAG_CHK;
-                        else
-                            next_state = IDLE;
-                    end else begin
-                        next_state = RD_MEM;
-                    end
+                    next_state = RD_MEM;
                 end
             end
 

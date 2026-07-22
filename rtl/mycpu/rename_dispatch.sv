@@ -47,9 +47,12 @@ module RenameDispatch (
     wire commit1_bypass [0:3];
     wire [31:0] source_value [0:3];
     wire dispatch_src_ready [0:1][0:1];
-    wire rename_ready;
-    wire pair_resources_ready;
-    wire single_resources_ready;
+    wire [1:0] rename_pop_count;
+    wire [1:0] rename_occupancy;
+    wire lane0_resources_ready;
+    wire lane1_resources_ready;
+    wire dispatch0_fire;
+    wire dispatch1_fire;
 
     assign source_used[0] = renamed_uop[0].src0.used;
     assign source_used[1] = renamed_uop[0].src1.used;
@@ -83,14 +86,16 @@ module RenameDispatch (
         end
     endgenerate
 
-    assign pair_resources_ready = rob_alloc_ready[0] && rob_alloc_ready[1] &&
-                                   scheduler_dispatch_ready[0] &&
+    assign lane0_resources_ready = rob_alloc_ready[0] &&
+                                   scheduler_dispatch_ready[0];
+    assign lane1_resources_ready = rob_alloc_ready[1] &&
                                    scheduler_dispatch_ready[1];
-    assign single_resources_ready = rob_alloc_ready[0] &&
-                                     scheduler_dispatch_ready[0];
-    assign rename_ready = (rn_valid[1] ? pair_resources_ready :
-                                      single_resources_ready) &&
-                          !redirect_valid;
+    assign dispatch0_fire = rn_valid[0] && lane0_resources_ready &&
+                            !redirect_valid;
+    assign dispatch1_fire = rn_valid[1] && dispatch0_fire &&
+                            lane1_resources_ready;
+    assign rename_pop_count = dispatch1_fire ? 2'd2 :
+                              dispatch0_fire ? 2'd1 : 2'd0;
 
     assign dispatch_src_ready[0][0] = !source_used[0] || !rat_pending[0] ||
                                       rob_query_done[0] || complete[0].valid &&
@@ -128,9 +133,10 @@ module RenameDispatch (
         .in_uop1     (decode_uop[1]),
         .out_valid0  (rn_valid[0]),
         .out_valid1  (rn_valid[1]),
-        .out_ready   (rename_ready),
+        .out_pop_count(rename_pop_count),
         .out_uop0    (renamed_uop[0]),
         .out_uop1    (renamed_uop[1]),
+        .occupancy   (rename_occupancy),
         .commit0     (commit[0]),
         .commit1     (commit[1])
     );
@@ -195,7 +201,7 @@ module RenameDispatch (
 
     always_comb begin
         dispatch[0] = '0;
-        dispatch[0].valid = rn_valid[0] && rename_ready;
+        dispatch[0].valid = dispatch0_fire;
         dispatch[0].src0_ready = dispatch_src_ready[0][0];
         dispatch[0].src0_id = rat_id[0];
         dispatch[0].src1_ready = dispatch_src_ready[0][1];
@@ -229,7 +235,7 @@ module RenameDispatch (
         dispatch[0].uop.pred = renamed_uop[0].pred;
 
         dispatch[1] = '0;
-        dispatch[1].valid = dispatch[0].valid && rn_valid[1];
+        dispatch[1].valid = dispatch1_fire;
         dispatch[1].src0_ready = dispatch_src_ready[1][0];
         dispatch[1].src0_id = rat_id[2];
         dispatch[1].src1_ready = dispatch_src_ready[1][1];
@@ -262,5 +268,45 @@ module RenameDispatch (
         dispatch[1].uop.serializing = renamed_uop[1].serializing;
         dispatch[1].uop.pred = renamed_uop[1].pred;
     end
+
+`ifndef SYNTHESIS
+    reg [63:0] elastic_cycle_count;
+    reg [63:0] partial_dispatch_count;
+    reg [1:0] elastic_max_occupancy;
+    always @(posedge clk or negedge rstn) begin
+        if (!rstn) begin
+            elastic_cycle_count <= 0;
+            partial_dispatch_count <= 0;
+            elastic_max_occupancy <= 0;
+        end else begin
+            elastic_cycle_count <= elastic_cycle_count + 1;
+            if (dispatch0_fire && rn_valid[1] && !dispatch1_fire)
+                partial_dispatch_count <= partial_dispatch_count + 1;
+            if (rename_occupancy > elastic_max_occupancy)
+                elastic_max_occupancy <= rename_occupancy;
+
+            if (dispatch[1].valid && !dispatch[0].valid)
+                $fatal(1, "Dispatch lane1 advanced before lane0");
+            if (dispatch[0].valid &&
+                (!rob_alloc_ready[0] || !scheduler_dispatch_ready[0]))
+                $fatal(1, "Dispatch lane0 was not atomic across ROB and Scheduler");
+            if (dispatch[1].valid &&
+                (!rob_alloc_ready[1] || !scheduler_dispatch_ready[1]))
+                $fatal(1, "Dispatch lane1 was not atomic across ROB and Scheduler");
+            if (dispatch[1].valid &&
+                (rob_alloc_id[1] !== (rob_alloc_id[0] + 1'b1)))
+                $fatal(1, "Dual dispatch ROB IDs are not consecutive in age order");
+
+            if (((elastic_cycle_count + 1) % 100000) == 0)
+                $display("[DISPATCH-ELASTIC] cycles=%0d partial_dispatch=%0d max_occupancy=%0d occupancy=%0d",
+                         elastic_cycle_count + 1,
+                         partial_dispatch_count +
+                         (dispatch0_fire && rn_valid[1] && !dispatch1_fire),
+                         (rename_occupancy > elastic_max_occupancy) ?
+                          rename_occupancy : elastic_max_occupancy,
+                         rename_occupancy);
+        end
+    end
+`endif
 
 endmodule

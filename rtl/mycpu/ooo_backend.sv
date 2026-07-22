@@ -42,7 +42,7 @@ module OooBackend (
     output commit_t                      commit1,
 
     output logic [`ROB_TAG_W:0]          perf_rob_occupancy,
-    output logic [2:0]                   perf_issue_occupancy,
+    output logic [3:0]                   perf_issue_occupancy,
     output logic                         perf_rob_block,
     output logic                         perf_issue_queue_block,
     output logic                         perf_true_source_wait,
@@ -64,7 +64,7 @@ module OooBackend (
     wire uop_id_t rob_alloc_id [0:1];
     wire [`ROB_DEPTH-1:0] rob_live_mask;
     wire [`ROB_TAG_W:0] rob_occupancy;
-    wire [2:0] scheduler_occupancy;
+    wire [3:0] scheduler_occupancy;
     wire [`ROB_TAG_W-1:0] rob_head_tag;
     wire uop_id_t rob_query_id [0:3];
     wire rob_query_done [0:3];

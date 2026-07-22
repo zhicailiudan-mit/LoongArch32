@@ -120,7 +120,7 @@ module MyCpu (
     wire perf_bpu_wait;
     wire perf_icache_wait;
     wire [`ROB_TAG_W:0] perf_rob_occupancy;
-    wire [2:0] perf_issue_occupancy;
+    wire [3:0] perf_issue_occupancy;
     wire [2:0] perf_lq_occupancy;
     wire [2:0] perf_sq_occupancy;
     wire [2:0] perf_sb_occupancy;

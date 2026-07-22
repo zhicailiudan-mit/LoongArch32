@@ -55,7 +55,7 @@ module Scheduler (
     input  logic                     issue1_ready,
     output logic                     issue1_fire,
     output issue_uop_t               issue1,
-    output logic [2:0]               occupancy,
+    output logic [3:0]               occupancy,
     output logic                     perf_true_source_wait,
     output logic                     perf_lsu_order,
     output logic                     perf_serializing
@@ -66,7 +66,7 @@ module Scheduler (
     wire dq_issue_valid [0:1];
     wire dq_issue_ready [0:1];
     wire issue_uop_t dq_issue [0:1];
-    wire [2:0] dq_occupancy;
+    wire [3:0] dq_occupancy;
     wire completion_t dq_complete [0:1];
     wire commit_t dq_commit [0:1];
 

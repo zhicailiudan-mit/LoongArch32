@@ -6,8 +6,8 @@
 `define ENABLE_BPU
 
 // Backend sizing shared by ROB, RAT, issue queue and pipeline tags.
-`define ROB_DEPTH 16
-`define ROB_TAG_W 4
+`define ROB_DEPTH 32
+`define ROB_TAG_W 5
 `define UOP_EPOCH_W 2
 `define UOP_ID_W (`UOP_EPOCH_W + `ROB_TAG_W)
 

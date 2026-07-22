@@ -125,7 +125,10 @@ module PrivilegeSystem (
             // Direct-address mode with the existing cacheable MAT setting.
             // The privilege placeholder must preserve the pre-existing
             // instruction/data-cache behavior until CSR semantics are enabled.
-            state_r.crmd <= 32'h0000_0088;
+            // DA=1, PG=0; DATF=01 and DATM=01.  The old 0x88 value left
+            // DATF=00, making every instruction request uncached even though
+            // the ICache hit pipeline and refill arrays were enabled.
+            state_r.crmd <= 32'h0000_00a8;
             state_r.dmw0 <= 32'h0000_0000;
             state_r.dmw1 <= 32'h0000_0000;
             state_r.ctag <= 32'h0000_0000;

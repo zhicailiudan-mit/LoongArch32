@@ -4,10 +4,10 @@
 // Select exactly one test profile.  Change only this line before elaborating
 // the soc_verify simulation; the MIF and reference traces switch together.
 //`define TEST_PROFILE_STREAM
-`define TEST_PROFILE_MATRIX
+//`define TEST_PROFILE_MATRIX
 //`define TEST_PROFILE_CRYPTONIGHT
 //`define TEST_PROFILE_MIXED
-//`define TEST_PROFILE_COMPREHENSIVE
+`define TEST_PROFILE_COMPREHENSIVE
 
 `ifdef TEST_PROFILE_STREAM
   `define SRAM_INIT_FILE        "C:/Users/wanlinc/Desktop/Me/Loogn cpu v1/func_test/func/obj/inst_ram_stream.mif"

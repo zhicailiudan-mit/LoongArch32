@@ -39,13 +39,13 @@ module DispatchQueue #(
     output wire                  issue_valid [0:1],
     input  wire                  issue_ready [0:1],
     output issue_uop_t           issue [0:1],
-    output wire [2:0]            occupancy
+    output wire [3:0]            occupancy
 );
 
-    localparam DQ_DEPTH = 4;
-    // Five sequence bits are sufficient because at most ROB_DEPTH=16 uops
-    // can be live.  Therefore any two live queue entries are separated by
-    // less than half of this modulo-32 sequence space.
+    localparam DQ_DEPTH = 8;
+    // One bit beyond the ROB tag is sufficient because at most ROB_DEPTH
+    // uops can be live. Any two live queue entries are therefore separated
+    // by less than half of this modular sequence space.
     localparam DQ_SEQ_W = `ROB_TAG_W + 1;
 
     reg [DQ_DEPTH-1:0] valid;
@@ -88,9 +88,9 @@ module DispatchQueue #(
     // is presented while stalled, keep its selected entry stable even if the
     // other lane fires and changes the normal issue arbitration.
     reg main_hold_valid;
-    reg [1:0] main_hold_sel;
+    reg [2:0] main_hold_sel;
     reg fast_hold_valid;
-    reg [1:0] fast_hold_sel;
+    reg [2:0] fast_hold_sel;
     reg [2:0] ras_ptr [0:DQ_DEPTH-1];
     reg pred_valid [0:DQ_DEPTH-1];
     reg pred_taken [0:DQ_DEPTH-1];
@@ -102,11 +102,11 @@ module DispatchQueue #(
     // prediction packet but is never used by issue selection or CPU control.
     reg perf_btb_hit [0:DQ_DEPTH-1];
 
-    reg [2:0] count;
-    wire [1:0] issue_sel;
-    wire [1:0] fast_issue_sel;
-    reg [1:0] enq_sel;
-    reg [1:0] enq1_sel;
+    reg [3:0] count;
+    wire [2:0] issue_sel;
+    wire [2:0] fast_issue_sel;
+    reg [2:0] enq_sel;
+    reg [2:0] enq1_sel;
     wire      issue_found;
     wire      fast_issue_found;
     reg       free_found;
@@ -241,53 +241,70 @@ module DispatchQueue #(
         end
     endfunction
 
-    // Balanced 4-way oldest selector.  The previous priority-loop form was
-    // instantiated three times in series (oldest -> main -> fast), creating
-    // a 28-LUT-level path.  This tournament compares 0/1 and 2/3 in parallel,
-    // then compares the two winners.
-    // Return value: {found, slot[1:0]}.
-    function [2:0] pick_oldest4;
+    // Balanced 8-way tournament. Pair, quarter, and final comparisons form
+    // three fixed levels; no timing-critical serial priority loop is used.
+    // Return value: {found, slot[2:0]}.
+    function [3:0] pick_oldest8;
         input [DQ_DEPTH-1:0] mask;
         input [DQ_SEQ_W-1:0] seq0;
         input [DQ_SEQ_W-1:0] seq1;
         input [DQ_SEQ_W-1:0] seq2;
         input [DQ_SEQ_W-1:0] seq3;
-        reg                  valid01;
-        reg                  valid23;
-        reg [1:0]            sel01;
-        reg [1:0]            sel23;
-        reg [DQ_SEQ_W-1:0]   win_seq01;
-        reg [DQ_SEQ_W-1:0]   win_seq23;
+        input [DQ_SEQ_W-1:0] seq4;
+        input [DQ_SEQ_W-1:0] seq5;
+        input [DQ_SEQ_W-1:0] seq6;
+        input [DQ_SEQ_W-1:0] seq7;
+        reg valid01, valid23, valid45, valid67;
+        reg valid03, valid47;
+        reg [2:0] sel01, sel23, sel45, sel67;
+        reg [2:0] sel03, sel47;
+        reg [DQ_SEQ_W-1:0] win01, win23, win45, win67;
+        reg [DQ_SEQ_W-1:0] win03, win47;
         begin
             valid01 = mask[0] | mask[1];
             valid23 = mask[2] | mask[3];
-
+            valid45 = mask[4] | mask[5];
+            valid67 = mask[6] | mask[7];
             if (mask[0] && (!mask[1] || seq_is_older(seq0, seq1))) begin
-                sel01 = 2'd0;
-                win_seq01 = seq0;
+                sel01 = 3'd0; win01 = seq0;
             end else begin
-                sel01 = 2'd1;
-                win_seq01 = seq1;
+                sel01 = 3'd1; win01 = seq1;
             end
-
             if (mask[2] && (!mask[3] || seq_is_older(seq2, seq3))) begin
-                sel23 = 2'd2;
-                win_seq23 = seq2;
+                sel23 = 3'd2; win23 = seq2;
             end else begin
-                sel23 = 2'd3;
-                win_seq23 = seq3;
+                sel23 = 3'd3; win23 = seq3;
+            end
+            if (mask[4] && (!mask[5] || seq_is_older(seq4, seq5))) begin
+                sel45 = 3'd4; win45 = seq4;
+            end else begin
+                sel45 = 3'd5; win45 = seq5;
+            end
+            if (mask[6] && (!mask[7] || seq_is_older(seq6, seq7))) begin
+                sel67 = 3'd6; win67 = seq6;
+            end else begin
+                sel67 = 3'd7; win67 = seq7;
             end
 
-            if (!valid01 && !valid23)
-                pick_oldest4 = 3'b000;
-            else if (!valid23)
-                pick_oldest4 = {1'b1, sel01};
-            else if (!valid01)
-                pick_oldest4 = {1'b1, sel23};
-            else if (seq_is_older(win_seq01, win_seq23))
-                pick_oldest4 = {1'b1, sel01};
+            valid03 = valid01 | valid23;
+            if (valid01 && (!valid23 || seq_is_older(win01, win23))) begin
+                sel03 = sel01; win03 = win01;
+            end else begin
+                sel03 = sel23; win03 = win23;
+            end
+            valid47 = valid45 | valid67;
+            if (valid45 && (!valid67 || seq_is_older(win45, win67))) begin
+                sel47 = sel45; win47 = win45;
+            end else begin
+                sel47 = sel67; win47 = win67;
+            end
+
+            if (!valid03 && !valid47)
+                pick_oldest8 = 4'b0000;
+            else if (valid03 && (!valid47 || seq_is_older(win03, win47)))
+                pick_oldest8 = {1'b1, sel03};
             else
-                pick_oldest4 = {1'b1, sel23};
+                pick_oldest8 = {1'b1, sel47};
         end
     endfunction
 
@@ -308,7 +325,7 @@ module DispatchQueue #(
     wire [DQ_DEPTH-1:0] serializing_mask;
     logic [DQ_DEPTH-1:0] older_branch_pending;
     logic [DQ_DEPTH-1:0] older_store_pending;
-    wire [2:0] next_barrier_pick;
+    wire [3:0] next_barrier_pick;
     wire next_barrier_found;
     wire [DQ_SEQ_W-1:0] next_barrier_seq;
     wire [DQ_DEPTH-1:0] next_barrier_blocks;
@@ -340,9 +357,11 @@ module DispatchQueue #(
     end
 
 `ifndef SYNTHESIS
-    wire [2:0] perf_oldest_valid = pick_oldest4(valid, alloc_seq[0], alloc_seq[1], alloc_seq[2], alloc_seq[3]);
-    wire [1:0] perf_oldest_idx = perf_oldest_valid[1:0];
-    wire perf_oldest_is_valid = perf_oldest_valid[2];
+    wire [3:0] perf_oldest_valid = pick_oldest8(
+        valid, alloc_seq[0], alloc_seq[1], alloc_seq[2], alloc_seq[3],
+        alloc_seq[4], alloc_seq[5], alloc_seq[6], alloc_seq[7]);
+    wire [2:0] perf_oldest_idx = perf_oldest_valid[2:0];
+    wire perf_oldest_is_valid = perf_oldest_valid[3];
 `else
     assign perf_true_source_wait = 1'b0;
     assign perf_lsu_order = 1'b0;
@@ -455,11 +474,12 @@ module DispatchQueue #(
     // Barrier age comparisons feed only registered state.  Release occurs
     // from the registered privilege response, after system_inflight has
     // already protected the whole execution window.
-    assign next_barrier_pick = pick_oldest4(
+    assign next_barrier_pick = pick_oldest8(
         serializing_mask,
-        alloc_seq[0], alloc_seq[1], alloc_seq[2], alloc_seq[3]);
-    assign next_barrier_found = next_barrier_pick[2];
-    assign next_barrier_seq = alloc_seq[next_barrier_pick[1:0]];
+        alloc_seq[0], alloc_seq[1], alloc_seq[2], alloc_seq[3],
+        alloc_seq[4], alloc_seq[5], alloc_seq[6], alloc_seq[7]);
+    assign next_barrier_found = next_barrier_pick[3];
+    assign next_barrier_seq = alloc_seq[next_barrier_pick[2:0]];
     assign barrier_blocks_new = barrier_release ? next_barrier_found :
                                                    barrier_active;
 
@@ -470,69 +490,64 @@ module DispatchQueue #(
     // barrier state blocks younger entries.
     wire [DQ_DEPTH-1:0] main_candidate = valid & slot_ready & ~barrier_blocked &
         ~fast_hold_onehot;
-    wire [2:0] oldest_main_pick = pick_oldest4(
+    wire [3:0] oldest_main_pick = pick_oldest8(
         main_candidate,
-        alloc_seq[0], alloc_seq[1], alloc_seq[2], alloc_seq[3]);
+        alloc_seq[0], alloc_seq[1], alloc_seq[2], alloc_seq[3],
+        alloc_seq[4], alloc_seq[5], alloc_seq[6], alloc_seq[7]);
 
     // When the oldest ready uop can run on ALU1, prefer a second ready uop
     // which requires lane0 (LSU/MDU/branch).  The fast selector below then
     // chooses the original oldest ALU uop, so both issue in the same cycle.
-    // Four exclusion masks avoid putting the same entry on both outputs and
+    // Eight exclusion masks avoid putting the same entry on both outputs and
     // retain the balanced selector structure used on the timing-critical path.
     wire [DQ_DEPTH-1:0] lane0_candidate = main_candidate & slot_lane0_only &
                                           ~main_hold_onehot;
-    wire [2:0] lane0_pick_no0 = pick_oldest4(
-        lane0_candidate & 4'b1110,
-        alloc_seq[0], alloc_seq[1], alloc_seq[2], alloc_seq[3]);
-    wire [2:0] lane0_pick_no1 = pick_oldest4(
-        lane0_candidate & 4'b1101,
-        alloc_seq[0], alloc_seq[1], alloc_seq[2], alloc_seq[3]);
-    wire [2:0] lane0_pick_no2 = pick_oldest4(
-        lane0_candidate & 4'b1011,
-        alloc_seq[0], alloc_seq[1], alloc_seq[2], alloc_seq[3]);
-    wire [2:0] lane0_pick_no3 = pick_oldest4(
-        lane0_candidate & 4'b0111,
-        alloc_seq[0], alloc_seq[1], alloc_seq[2], alloc_seq[3]);
-    reg [2:0] lane0_pair_pick;
+    wire [3:0] lane0_pick_no0 = pick_oldest8(lane0_candidate & 8'b11111110, alloc_seq[0], alloc_seq[1], alloc_seq[2], alloc_seq[3], alloc_seq[4], alloc_seq[5], alloc_seq[6], alloc_seq[7]);
+    wire [3:0] lane0_pick_no1 = pick_oldest8(lane0_candidate & 8'b11111101, alloc_seq[0], alloc_seq[1], alloc_seq[2], alloc_seq[3], alloc_seq[4], alloc_seq[5], alloc_seq[6], alloc_seq[7]);
+    wire [3:0] lane0_pick_no2 = pick_oldest8(lane0_candidate & 8'b11111011, alloc_seq[0], alloc_seq[1], alloc_seq[2], alloc_seq[3], alloc_seq[4], alloc_seq[5], alloc_seq[6], alloc_seq[7]);
+    wire [3:0] lane0_pick_no3 = pick_oldest8(lane0_candidate & 8'b11110111, alloc_seq[0], alloc_seq[1], alloc_seq[2], alloc_seq[3], alloc_seq[4], alloc_seq[5], alloc_seq[6], alloc_seq[7]);
+    wire [3:0] lane0_pick_no4 = pick_oldest8(lane0_candidate & 8'b11101111, alloc_seq[0], alloc_seq[1], alloc_seq[2], alloc_seq[3], alloc_seq[4], alloc_seq[5], alloc_seq[6], alloc_seq[7]);
+    wire [3:0] lane0_pick_no5 = pick_oldest8(lane0_candidate & 8'b11011111, alloc_seq[0], alloc_seq[1], alloc_seq[2], alloc_seq[3], alloc_seq[4], alloc_seq[5], alloc_seq[6], alloc_seq[7]);
+    wire [3:0] lane0_pick_no6 = pick_oldest8(lane0_candidate & 8'b10111111, alloc_seq[0], alloc_seq[1], alloc_seq[2], alloc_seq[3], alloc_seq[4], alloc_seq[5], alloc_seq[6], alloc_seq[7]);
+    wire [3:0] lane0_pick_no7 = pick_oldest8(lane0_candidate & 8'b01111111, alloc_seq[0], alloc_seq[1], alloc_seq[2], alloc_seq[3], alloc_seq[4], alloc_seq[5], alloc_seq[6], alloc_seq[7]);
+    reg [3:0] lane0_pair_pick;
     always @(*) begin
-        case (oldest_main_pick[1:0])
-            2'd0: lane0_pair_pick = lane0_pick_no0;
-            2'd1: lane0_pair_pick = lane0_pick_no1;
-            2'd2: lane0_pair_pick = lane0_pick_no2;
-            default: lane0_pair_pick = lane0_pick_no3;
+        case (oldest_main_pick[2:0])
+            3'd0: lane0_pair_pick = lane0_pick_no0;
+            3'd1: lane0_pair_pick = lane0_pick_no1;
+            3'd2: lane0_pair_pick = lane0_pick_no2;
+            3'd3: lane0_pair_pick = lane0_pick_no3;
+            3'd4: lane0_pair_pick = lane0_pick_no4;
+            3'd5: lane0_pair_pick = lane0_pick_no5;
+            3'd6: lane0_pair_pick = lane0_pick_no6;
+            default: lane0_pair_pick = lane0_pick_no7;
         endcase
     end
     wire use_resource_pair = RESOURCE_AWARE_PAIRING && !main_hold_valid &&
-                             oldest_main_pick[2] &&
-                             slot_fast_eligible[oldest_main_pick[1:0]] &&
-                             lane0_pair_pick[2];
-    wire [2:0] main_pick = use_resource_pair ? lane0_pair_pick :
+                             oldest_main_pick[3] &&
+                             slot_fast_eligible[oldest_main_pick[2:0]] &&
+                             lane0_pair_pick[3];
+    wire [3:0] main_pick = use_resource_pair ? lane0_pair_pick :
                                                  oldest_main_pick;
-    assign issue_found = main_hold_valid ? valid[main_hold_sel] : main_pick[2];
-    assign issue_sel = main_hold_valid ? main_hold_sel : main_pick[1:0];
+    assign issue_found = main_hold_valid ? valid[main_hold_sel] : main_pick[3];
+    assign issue_sel = main_hold_valid ? main_hold_sel : main_pick[2:0];
 
     // Compute all fast-lane exclusion cases in parallel.  The main selector
     // chooses only the final small mux; it no longer feeds another complete
     // priority/age scan.
     wire [DQ_DEPTH-1:0] fast_candidate = valid & slot_ready & ~barrier_blocked &
         slot_fast_eligible & ~main_hold_onehot;
-    wire [2:0] fast_pick_any = pick_oldest4(
-        fast_candidate,
-        alloc_seq[0], alloc_seq[1], alloc_seq[2], alloc_seq[3]);
-    wire [2:0] fast_pick_no0 = pick_oldest4(
-        fast_candidate & 4'b1110,
-        alloc_seq[0], alloc_seq[1], alloc_seq[2], alloc_seq[3]);
-    wire [2:0] fast_pick_no1 = pick_oldest4(
-        fast_candidate & 4'b1101,
-        alloc_seq[0], alloc_seq[1], alloc_seq[2], alloc_seq[3]);
-    wire [2:0] fast_pick_no2 = pick_oldest4(
-        fast_candidate & 4'b1011,
-        alloc_seq[0], alloc_seq[1], alloc_seq[2], alloc_seq[3]);
-    wire [2:0] fast_pick_no3 = pick_oldest4(
-        fast_candidate & 4'b0111,
-        alloc_seq[0], alloc_seq[1], alloc_seq[2], alloc_seq[3]);
+    wire [3:0] fast_pick_any = pick_oldest8(fast_candidate, alloc_seq[0], alloc_seq[1], alloc_seq[2], alloc_seq[3], alloc_seq[4], alloc_seq[5], alloc_seq[6], alloc_seq[7]);
+    wire [3:0] fast_pick_no0 = pick_oldest8(fast_candidate & 8'b11111110, alloc_seq[0], alloc_seq[1], alloc_seq[2], alloc_seq[3], alloc_seq[4], alloc_seq[5], alloc_seq[6], alloc_seq[7]);
+    wire [3:0] fast_pick_no1 = pick_oldest8(fast_candidate & 8'b11111101, alloc_seq[0], alloc_seq[1], alloc_seq[2], alloc_seq[3], alloc_seq[4], alloc_seq[5], alloc_seq[6], alloc_seq[7]);
+    wire [3:0] fast_pick_no2 = pick_oldest8(fast_candidate & 8'b11111011, alloc_seq[0], alloc_seq[1], alloc_seq[2], alloc_seq[3], alloc_seq[4], alloc_seq[5], alloc_seq[6], alloc_seq[7]);
+    wire [3:0] fast_pick_no3 = pick_oldest8(fast_candidate & 8'b11110111, alloc_seq[0], alloc_seq[1], alloc_seq[2], alloc_seq[3], alloc_seq[4], alloc_seq[5], alloc_seq[6], alloc_seq[7]);
+    wire [3:0] fast_pick_no4 = pick_oldest8(fast_candidate & 8'b11101111, alloc_seq[0], alloc_seq[1], alloc_seq[2], alloc_seq[3], alloc_seq[4], alloc_seq[5], alloc_seq[6], alloc_seq[7]);
+    wire [3:0] fast_pick_no5 = pick_oldest8(fast_candidate & 8'b11011111, alloc_seq[0], alloc_seq[1], alloc_seq[2], alloc_seq[3], alloc_seq[4], alloc_seq[5], alloc_seq[6], alloc_seq[7]);
+    wire [3:0] fast_pick_no6 = pick_oldest8(fast_candidate & 8'b10111111, alloc_seq[0], alloc_seq[1], alloc_seq[2], alloc_seq[3], alloc_seq[4], alloc_seq[5], alloc_seq[6], alloc_seq[7]);
+    wire [3:0] fast_pick_no7 = pick_oldest8(fast_candidate & 8'b01111111, alloc_seq[0], alloc_seq[1], alloc_seq[2], alloc_seq[3], alloc_seq[4], alloc_seq[5], alloc_seq[6], alloc_seq[7]);
 
-    reg [2:0] fast_pick;
+    reg [3:0] fast_pick;
     always @(*) begin
         // Never present the same entry on both output lanes.  The old logic
         // allowed lane1 to select the lane0 entry when lane0 was stalled;
@@ -542,19 +557,23 @@ module DispatchQueue #(
             fast_pick = fast_pick_any;
         end else begin
             case (issue_sel)
-                2'd0: fast_pick = fast_pick_no0;
-                2'd1: fast_pick = fast_pick_no1;
-                2'd2: fast_pick = fast_pick_no2;
-                default: fast_pick = fast_pick_no3;
+                3'd0: fast_pick = fast_pick_no0;
+                3'd1: fast_pick = fast_pick_no1;
+                3'd2: fast_pick = fast_pick_no2;
+                3'd3: fast_pick = fast_pick_no3;
+                3'd4: fast_pick = fast_pick_no4;
+                3'd5: fast_pick = fast_pick_no5;
+                3'd6: fast_pick = fast_pick_no6;
+                default: fast_pick = fast_pick_no7;
             endcase
         end
     end
-    assign fast_issue_found = fast_hold_valid ? valid[fast_hold_sel] : fast_pick[2];
-    assign fast_issue_sel = fast_hold_valid ? fast_hold_sel : fast_pick[1:0];
+    assign fast_issue_found = fast_hold_valid ? valid[fast_hold_sel] : fast_pick[3];
+    assign fast_issue_sel = fast_hold_valid ? fast_hold_sel : fast_pick[2:0];
 
     always @(*) begin
-        enq_sel = 2'h0;
-        enq1_sel = 2'h0;
+        enq_sel = 3'h0;
+        enq1_sel = 3'h0;
         free_found = 1'b0;
         second_free_found = 1'b0;
         for (k = 0; k < DQ_DEPTH; k = k + 1) begin
@@ -564,10 +583,10 @@ module DispatchQueue #(
             if (!valid[k]) begin
                 if (!free_found) begin
                     free_found = 1'b1;
-                    enq_sel = k[1:0];
-                end else if (!second_free_found && (k[1:0] != enq_sel)) begin
+                    enq_sel = k[2:0];
+                end else if (!second_free_found && (k[2:0] != enq_sel)) begin
                     second_free_found = 1'b1;
-                    enq1_sel = k[1:0];
+                    enq1_sel = k[2:0];
                 end
             end
         end
@@ -830,10 +849,10 @@ module DispatchQueue #(
             barrier_blocked <= {DQ_DEPTH{1'b0}};
             barrier_active <= 1'b0;
             main_hold_valid <= 1'b0;
-            main_hold_sel <= 2'h0;
+            main_hold_sel <= 3'h0;
             fast_hold_valid <= 1'b0;
-            fast_hold_sel <= 2'h0;
-            count <= 3'h0;
+            fast_hold_sel <= 3'h0;
+            count <= 4'h0;
             next_alloc_seq <= {DQ_SEQ_W{1'b0}};
             for (i = 0; i < DQ_DEPTH; i = i + 1) begin
                 uop_id[i] <= '0;
@@ -887,9 +906,9 @@ module DispatchQueue #(
             end
             barrier_active <= 1'b0;
             main_hold_valid <= 1'b0;
-            main_hold_sel <= 2'h0;
+            main_hold_sel <= 3'h0;
             fast_hold_valid <= 1'b0;
-            fast_hold_sel <= 2'h0;
+            fast_hold_sel <= 3'h0;
             count <= recover_count;
             if (system_flush)
                 next_alloc_seq <= {DQ_SEQ_W{1'b0}};

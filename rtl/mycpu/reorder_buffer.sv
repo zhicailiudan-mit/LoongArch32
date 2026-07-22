@@ -105,9 +105,15 @@ module ReorderBuffer (
     // Recovery has priority over allocation in the sequential state update.
     // Reflect that priority at the ready/valid boundary so a source cannot
     // observe a false allocation fire in the recovery cycle.
-    assign alloc_ready[0] = !recover_valid && (count != `ROB_DEPTH);
-    assign alloc_ready[1] = !recover_valid &&
-                            (count <= (`ROB_DEPTH - 2));
+    // Retirement and allocation share an edge.  Include the entries retired
+    // on that edge in the advertised space so a full ROB need not insert a
+    // bubble before reusing its head slot.  Allocation writes occur after the
+    // retirement clears in the sequential block, so a reused slot remains
+    // valid with the new epoch/tag payload.
+    wire [`ROB_TAG_W:0] free_after_commit =
+        `ROB_DEPTH - count + commit0_valid + commit1_valid;
+    assign alloc_ready[0] = !recover_valid && (free_after_commit >= 1);
+    assign alloc_ready[1] = !recover_valid && (free_after_commit >= 2);
     assign alloc_id[0].rob_tag = tail;
     assign alloc_id[0].epoch = tail_epoch;
     assign alloc_id[1].rob_tag = tail + {{(`ROB_TAG_W-1){1'b0}}, 1'b1};
@@ -187,7 +193,13 @@ module ReorderBuffer (
                     end
                 end
                 tail <= recover_id.rob_tag + {{(`ROB_TAG_W-1){1'b0}}, 1'b1};
-                tail_epoch <= recover_id.epoch +
+                // Start a fresh allocation generation after recovery.  The
+                // natural wrap increment alone would immediately reuse the
+                // exact uop_id of the first killed entry, allowing its late
+                // completion to update a newly allocated correct-path uop.
+                // Epoch width is unchanged; this is only a generation step
+                // in addition to the normal tag-wrap step.
+                tail_epoch <= recover_id.epoch + 1'b1 +
                               (recover_id.rob_tag == {`ROB_TAG_W{1'b1}});
                 count <= {1'b0, recover_distance} + 1'b1 -
                          commit0_valid - commit1_valid;

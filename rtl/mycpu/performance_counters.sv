@@ -28,7 +28,7 @@ module PerformanceCounters #(
     input logic                    commit1_valid,
     input logic [31:0]             commit1_pc,
     input logic [`ROB_TAG_W:0]     rob_occupancy,
-    input logic [2:0]              issue_occupancy,
+    input logic [3:0]              issue_occupancy,
     input logic [2:0]              lq_occupancy,
     input logic [2:0]              sq_occupancy,
     input logic [2:0]              sb_occupancy,
@@ -178,7 +178,7 @@ module PerformanceCounters #(
     logic [63:0] perf_sb_occupancy_sum;
     
     logic [`ROB_TAG_W:0] perf_rob_occupancy_max;
-    logic [2:0] perf_issue_occupancy_max;
+    logic [3:0] perf_issue_occupancy_max;
     logic [2:0] perf_lq_occupancy_max;
     logic [2:0] perf_sq_occupancy_max;
     logic [2:0] perf_sb_occupancy_max;
