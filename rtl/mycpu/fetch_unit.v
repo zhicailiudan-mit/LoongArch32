@@ -13,8 +13,13 @@ module FetchUnit (
     input  wire [31:0]  pred_target  ,
     input  wire         pred_taken   ,
     input  wire [ 9:0]  pred_index   ,
+    input  wire [31:0]  pred1_target,
+    input  wire         pred1_taken,
+    input  wire [ 9:0]  pred1_index,
+    input  wire         pred1_btb_hit,
     input  wire [ 2:0]  pred_ras_sp_before,
     input  wire [ 3:0]  pred_ras_count_before,
+    input  wire         perf_pred_btb_hit,
     // To ID
     output wire         if_valid     ,
     output wire [31:0]  if_pc        ,
@@ -26,6 +31,7 @@ module FetchUnit (
     output wire [ 9:0]  if_pred_index,
     output wire [ 2:0]  if_ras_sp_before,
     output wire [ 3:0]  if_ras_count_before,
+    output wire         if_perf_btb_hit,
     output wire         if1_valid,
     output wire [31:0]  if1_pc,
     output wire [31:0]  if1_inst,
@@ -36,6 +42,7 @@ module FetchUnit (
     output wire [ 9:0]  if1_pred_index,
     output wire [ 2:0]  if1_ras_sp_before,
     output wire [ 3:0]  if1_ras_count_before,
+    output wire         if1_perf_btb_hit,
     // To BPU
     output wire         bpu_valid    ,
     output wire [31:0]  bpu_pc       ,
@@ -73,6 +80,7 @@ module FetchUnit (
     reg [ 9:0] ibuf_pred_index [IBUF_DEPTH-1:0];
     reg [ 2:0] ibuf_ras_sp_before   [IBUF_DEPTH-1:0];
     reg [ 3:0] ibuf_ras_count_before[IBUF_DEPTH-1:0];
+    reg        ibuf_perf_btb_hit[IBUF_DEPTH-1:0];
 
     reg [IBUF_PTR_W-1:0] ibuf_rptr;
     reg [IBUF_PTR_W-1:0] ibuf_wptr;
@@ -89,6 +97,11 @@ module FetchUnit (
     reg [ 9:0] meta_pred_index [META_DEPTH-1:0];
     reg [ 2:0] meta_ras_sp_before [META_DEPTH-1:0];
     reg [ 3:0] meta_ras_count_before [META_DEPTH-1:0];
+    reg        meta_perf_btb_hit [META_DEPTH-1:0];
+    reg        meta_pred1_taken [META_DEPTH-1:0];
+    reg [31:0] meta_pred1_target [META_DEPTH-1:0];
+    reg [ 9:0] meta_pred1_index [META_DEPTH-1:0];
+    reg        meta_pred1_btb_hit [META_DEPTH-1:0];
     reg        meta_dual [META_DEPTH-1:0];
     reg [META_PTR_W-1:0] meta_rptr;
     reg [META_PTR_W-1:0] meta_wptr;
@@ -104,6 +117,11 @@ module FetchUnit (
     wire [9:0] pending_pred_index = meta_pred_index[meta_rptr];
     wire [2:0] pending_ras_sp_before = meta_ras_sp_before[meta_rptr];
     wire [3:0] pending_ras_count_before = meta_ras_count_before[meta_rptr];
+    wire pending_perf_btb_hit = meta_perf_btb_hit[meta_rptr];
+    wire pending_pred1_taken = meta_pred1_taken[meta_rptr];
+    wire [31:0] pending_pred1_target = meta_pred1_target[meta_rptr];
+    wire [9:0] pending_pred1_index = meta_pred1_index[meta_rptr];
+    wire pending_pred1_btb_hit = meta_pred1_btb_hit[meta_rptr];
     wire pending_dual = meta_dual[meta_rptr];
     wire [IBUF_PTR_W-1:0] ibuf_rptr1 = ibuf_rptr + 1'b1;
 
@@ -117,6 +135,7 @@ module FetchUnit (
     assign if_pred_index       = ibuf_pred_index[ibuf_rptr];
     assign if_ras_sp_before    = ibuf_ras_sp_before[ibuf_rptr];
     assign if_ras_count_before = ibuf_ras_count_before[ibuf_rptr];
+    assign if_perf_btb_hit      = ibuf_perf_btb_hit[ibuf_rptr];
 
     assign if1_valid            = (ibuf_count >= 2);
     assign if1_pc               = ibuf_pc[ibuf_rptr1];
@@ -128,6 +147,7 @@ module FetchUnit (
     assign if1_pred_index       = ibuf_pred_index[ibuf_rptr1];
     assign if1_ras_sp_before    = ibuf_ras_sp_before[ibuf_rptr1];
     assign if1_ras_count_before = ibuf_ras_count_before[ibuf_rptr1];
+    assign if1_perf_btb_hit      = ibuf_perf_btb_hit[ibuf_rptr1];
 
     wire [1:0] ibuf_pop_actual =
         ((ibuf_pop_count == 2) && (ibuf_count >= 2)) ? 2'd2 :
@@ -150,6 +170,11 @@ module FetchUnit (
     reg [ 9:0] f1_pred_index;
     reg [ 2:0] f1_ras_sp_before;
     reg [ 3:0] f1_ras_count_before;
+    reg        f1_perf_btb_hit;
+    reg        f1_pred1_taken;
+    reg [31:0] f1_pred1_target;
+    reg [ 9:0] f1_pred1_index;
+    reg        f1_pred1_btb_hit;
     reg        f1_dual;
 
     // ------------------------------------------------------------
@@ -157,11 +182,6 @@ module FetchUnit (
     // ------------------------------------------------------------
     wire consume_resp = ifetch_valid & (!pending_dual || ifetch1_valid) &
                         pending_valid & !pred_error;
-    wire [31:0] pending_lane1_pc = pending_pc + 32'd4;
-    wire [31:0] pending_lane1_hash = pending_lane1_pc ^
-                                     (pending_lane1_pc >> 10) ^
-                                     (pending_lane1_pc >> 20);
-
     // IBUF count plus F1 and every accepted outstanding packet
     // are all reserved entries. This prevents a returned instruction from
     // overflowing IBUF while the backend is stalled.
@@ -196,8 +216,10 @@ module FetchUnit (
 
     assign bpu_valid = fetch_prepare;
     assign bpu_pc    = fetch_pc;
-    wire [31:0] fetch_advance_target = fetch_dual_candidate ?
-                                       (pred_target + 32'd4) : pred_target;
+    wire [31:0] fetch_advance_target = pred_taken ? pred_target :
+        (fetch_dual_candidate ?
+            (pred1_taken ? pred1_target : fetch_pc + 32'd8) :
+            fetch_pc + 32'd4);
 
     // Redirects are held for one cycle, then fetched as a normal BPU
     // request. This removes the EX->ICache address path.
@@ -238,6 +260,11 @@ module FetchUnit (
             f1_pred_index       <= 10'h0;
             f1_ras_sp_before    <= 3'h0;
             f1_ras_count_before <= 4'h0;
+            f1_perf_btb_hit     <= 1'b0;
+            f1_pred1_taken      <= 1'b0;
+            f1_pred1_target     <= `PC_INIT_VAL + 32'd8;
+            f1_pred1_index      <= 10'h0;
+            f1_pred1_btb_hit    <= 1'b0;
             f1_dual             <= 1'b0;
         end
         else if (pred_error) begin
@@ -253,6 +280,11 @@ module FetchUnit (
             f1_pred_index       <= pred_index;
             f1_ras_sp_before    <= pred_ras_sp_before;
             f1_ras_count_before <= pred_ras_count_before;
+            f1_perf_btb_hit     <= perf_pred_btb_hit;
+            f1_pred1_taken      <= pred1_taken;
+            f1_pred1_target     <= pred1_target;
+            f1_pred1_index      <= pred1_index;
+            f1_pred1_btb_hit    <= pred1_btb_hit;
             f1_dual             <= fetch_dual_candidate;
         end
         else if (f1_fire) begin
@@ -292,17 +324,18 @@ module FetchUnit (
                 ibuf_pred_index[ibuf_wptr] <= pending_pred_index;
                 ibuf_ras_sp_before[ibuf_wptr] <= pending_ras_sp_before;
                 ibuf_ras_count_before[ibuf_wptr] <= pending_ras_count_before;
+                ibuf_perf_btb_hit[ibuf_wptr] <= pending_perf_btb_hit;
                 if (pending_dual) begin
                     ibuf_pc[ibuf_wptr + 1'b1] <= pending_pc + 32'd4;
                     ibuf_inst[ibuf_wptr + 1'b1] <= ifetch1_inst;
                     ibuf_ras_ptr[ibuf_wptr + 1'b1] <= pending_ras_ptr;
                     ibuf_pred_valid[ibuf_wptr + 1'b1] <= 1'b1;
-                    ibuf_pred_taken[ibuf_wptr + 1'b1] <= 1'b0;
-                    ibuf_pred_target[ibuf_wptr + 1'b1] <= pending_pc + 32'd8;
-                    ibuf_pred_index[ibuf_wptr + 1'b1] <=
-                        pending_lane1_hash[11:2];
+                    ibuf_pred_taken[ibuf_wptr + 1'b1] <= pending_pred1_taken;
+                    ibuf_pred_target[ibuf_wptr + 1'b1] <= pending_pred1_target;
+                    ibuf_pred_index[ibuf_wptr + 1'b1] <= pending_pred1_index;
                     ibuf_ras_sp_before[ibuf_wptr + 1'b1] <= pending_ras_sp_before;
                     ibuf_ras_count_before[ibuf_wptr + 1'b1] <= pending_ras_count_before;
+                    ibuf_perf_btb_hit[ibuf_wptr + 1'b1] <= pending_pred1_btb_hit;
                 end
                 ibuf_wptr <= ibuf_wptr + (pending_dual ? 2 : 1);
             end
@@ -328,6 +361,11 @@ module FetchUnit (
                 meta_pred_index[meta_wptr] <= f1_pred_index;
                 meta_ras_sp_before[meta_wptr] <= f1_ras_sp_before;
                 meta_ras_count_before[meta_wptr] <= f1_ras_count_before;
+                meta_perf_btb_hit[meta_wptr] <= f1_perf_btb_hit;
+                meta_pred1_taken[meta_wptr] <= f1_pred1_taken;
+                meta_pred1_target[meta_wptr] <= f1_pred1_target;
+                meta_pred1_index[meta_wptr] <= f1_pred1_index;
+                meta_pred1_btb_hit[meta_wptr] <= f1_pred1_btb_hit;
                 meta_dual[meta_wptr] <= f1_dual;
                 meta_wptr <= meta_wptr + 1'b1;
             end

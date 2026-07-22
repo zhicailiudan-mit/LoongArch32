@@ -46,7 +46,7 @@ module soc_lite_top #(parameter SIMULATION=1'b0)
     input  wire        clk,
 
     //------sram-------
-    output wire [19:0]  sram_addr,
+    output wire [20:0]  sram_addr,
     inout  wire [31:0]  sram_data,
     output wire         sram_oen,       // output enable
     output wire         sram_cen,       // chip select
@@ -138,7 +138,10 @@ module soc_lite_top #(parameter SIMULATION=1'b0)
     );
 
     // SRAM
-    sram_ctrl #(20) u_sram_ctrl (
+    // The performance images use the complete 8 MiB window at
+    // 0x1c000000..0x1c7fffff.  Twenty word-address bits only cover 4 MiB and
+    // alias 0x1c400000 onto 0x1c000000, so keep the extra bank bit in sim.
+    sram_ctrl #(21) u_sram_ctrl (
         .rstn           (resetn        ),
         .usr_clk        (sram_uclk     ),
         .wen_clk        (sram_wclk     ),

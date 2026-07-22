@@ -55,7 +55,10 @@ module Scheduler (
     input  logic                     issue1_ready,
     output logic                     issue1_fire,
     output issue_uop_t               issue1,
-    output logic [2:0]               occupancy
+    output logic [2:0]               occupancy,
+    output logic                     perf_true_source_wait,
+    output logic                     perf_lsu_order,
+    output logic                     perf_serializing
 );
 
     dispatch_uop_t dq_enq [0:1];
@@ -143,6 +146,9 @@ module Scheduler (
         .system_flush   (system_flush),
         .recover_id     (recover_id),
         .barrier_release(barrier_release),
+        .perf_true_source_wait(perf_true_source_wait),
+        .perf_lsu_order (perf_lsu_order),
+        .perf_serializing(perf_serializing),
         .enq            (dq_enq),
         .enq_ready      (dq_enq_ready),
         .complete       (dq_complete),

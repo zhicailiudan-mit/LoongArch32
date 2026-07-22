@@ -18,10 +18,14 @@ module DispatchQueue #(
     input  wire                  clk,
     input  wire                  rstn,
     input  wire                  flush,
-    input  wire                  recover_valid,
-    input  wire                  system_flush,
+    input  logic                 recover_valid,
+    input  logic                 system_flush,
     input  uop_id_t              recover_id,
-    input  wire                  barrier_release,
+    input  logic                 barrier_release,
+    output logic                 perf_true_source_wait,
+    output logic                 perf_lsu_order,
+    output logic                 perf_serializing,
+
     input  dispatch_uop_t        enq [0:1],
     output wire                  enq_ready [0:1],
 
@@ -94,6 +98,9 @@ module DispatchQueue #(
     reg [9:0] pred_index [0:DQ_DEPTH-1];
     reg [2:0] ras_sp_before [0:DQ_DEPTH-1];
     reg [3:0] ras_count_before [0:DQ_DEPTH-1];
+    // Observation-only Fetch-time BTB lookup result.  This bit follows the
+    // prediction packet but is never used by issue selection or CPU control.
+    reg perf_btb_hit [0:DQ_DEPTH-1];
 
     reg [2:0] count;
     wire [1:0] issue_sel;
@@ -200,6 +207,8 @@ module DispatchQueue #(
     wire [2:0] enq1_ras_sp_before = enq[1].uop.pred.ras_sp_before;
     wire [3:0] enq_ras_count_before = enq[0].uop.pred.ras_count_before;
     wire [3:0] enq1_ras_count_before = enq[1].uop.pred.ras_count_before;
+    wire enq_perf_btb_hit = enq[0].uop.pred.perf_btb_hit;
+    wire enq1_perf_btb_hit = enq[1].uop.pred.perf_btb_hit;
 
     wire complete_valid = complete[0].valid;
     wire [`ROB_TAG_W-1:0] complete_tag = complete[0].uop_id.rob_tag;
@@ -330,6 +339,16 @@ module DispatchQueue #(
         end
     end
 
+`ifndef SYNTHESIS
+    wire [2:0] perf_oldest_valid = pick_oldest4(valid, alloc_seq[0], alloc_seq[1], alloc_seq[2], alloc_seq[3]);
+    wire [1:0] perf_oldest_idx = perf_oldest_valid[1:0];
+    wire perf_oldest_is_valid = perf_oldest_valid[2];
+`else
+    assign perf_true_source_wait = 1'b0;
+    assign perf_lsu_order = 1'b0;
+    assign perf_serializing = 1'b0;
+`endif
+
     // The SQ receives an entry when address generation completes, not at
     // dispatch. Until an older Store has left this queue, its address is
     // unknown to the LSU. Conservatively keep a younger Load here rather
@@ -402,16 +421,6 @@ module DispatchQueue #(
                                     (!(is_ld_st[q] &&
                                        (ram_we[q] == `RAM_WE_N)) ||
                                      !older_store_pending[q]) &&
-                                    // Store completion feeds the ROB/SQ
-                                    // boundary. Until the independent SQ
-                                    // allocation path is implemented, issue
-                                    // a Store only at the ROB head so a
-                                    // younger Store can never become
-                                    // externally visible before an older one.
-                                    (!(is_ld_st[q] &&
-                                       (ram_we[q] != `RAM_WE_N)) ||
-                                     (rob_head_valid &&
-                                      uop_id_equal(uop_id[q], rob_head_id))) &&
                                     (!is_br_jmp[q] || !older_branch_pending[q]) &&
                                    (!BRANCH_AT_ROB_HEAD || !is_br_jmp[q] ||
                                     (rob_head_valid &&
@@ -609,6 +618,21 @@ module DispatchQueue #(
         issue[0].pred.index = pred_index[issue_sel];
         issue[0].pred.ras_sp_before = ras_sp_before[issue_sel];
         issue[0].pred.ras_count_before = ras_count_before[issue_sel];
+        issue[0].pred.perf_btb_hit = perf_btb_hit[issue_sel];
+
+`ifndef SYNTHESIS
+        perf_true_source_wait = 1'b0;
+        perf_lsu_order = 1'b0;
+        perf_serializing = 1'b0;
+        if (perf_oldest_is_valid) begin
+            perf_true_source_wait = (!src0_ready[perf_oldest_idx] || !src1_ready[perf_oldest_idx]);
+            perf_lsu_order = src0_ready[perf_oldest_idx] && src1_ready[perf_oldest_idx] &&
+                             is_ld_st[perf_oldest_idx] && (ram_we[perf_oldest_idx] == `RAM_WE_N) && older_store_pending[perf_oldest_idx];
+            perf_serializing = src0_ready[perf_oldest_idx] && src1_ready[perf_oldest_idx] &&
+                               slot_lane0_only[perf_oldest_idx] && (system_op[perf_oldest_idx] != 3'd0) &&
+                               (!rob_head_valid || !uop_id_equal(uop_id[perf_oldest_idx], rob_head_id));
+        end
+`endif
 
         issue[1] = '0;
         issue[1].uop_id = uop_id[fast_issue_sel];
@@ -644,6 +668,7 @@ module DispatchQueue #(
         issue[1].pred.index = pred_index[fast_issue_sel];
         issue[1].pred.ras_sp_before = ras_sp_before[fast_issue_sel];
         issue[1].pred.ras_count_before = ras_count_before[fast_issue_sel];
+        issue[1].pred.perf_btb_hit = perf_btb_hit[fast_issue_sel];
     end
     assign occupancy = count;
 
@@ -845,6 +870,7 @@ module DispatchQueue #(
                 pred_index[i] <= 10'h0;
                 ras_sp_before[i] <= 3'h0;
                 ras_count_before[i] <= 4'h0;
+                perf_btb_hit[i] <= 1'b0;
             end
         end else if (flush) begin
             recover_count = 0;
@@ -957,6 +983,7 @@ module DispatchQueue #(
                 pred_index[enq_sel] <= enq_pred_index;
                 ras_sp_before[enq_sel] <= enq_ras_sp_before;
                 ras_count_before[enq_sel] <= enq_ras_count_before;
+                perf_btb_hit[enq_sel] <= enq_perf_btb_hit;
             end
 
             if (enq1_fire) begin
@@ -1003,6 +1030,7 @@ module DispatchQueue #(
                 pred_index[enq1_sel] <= enq1_pred_index;
                 ras_sp_before[enq1_sel] <= enq1_ras_sp_before;
                 ras_count_before[enq1_sel] <= enq1_ras_count_before;
+                perf_btb_hit[enq1_sel] <= enq1_perf_btb_hit;
             end
 
             count <= count + enq_fire + enq1_fire -

@@ -4,7 +4,9 @@
 
 `define BHT_IDX_W 10
 `define BHT_ENTRY (1 << `BHT_IDX_W)
-`define BHT_TAG_W 8
+// With the existing hashed 10-bit index, PC[31:12] is an exact complementary
+// tag: equal tag + equal index uniquely identifies every aligned PC[31:2].
+`define BHT_TAG_W 20
 
 `define RAS_ENTRY 8
 `define RAS_CNT_W 4
@@ -27,21 +29,46 @@ module BranchPredUnit (
     input  wire [ 9:0]  id_pred_index_in,
     input  wire [ 2:0]  id_ras_sp_before_in,
     input  wire [ 3:0]  id_ras_count_before_in,
+    input  wire         id_perf_btb_hit_in,
     input  wire         pl_suspend ,
 
     // predict branch direction and target
     output wire [31:0]  pred_target,
     output wire         pred_taken_out,
     output wire [ 9:0]  pred_index_out,
+    output wire [31:0]  pred1_target,
+    output wire         pred1_taken_out,
+    output wire [ 9:0]  pred1_index_out,
+    output wire         pred1_btb_hit_out,
     output wire [ 2:0]  pred_ras_sp_before,
     output wire [ 3:0]  pred_ras_count_before,
     output wire         pred_error ,
+
+    // Simulation-only performance observation.  These outputs describe the
+    // same resolved branch event used by pred_error; they never feed control.
+    output wire         perf_branch_fire,
+    output wire         perf_predicted_taken,
+    output wire         perf_actual_taken,
+    output wire         perf_mispredict,
+    output wire         perf_pred_btb_hit_out,
+    output wire         perf_resolved_btb_hit,
+    output wire [31:0]  perf_resolved_pc,
+    output wire         perf_resolved_conditional,
+    output wire         perf_resolved_backward,
+    output wire         perf_resolved_jirl,
+    output wire         perf_direction_mispredict,
+    output wire         perf_target_mispredict,
+    output wire         perf_btb_update,
+    output wire         perf_btb_update_conditional,
+    output wire         perf_btb_update_backward,
 
     // signals to correct BHT
     input  wire         ex_valid   ,
     input  wire         ex_is_bj   ,
     input  wire         ex_is_call ,
     input  wire         ex_is_ret  ,
+    input  wire         ex_is_conditional,
+    input  wire         ex_offset_negative,
     input  wire [31:0]  ex_pc      ,
     input  wire         real_taken ,
     input  wire [31:0]  real_target,
@@ -62,20 +89,24 @@ module BranchPredUnit (
 
     (* ram_style = "distributed" *) reg                   entry_call [`BHT_ENTRY-1:0];
     (* ram_style = "distributed" *) reg                   entry_ret  [`BHT_ENTRY-1:0];
+    (* ram_style = "distributed" *) reg                   entry_conditional [`BHT_ENTRY-1:0];
+    (* ram_style = "distributed" *) reg                   entry_backward    [`BHT_ENTRY-1:0];
+    wire [`BHT_TAG_W-1:0] if_tag = if_pc[31:12];
+    wire [31:0] if_pc1 = if_pc + 32'd4;
+    wire [`BHT_TAG_W-1:0] if_tag1 = if_pc1[31:12];
 
-    wire [`BHT_TAG_W-1:0] if_tag =
-        if_pc[9:2] ^ if_pc[17:10] ^ if_pc[25:18] ^ {2'b00, if_pc[31:26]};
-
-    wire [`BHT_TAG_W-1:0] ex_tag =
-        ex_pc[9:2] ^ ex_pc[17:10] ^ ex_pc[25:18] ^ {2'b00, ex_pc[31:26]};
+    wire [`BHT_TAG_W-1:0] ex_tag = ex_pc[31:12];
 
     wire [31:0] pc_hash       = if_pc ^ (if_pc >> 10) ^ (if_pc >> 20);
+    wire [31:0] pc1_hash      = if_pc1 ^ (if_pc1 >> 10) ^ (if_pc1 >> 20);
     wire [31:0] ex_pc_hash    = ex_pc ^ (ex_pc >> 10) ^ (ex_pc >> 20);
 
     wire [`BHT_IDX_W-1:0] index          = pc_hash[`BHT_IDX_W+1:2];
+    wire [`BHT_IDX_W-1:0] index1         = pc1_hash[`BHT_IDX_W+1:2];
     wire [`BHT_IDX_W-1:0] ex_index_real  = ex_pc_hash[`BHT_IDX_W+1:2];
 
     wire hit = (tag[index] == if_tag) && valid[index];
+    wire hit1 = (tag[index1] == if_tag1) && valid[index1];
 
     wire hit_call = hit & entry_call[index];
     wire hit_ret  = hit & entry_ret [index];
@@ -100,27 +131,40 @@ module BranchPredUnit (
     // ------------------------------------------------------------
     // IF阶段预测
     // ------------------------------------------------------------
-    // A BTB tag match alone is not enough to classify an instruction as
-    // control flow.  Aliasing can make an ordinary ALU/load/store PC hit an
-    // old branch entry.  The fetch instruction is already available at this
-    // boundary, so qualify all taken predictions with the LA32R branch/jump
-    // opcode range (JIRL, B/BL and the conditional branches).
-    wire [5:0] if_major_op = ifetch_inst[31:26];
-    wire if_is_control = ifetch_valid &&
-                         (if_major_op >= 6'h13) &&
-                         (if_major_op <= 6'h1b);
-    wire ras_pred_taken = if_is_control & hit_ret & !ras_empty;
-
-    wire btb_pred_taken = if_is_control & hit & !hit_ret &
-                          (hit_call | history[index][1]);
+    // if_pc selects the next request while ifetch_inst belongs to an older
+    // returning request, so that instruction cannot qualify this lookup.
+    // Conditional entries use BTFNT from the decoded immediate sign captured
+    // at resolution; other branch/jump classes retain their existing policy.
+    wire conditional_pred_taken = entry_conditional[index] &
+                                  entry_backward[index];
+    wire nonconditional_pred_taken = !entry_conditional[index] &
+                                     (hit_call | history[index][1]);
+    wire ras_pred_taken = hit_ret & !ras_empty;
+    wire btb_pred_taken = hit & !hit_ret &
+                          (conditional_pred_taken |
+                           nonconditional_pred_taken);
 
     wire pred_taken = ras_pred_taken | btb_pred_taken;
+
+    // Lane1 deliberately excludes CALL and every JIRL/RET entry.  It reads
+    // the same BTB state but performs no speculative RAS operation.
+    wire lane1_supported = hit1 && !entry_call[index1] && !entry_ret[index1];
+    wire lane1_conditional_taken = entry_conditional[index1] &
+                                   entry_backward[index1];
+    wire lane1_direct_taken = !entry_conditional[index1] &
+                              history[index1][1];
+    wire pred1_taken = lane1_supported &
+                       (lane1_conditional_taken | lane1_direct_taken);
 
     assign pred_target = ras_pred_taken ? ras_top :
                          btb_pred_taken ? target[index] :
                                           if_pc + 32'h4;
     assign pred_taken_out        = pred_taken;
     assign pred_index_out        = index;
+    assign pred1_target          = pred1_taken ? target[index1] : if_pc + 32'd8;
+    assign pred1_taken_out       = pred1_taken;
+    assign pred1_index_out       = index1;
+    assign pred1_btb_hit_out     = hit1;
     assign pred_ras_sp_before    = ras_sp;
     assign pred_ras_count_before = ras_count;
 
@@ -141,6 +185,7 @@ module BranchPredUnit (
 
     reg                  ex_pred_taken;
     reg [31:0]           ex_pred_target;
+    reg                  ex_perf_btb_hit;
 
     reg [2:0]            ex_ras_sp_before;
     reg [`RAS_CNT_W-1:0] ex_ras_count_before;
@@ -157,6 +202,7 @@ module BranchPredUnit (
             ex_pred_valid  <= 1'b0;
             ex_pred_taken  <= 1'b0;
             ex_pred_target <= 32'h0;
+            ex_perf_btb_hit <= 1'b0;
 
             ex_ras_sp_before    <= 3'h0;
             ex_ras_count_before <= 4'h0;
@@ -170,6 +216,7 @@ module BranchPredUnit (
                 ex_pred_valid  <= id_pred_valid_in;
                 ex_pred_taken  <= id_pred_taken_in;
                 ex_pred_target <= id_pred_target_in;
+                ex_perf_btb_hit <= id_perf_btb_hit_in;
 
                 ex_ras_sp_before    <= id_ras_sp_before_in;
                 ex_ras_count_before <= id_ras_count_before_in;
@@ -201,6 +248,52 @@ module BranchPredUnit (
     // pred_error clears the issue/execute valid on that edge, so a second lock keyed by
     // ex_pc is redundant and only adds a long compare to the redirect path.
     assign pred_error = ex_fire & prediction_mismatch;
+`ifndef SYNTHESIS
+    // Every resolved branch must still own the prediction packet captured
+    // when that instruction was fetched; otherwise all downstream diagnostic
+    // classifications would be comparing different instructions.
+    always @(posedge cpu_clk) begin
+        if (cpu_rstn && ex_fire && ex_is_bj && !ex_pred_valid)
+            $fatal(1, "BTB diag: resolved branch has no fetch prediction metadata");
+    end
+
+    assign perf_branch_fire     = ex_fire & ex_is_bj;
+    assign perf_predicted_taken = ex_pred_taken;
+    assign perf_actual_taken    = real_taken;
+    assign perf_mispredict      = ex_fire & ex_is_bj & prediction_taken_error;
+    assign perf_pred_btb_hit_out = hit;
+    assign perf_resolved_btb_hit = ex_perf_btb_hit;
+    assign perf_resolved_pc = ex_pc;
+    assign perf_resolved_conditional = ex_is_conditional;
+    assign perf_resolved_backward = ex_is_conditional & ex_offset_negative;
+    assign perf_resolved_jirl = ex_is_ret;
+    assign perf_direction_mispredict = ex_fire & ex_is_bj &
+                                        prediction_taken_error;
+    assign perf_target_mispredict = ex_fire & ex_is_bj &
+                                     !prediction_taken_error &
+                                     prediction_target_error;
+    assign perf_btb_update = train_valid & train_is_bj;
+    assign perf_btb_update_conditional = perf_btb_update &
+                                          train_is_conditional;
+    assign perf_btb_update_backward = perf_btb_update_conditional &
+                                       train_offset_negative;
+`else
+    assign perf_branch_fire     = 1'b0;
+    assign perf_predicted_taken = 1'b0;
+    assign perf_actual_taken    = 1'b0;
+    assign perf_mispredict      = 1'b0;
+    assign perf_pred_btb_hit_out = 1'b0;
+    assign perf_resolved_btb_hit = 1'b0;
+    assign perf_resolved_pc = 32'h0;
+    assign perf_resolved_conditional = 1'b0;
+    assign perf_resolved_backward = 1'b0;
+    assign perf_resolved_jirl = 1'b0;
+    assign perf_direction_mispredict = 1'b0;
+    assign perf_target_mispredict = 1'b0;
+    assign perf_btb_update = 1'b0;
+    assign perf_btb_update_conditional = 1'b0;
+    assign perf_btb_update_backward = 1'b0;
+`endif
 
     wire call_pred_error =
         ex_fire && ex_pred_valid && ex_is_call &&
@@ -283,6 +376,8 @@ module BranchPredUnit (
     reg                  train_is_bj;
     reg                  train_is_call;
     reg                  train_is_ret;
+    reg                  train_is_conditional;
+    reg                  train_offset_negative;
     reg                  train_real_taken;
     reg                  train_pred_valid;
     reg                  train_pred_taken;
@@ -296,6 +391,8 @@ module BranchPredUnit (
             train_is_bj      <= 1'b0;
             train_is_call    <= 1'b0;
             train_is_ret     <= 1'b0;
+            train_is_conditional <= 1'b0;
+            train_offset_negative <= 1'b0;
             train_real_taken <= 1'b0;
             train_pred_valid <= 1'b0;
             train_pred_taken <= 1'b0;
@@ -308,6 +405,8 @@ module BranchPredUnit (
             train_is_bj      <= ex_is_bj;
             train_is_call    <= ex_is_call;
             train_is_ret     <= ex_is_ret;
+            train_is_conditional <= ex_is_conditional;
+            train_offset_negative <= ex_offset_negative;
             train_real_taken <= real_taken;
             train_pred_valid <= ex_pred_valid;
             train_pred_taken <= ex_pred_taken;
@@ -357,6 +456,8 @@ module BranchPredUnit (
                 target    [train_index] <= train_target;
                 entry_call[train_index] <= train_is_call;
                 entry_ret [train_index] <= train_is_ret;
+                entry_conditional[train_index] <= train_is_conditional;
+                entry_backward[train_index] <= train_offset_negative;
             end
             else if (update_entry) begin
                 if (train_real_taken) begin
@@ -369,12 +470,16 @@ module BranchPredUnit (
                 end
                 entry_call[train_index] <= train_is_call;
                 entry_ret [train_index] <= train_is_ret;
+                entry_conditional[train_index] <= train_is_conditional;
+                entry_backward[train_index] <= train_offset_negative;
             end
         end
         else if (train_valid && !train_is_bj && train_pred_valid && train_pred_taken) begin
             if (valid[train_index] && (tag[train_index] == train_tag)) begin
                 entry_call[train_index] <= 1'b0;
                 entry_ret [train_index] <= 1'b0;
+                entry_conditional[train_index] <= 1'b0;
+                entry_backward[train_index] <= 1'b0;
             end
         end
     end
@@ -388,8 +493,46 @@ module BranchPredUnit (
     assign pred_target = if_pc + 32'h4;
     assign pred_taken_out        = 1'b0;
     assign pred_index_out        = 10'h0;
+    assign pred1_target          = if_pc + 32'd8;
+    assign pred1_taken_out       = 1'b0;
+    assign pred1_index_out       = 10'h0;
+    assign pred1_btb_hit_out     = 1'b0;
     assign pred_ras_sp_before    = 3'h0;
     assign pred_ras_count_before = 4'h0;
+`ifndef SYNTHESIS
+    assign perf_branch_fire      = ex_valid & ex_is_bj & !pl_suspend;
+    assign perf_predicted_taken  = 1'b0;
+    assign perf_actual_taken     = real_taken;
+    assign perf_mispredict       = ex_valid & ex_is_bj & real_taken &
+                                   !pl_suspend;
+    assign perf_pred_btb_hit_out = 1'b0;
+    assign perf_resolved_btb_hit = 1'b0;
+    assign perf_resolved_pc = ex_pc;
+    assign perf_resolved_conditional = ex_is_conditional;
+    assign perf_resolved_backward = ex_is_conditional & ex_offset_negative;
+    assign perf_resolved_jirl = ex_is_ret;
+    assign perf_direction_mispredict = perf_mispredict;
+    assign perf_target_mispredict = 1'b0;
+    assign perf_btb_update = 1'b0;
+    assign perf_btb_update_conditional = 1'b0;
+    assign perf_btb_update_backward = 1'b0;
+`else
+    assign perf_branch_fire      = 1'b0;
+    assign perf_predicted_taken  = 1'b0;
+    assign perf_actual_taken     = 1'b0;
+    assign perf_mispredict       = 1'b0;
+    assign perf_pred_btb_hit_out = 1'b0;
+    assign perf_resolved_btb_hit = 1'b0;
+    assign perf_resolved_pc = 32'h0;
+    assign perf_resolved_conditional = 1'b0;
+    assign perf_resolved_backward = 1'b0;
+    assign perf_resolved_jirl = 1'b0;
+    assign perf_direction_mispredict = 1'b0;
+    assign perf_target_mispredict = 1'b0;
+    assign perf_btb_update = 1'b0;
+    assign perf_btb_update_conditional = 1'b0;
+    assign perf_btb_update_backward = 1'b0;
+`endif
 
 `endif
 

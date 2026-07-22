@@ -45,6 +45,9 @@ package cpu_types_pkg;
         logic [9:0]  index;
         logic [2:0]  ras_sp_before;
         logic [3:0]  ras_count_before;
+        // Observation-only: BTB lookup result sampled with this instruction.
+        // It is never consumed by functional control.
+        logic        perf_btb_hit;
     } prediction_meta_t;
 
     // Frontend packet in the same field order as the existing IF_ID packet:

@@ -45,7 +45,11 @@ module OooBackend (
     output logic [2:0]                   perf_issue_occupancy,
     output logic                         perf_rob_block,
     output logic                         perf_issue_queue_block,
-    output logic                         perf_source_wait,
+    output logic                         perf_true_source_wait,
+    output logic                         perf_lsu_order,
+    output logic                         perf_serializing,
+    output logic                         perf_dispatch_fire0,
+    output logic                         perf_dispatch_fire1,
     output logic                         perf_serializing_block,
 
     output logic                         rob_head_valid,
@@ -109,6 +113,8 @@ module OooBackend (
 
     assign dispatch_valid[0] = dispatch[0].valid;
     assign dispatch_valid[1] = dispatch[1].valid;
+    assign perf_dispatch_fire0 = dispatch_valid[0] && scheduler_dispatch_ready[0];
+    assign perf_dispatch_fire1 = dispatch_valid[1] && scheduler_dispatch_ready[1];
 
     Scheduler u_scheduler (
         .clk                  (clk),
@@ -151,8 +157,11 @@ module OooBackend (
         .issue1_valid         (issue1_valid),
         .issue1_ready         (issue1_ready),
         .issue1_fire          (issue1_fire),
-        .issue1              (issue1),
-        .occupancy            (scheduler_occupancy)
+        .issue1               (issue1),
+        .occupancy            (scheduler_occupancy),
+        .perf_true_source_wait(perf_true_source_wait),
+        .perf_lsu_order       (perf_lsu_order),
+        .perf_serializing     (perf_serializing)
     );
 
     CompletionRouter u_completion_router (
@@ -194,9 +203,6 @@ module OooBackend (
     assign perf_issue_queue_block =
                             (dispatch[0].valid && !scheduler_dispatch_ready[0]) ||
                             (dispatch[1].valid && !scheduler_dispatch_ready[1]);
-    assign perf_source_wait = (scheduler_occupancy != 0) &&
-                              !issue0_valid && !issue1_valid &&
-                              !system_issue_valid && !system_inflight;
     assign perf_serializing_block = system_inflight;
 
 endmodule

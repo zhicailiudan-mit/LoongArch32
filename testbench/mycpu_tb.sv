@@ -47,7 +47,7 @@ module tb_top( );
     reg clk = 1'b0;
 
     //sram
-    wire [19:0] sram_addr;
+    wire [20:0] sram_addr;
     wire [31:0] sram_data;
     wire        sram_oen;
     wire        sram_cen;
@@ -92,7 +92,7 @@ module tb_top( );
 
     // Upper half-word
     sram_model sram_uh (
-        .Address    (sram_addr[19:0] ),     // input [19:0]
+        .Address    (sram_addr[20:0] ),     // input [20:0], 8 MiB total
         .DataIO     (sram_data[31:16]),     // inout [15:0]
         .OE_n       (sram_oen        ),     // input [0:0]
         .CE_n       (sram_cen        ),     // input [0:0]
@@ -102,7 +102,7 @@ module tb_top( );
     );
     // Lower half-word
     sram_model sram_lh (
-        .Address    (sram_addr[19:0] ),     // input [19:0]
+        .Address    (sram_addr[20:0] ),     // input [20:0], 8 MiB total
         .DataIO     (sram_data[15:0] ),     // inout [15:0]
         .OE_n       (sram_oen        ),     // input [0:0]
         .CE_n       (sram_cen        ),     // input [0:0]
@@ -645,16 +645,16 @@ module tb_top( );
                 ref_wdata_addr_r <= ref_wdata_addr;
                 ref_wdata_r      <= ref_wdata;
             end else begin
-                if (ref_wdata_we[3]) sram_uh.mem_array1[ref_wdata_addr[21:2]] <= ref_wdata[31:24];
-                if (ref_wdata_we[2]) sram_uh.mem_array0[ref_wdata_addr[21:2]] <= ref_wdata[23:16];
-                if (ref_wdata_we[1]) sram_lh.mem_array1[ref_wdata_addr[21:2]] <= ref_wdata[15: 8];
-                if (ref_wdata_we[0]) sram_lh.mem_array0[ref_wdata_addr[21:2]] <= ref_wdata[ 7: 0];
+                if (ref_wdata_we[3]) sram_uh.mem_array1[ref_wdata_addr[22:2]] <= ref_wdata[31:24];
+                if (ref_wdata_we[2]) sram_uh.mem_array0[ref_wdata_addr[22:2]] <= ref_wdata[23:16];
+                if (ref_wdata_we[1]) sram_lh.mem_array1[ref_wdata_addr[22:2]] <= ref_wdata[15: 8];
+                if (ref_wdata_we[0]) sram_lh.mem_array0[ref_wdata_addr[22:2]] <= ref_wdata[ 7: 0];
             end
         end else if ((|ref_wdata_we_r) & !sram_writing) begin
-            if (ref_wdata_we_r[3]) sram_uh.mem_array1[ref_wdata_addr_r[21:2]] <= ref_wdata_r[31:24];
-            if (ref_wdata_we_r[2]) sram_uh.mem_array0[ref_wdata_addr_r[21:2]] <= ref_wdata_r[23:16];
-            if (ref_wdata_we_r[1]) sram_lh.mem_array1[ref_wdata_addr_r[21:2]] <= ref_wdata_r[15: 8];
-            if (ref_wdata_we_r[0]) sram_lh.mem_array0[ref_wdata_addr_r[21:2]] <= ref_wdata_r[ 7: 0];
+            if (ref_wdata_we_r[3]) sram_uh.mem_array1[ref_wdata_addr_r[22:2]] <= ref_wdata_r[31:24];
+            if (ref_wdata_we_r[2]) sram_uh.mem_array0[ref_wdata_addr_r[22:2]] <= ref_wdata_r[23:16];
+            if (ref_wdata_we_r[1]) sram_lh.mem_array1[ref_wdata_addr_r[22:2]] <= ref_wdata_r[15: 8];
+            if (ref_wdata_we_r[0]) sram_lh.mem_array0[ref_wdata_addr_r[22:2]] <= ref_wdata_r[ 7: 0];
             ref_wdata_we_r <= 4'h0;
         end
 

@@ -126,9 +126,28 @@ module MyCpu (
     wire [2:0] perf_sb_occupancy;
     wire perf_rob_block;
     wire perf_issue_queue_block;
-    wire perf_source_wait;
-    wire perf_serializing_block;
-    wire perf_lsu_order_block;
+    wire perf_true_source_wait;
+    wire perf_serializing;
+    wire perf_lsu_order;
+    wire lsu_perf_order_block;
+    wire perf_fetch_fire0;
+    wire perf_fetch_fire1;
+    wire perf_dispatch_fire0;
+    wire perf_dispatch_fire1;
+    wire perf_branch_fire;
+    wire perf_branch_predicted_taken;
+    wire perf_branch_actual_taken;
+    wire perf_branch_mispredict;
+    wire perf_branch_btb_hit;
+    wire [31:0] perf_branch_pc;
+    wire perf_branch_conditional;
+    wire perf_branch_backward;
+    wire perf_branch_jirl;
+    wire perf_direction_mispredict;
+    wire perf_target_mispredict;
+    wire perf_btb_update;
+    wire perf_btb_update_conditional;
+    wire perf_btb_update_backward;
     wire perf_dcache_wait;
     wire perf_dcache_backpressure;
     wire perf_load_issue;
@@ -204,6 +223,9 @@ module MyCpu (
         .ex_is_br_jmp    (execute_result.is_br_jmp),
         .ex_is_call      (execute_result.is_call),
         .ex_is_ret       (execute_result.is_ret),
+        .ex_is_conditional(execute_result.is_br_jmp &&
+                           (execute_result.npc_op == `NPC_ALU)),
+        .ex_offset_negative(execute_result.imm[31]),
         .ex_pc           (execute_result.pc),
         .ex_real_taken   (execute_result.branch_taken),
         .ex_real_target  (execute_result.branch_target),
@@ -222,7 +244,23 @@ module MyCpu (
         .ifetch1_valid   (ifetch1_valid),
         .ifetch1_inst    (ifetch1_inst),
         .perf_bpu_wait   (perf_bpu_wait),
-        .perf_icache_wait(perf_icache_wait)
+        .perf_icache_wait(perf_icache_wait),
+        .perf_fetch_fire0(perf_fetch_fire0),
+        .perf_fetch_fire1(perf_fetch_fire1),
+        .perf_branch_fire(perf_branch_fire),
+        .perf_branch_predicted_taken(perf_branch_predicted_taken),
+        .perf_branch_actual_taken(perf_branch_actual_taken),
+        .perf_branch_mispredict(perf_branch_mispredict),
+        .perf_branch_btb_hit(perf_branch_btb_hit),
+        .perf_branch_pc(perf_branch_pc),
+        .perf_branch_conditional(perf_branch_conditional),
+        .perf_branch_backward(perf_branch_backward),
+        .perf_branch_jirl(perf_branch_jirl),
+        .perf_direction_mispredict(perf_direction_mispredict),
+        .perf_target_mispredict(perf_target_mispredict),
+        .perf_btb_update(perf_btb_update),
+        .perf_btb_update_conditional(perf_btb_update_conditional),
+        .perf_btb_update_backward(perf_btb_update_backward)
     );
 
     DecodeCluster u_decode_cluster (
@@ -295,7 +333,7 @@ module MyCpu (
         .perf_lq_occupancy(perf_lq_occupancy),
         .perf_sq_occupancy(perf_sq_occupancy),
         .perf_sb_occupancy(perf_sb_occupancy),
-         .perf_order_block(perf_lsu_order_block),
+         .perf_order_block(lsu_perf_order_block),
          .perf_dcache_wait(perf_dcache_wait),
          .perf_dcache_backpressure(perf_dcache_backpressure),
          .perf_load_issue(perf_load_issue),
@@ -361,8 +399,12 @@ module MyCpu (
         .perf_issue_occupancy(perf_issue_occupancy),
         .perf_rob_block      (perf_rob_block),
         .perf_issue_queue_block(perf_issue_queue_block),
-        .perf_source_wait    (perf_source_wait),
-        .perf_serializing_block(perf_serializing_block),
+        .perf_true_source_wait(perf_true_source_wait),
+        .perf_lsu_order      (perf_lsu_order),
+        .perf_serializing    (perf_serializing),
+        .perf_dispatch_fire0 (perf_dispatch_fire0),
+        .perf_dispatch_fire1 (perf_dispatch_fire1),
+        .perf_serializing_block(),
         .rob_head_valid      (rob_head_valid),
         .rob_head_id         (rob_head_id)
     );
@@ -450,6 +492,7 @@ module MyCpu (
         .cache_maint_ctag  (cache_maint_ctag)
     );
 
+`ifndef SYNTHESIS
     (* keep_hierarchy = "yes", dont_touch = "yes" *)
     PerformanceCounters u_performance_counters (
         .clk                    (cpu_clk),
@@ -467,6 +510,8 @@ module MyCpu (
         .system_issue_fire      (system_issue_fire),
         .commit0_valid          (commit0.valid),
         .commit1_valid          (commit1.valid),
+        .commit0_pc             (commit0.pc),
+        .commit1_pc             (commit1.pc),
         .rob_occupancy          (perf_rob_occupancy),
         .issue_occupancy        (perf_issue_occupancy),
         .lq_occupancy           (perf_lq_occupancy),
@@ -474,14 +519,22 @@ module MyCpu (
         .sb_occupancy           (perf_sb_occupancy),
         .rob_block              (perf_rob_block),
         .issue_queue_block      (perf_issue_queue_block),
-        .source_wait            (perf_source_wait),
-        .serializing_block      (perf_serializing_block),
-        .lsu_order_block        (perf_lsu_order_block),
-        .lsu_queue_block        (ldst_suspend),
+        .source_wait            (perf_true_source_wait),
+        .serializing_block      (perf_serializing),
+        .lsu_order_block        (perf_lsu_order | lsu_perf_order_block),
+        .lsu_queue_block        (ldst_suspend | ldst1_suspend),
         .muldiv_block           (muldiv_busy),
         .privilege_block        (privilege_busy),
         .bpu_wait               (perf_bpu_wait),
         .icache_wait            (perf_icache_wait),
+        .fetch_fire0            (perf_fetch_fire0),
+        .fetch_fire1            (perf_fetch_fire1),
+        .dispatch_fire0         (perf_dispatch_fire0),
+        .dispatch_fire1         (perf_dispatch_fire1),
+        .branch_fire            (perf_branch_fire),
+        .branch_predicted_taken (perf_branch_predicted_taken),
+        .branch_actual_taken    (perf_branch_actual_taken),
+        .branch_mispredict      (perf_branch_mispredict),
          .dcache_wait            (perf_dcache_wait),
          .dcache_backpressure    (perf_dcache_backpressure),
          .load_issue             (perf_load_issue),
@@ -492,6 +545,31 @@ module MyCpu (
          .store_drain            (perf_store_drain),
          .recovery               (pipeline_flush)
     );
+
+    BtbDiagnostics u_btb_diagnostics (
+        .clk                    (cpu_clk),
+        .rstn                   (cpu_rstn),
+        .branch_fire            (perf_branch_fire),
+        .branch_pc              (perf_branch_pc),
+        .branch_btb_hit         (perf_branch_btb_hit),
+        .branch_conditional     (perf_branch_conditional),
+        .branch_backward        (perf_branch_backward),
+        .branch_jirl            (perf_branch_jirl),
+        .predicted_taken        (perf_branch_predicted_taken),
+        .actual_taken           (perf_branch_actual_taken),
+        .direction_mispredict   (perf_direction_mispredict),
+        .target_mispredict      (perf_target_mispredict),
+        .btb_update             (perf_btb_update),
+        .btb_update_conditional (perf_btb_update_conditional),
+        .btb_update_backward    (perf_btb_update_backward),
+        .commit0_valid          (commit0.valid),
+        .commit1_valid          (commit1.valid),
+        .issue0_fire            (issue0_fire),
+        .issue1_fire            (issue1_fire),
+        .system_issue_fire      (system_issue_fire),
+        .recovery               (pipeline_flush)
+    );
+`endif
 
     ///////////////////////////////////////////////////////////////////////////
     // Trace Debug Interface
