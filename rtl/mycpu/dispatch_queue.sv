@@ -318,6 +318,14 @@ module DispatchQueue #(
     wire [DQ_DEPTH-1:0] wake3_src1_vec;
     wire [DQ_DEPTH-1:0] wake_src0_vec;
     wire [DQ_DEPTH-1:0] wake_src1_vec;
+    wire [DQ_DEPTH-1:0] complete0_src0_match;
+    wire [DQ_DEPTH-1:0] complete0_src1_match;
+    wire [DQ_DEPTH-1:0] complete1_src0_match;
+    wire [DQ_DEPTH-1:0] complete1_src1_match;
+    wire [DQ_DEPTH-1:0] src0_ready_eff;
+    wire [DQ_DEPTH-1:0] src1_ready_eff;
+    wire [31:0] src0_value_eff [0:DQ_DEPTH-1];
+    wire [31:0] src1_value_eff [0:DQ_DEPTH-1];
     wire [DQ_DEPTH-1:0] slot_ready;
     wire [DQ_DEPTH-1:0] slot_restricted;
     wire [DQ_DEPTH-1:0] slot_fast_eligible;
@@ -389,22 +397,29 @@ module DispatchQueue #(
     genvar q;
     generate
         for (q = 0; q < DQ_DEPTH; q = q + 1) begin : GEN_ISSUE_STATE
-            assign wake0_src0_vec[q] = complete_valid && complete_rf_we && valid[q] &&
-                                       rR1_re[q] && (rR1[q] != 5'h0) &&
-                                       !src0_ready[q] &&
-                                       uop_id_equal(complete_id, src0_id[q]);
-            assign wake0_src1_vec[q] = complete_valid && complete_rf_we && valid[q] &&
-                                       rR2_re[q] && (rR2[q] != 5'h0) &&
-                                       !src1_ready[q] &&
-                                       uop_id_equal(complete_id, src1_id[q]);
-            assign wake1_src0_vec[q] = complete1_valid && complete1_rf_we && valid[q] &&
-                                       rR1_re[q] && (rR1[q] != 5'h0) &&
-                                       !src0_ready[q] &&
-                                       uop_id_equal(complete1_id, src0_id[q]);
-            assign wake1_src1_vec[q] = complete1_valid && complete1_rf_we && valid[q] &&
-                                       rR2_re[q] && (rR2[q] != 5'h0) &&
-                                       !src1_ready[q] &&
-                                       uop_id_equal(complete1_id, src1_id[q]);
+            // A ready source no longer has a meaningful producer ID.  Limit
+            // completion matching to unresolved sources so a wrapped ROB ID
+            // cannot replace an already-authoritative operand value.
+            assign complete0_src0_match[q] = complete_valid && complete_rf_we &&
+                                              valid[q] && rR1_re[q] &&
+                                              (rR1[q] != 5'h0) && !src0_ready[q] &&
+                                              uop_id_equal(complete_id, src0_id[q]);
+            assign complete0_src1_match[q] = complete_valid && complete_rf_we &&
+                                              valid[q] && rR2_re[q] &&
+                                              (rR2[q] != 5'h0) && !src1_ready[q] &&
+                                              uop_id_equal(complete_id, src1_id[q]);
+            assign complete1_src0_match[q] = complete1_valid && complete1_rf_we &&
+                                              valid[q] && rR1_re[q] &&
+                                              (rR1[q] != 5'h0) && !src0_ready[q] &&
+                                              uop_id_equal(complete1_id, src0_id[q]);
+            assign complete1_src1_match[q] = complete1_valid && complete1_rf_we &&
+                                              valid[q] && rR2_re[q] &&
+                                              (rR2[q] != 5'h0) && !src1_ready[q] &&
+                                              uop_id_equal(complete1_id, src1_id[q]);
+            assign wake0_src0_vec[q] = complete0_src0_match[q];
+            assign wake0_src1_vec[q] = complete0_src1_match[q];
+            assign wake1_src0_vec[q] = complete1_src0_match[q];
+            assign wake1_src1_vec[q] = complete1_src1_match[q];
             assign wake2_src0_vec[q] = commit_valid && commit_rf_we &&
                                        valid[q] && rR1_re[q] &&
                                        (rR1[q] != 5'h0) && !src0_ready[q] &&
@@ -425,6 +440,18 @@ module DispatchQueue #(
                                        wake2_src0_vec[q] || wake3_src0_vec[q];
             assign wake_src1_vec[q] = wake0_src1_vec[q] || wake1_src1_vec[q] ||
                                        wake2_src1_vec[q] || wake3_src1_vec[q];
+            assign src0_ready_eff[q] = src0_ready[q] ||
+                                        complete0_src0_match[q] ||
+                                        complete1_src0_match[q];
+            assign src1_ready_eff[q] = src1_ready[q] ||
+                                        complete0_src1_match[q] ||
+                                        complete1_src1_match[q];
+            assign src0_value_eff[q] = complete0_src0_match[q] ? complete_value :
+                                       complete1_src0_match[q] ? complete1_value :
+                                       rD1[q];
+            assign src1_value_eff[q] = complete0_src1_match[q] ? complete_value :
+                                       complete1_src1_match[q] ? complete1_value :
+                                       rD2[q];
             // Device reads have an irreversible side effect (for example a
             // UART RBR read pops one RX byte).  Address generation may be
             // speculative, but the read itself must not leave the scheduler
@@ -432,11 +459,10 @@ module DispatchQueue #(
             // retain normal out-of-order issue.
             // Address generation is moved out to avoid long combinational path.
             // RAM loads retain normal out-of-order issue.
-            // Wakeup is captured into src*_ready/rD* at the clock edge.
-            // Selection and issue use registered readiness only, so a result
-            // arriving this cycle cannot traverse compare -> oldest select ->
-            // issue mux -> execute in the same cycle.
-            assign slot_ready[q] = src0_ready[q] && src1_ready[q] &&
+            // Completion wakeup is still captured into src*_ready/rD* at the
+            // clock edge.  The effective state additionally lets that same
+            // completion participate in select and operand delivery now.
+            assign slot_ready[q] = src0_ready_eff[q] && src1_ready_eff[q] &&
                                     (!(is_ld_st[q] &&
                                        (ram_we[q] == `RAM_WE_N)) ||
                                      !older_store_pending[q]) &&
@@ -606,8 +632,8 @@ module DispatchQueue #(
         issue[0] = '0;
         issue[0].uop_id = uop_id[issue_sel];
         issue[0].pc = pc[issue_sel];
-        issue[0].src0_value = rD1[issue_sel];
-        issue[0].src1_value = rD2[issue_sel];
+        issue[0].src0_value = src0_value_eff[issue_sel];
+        issue[0].src1_value = src1_value_eff[issue_sel];
         issue[0].arch_rs1 = rR1[issue_sel];
         issue[0].arch_rs2 = rR2[issue_sel];
         issue[0].src0_used = rR1_re[issue_sel];
@@ -644,10 +670,10 @@ module DispatchQueue #(
         perf_lsu_order = 1'b0;
         perf_serializing = 1'b0;
         if (perf_oldest_is_valid) begin
-            perf_true_source_wait = (!src0_ready[perf_oldest_idx] || !src1_ready[perf_oldest_idx]);
-            perf_lsu_order = src0_ready[perf_oldest_idx] && src1_ready[perf_oldest_idx] &&
+            perf_true_source_wait = (!src0_ready_eff[perf_oldest_idx] || !src1_ready_eff[perf_oldest_idx]);
+            perf_lsu_order = src0_ready_eff[perf_oldest_idx] && src1_ready_eff[perf_oldest_idx] &&
                              is_ld_st[perf_oldest_idx] && (ram_we[perf_oldest_idx] == `RAM_WE_N) && older_store_pending[perf_oldest_idx];
-            perf_serializing = src0_ready[perf_oldest_idx] && src1_ready[perf_oldest_idx] &&
+            perf_serializing = src0_ready_eff[perf_oldest_idx] && src1_ready_eff[perf_oldest_idx] &&
                                slot_lane0_only[perf_oldest_idx] && (system_op[perf_oldest_idx] != 3'd0) &&
                                (!rob_head_valid || !uop_id_equal(uop_id[perf_oldest_idx], rob_head_id));
         end
@@ -656,8 +682,8 @@ module DispatchQueue #(
         issue[1] = '0;
         issue[1].uop_id = uop_id[fast_issue_sel];
         issue[1].pc = pc[fast_issue_sel];
-        issue[1].src0_value = rD1[fast_issue_sel];
-        issue[1].src1_value = rD2[fast_issue_sel];
+        issue[1].src0_value = src0_value_eff[fast_issue_sel];
+        issue[1].src1_value = src1_value_eff[fast_issue_sel];
         issue[1].imm = ext[fast_issue_sel];
         issue[1].reg_write = rf_we[fast_issue_sel];
         issue[1].arch_rd = wR[fast_issue_sel];
@@ -1057,5 +1083,55 @@ module DispatchQueue #(
             next_alloc_seq <= next_alloc_seq + enq_fire + enq1_fire;
         end
     end
+
+`ifndef SYNTHESIS
+    // A source can only name one full producer identity.  This assertion also
+    // guards against accidentally weakening the match to ROB tag only later.
+    integer wake_assert_q;
+    integer hold_assert_lane;
+    reg hold_payload_check [0:1];
+    issue_uop_t held_issue_payload [0:1];
+    always @(posedge clk or negedge rstn) begin
+        if (!rstn) begin
+            hold_payload_check[0] <= 1'b0;
+            hold_payload_check[1] <= 1'b0;
+            held_issue_payload[0] <= '0;
+            held_issue_payload[1] <= '0;
+        end else begin
+            for (wake_assert_q = 0; wake_assert_q < DQ_DEPTH;
+                 wake_assert_q = wake_assert_q + 1) begin
+                if (((complete0_src0_match[wake_assert_q] &&
+                      complete1_src0_match[wake_assert_q]) ||
+                     (complete0_src1_match[wake_assert_q] &&
+                      complete1_src1_match[wake_assert_q])) &&
+                    !uop_id_equal(complete_id, complete1_id)) begin
+                    $fatal(1, "DispatchQueue source matched two different completion uop IDs");
+                end
+            end
+
+            // Once offered under backpressure, the complete issue packet must
+            // remain unchanged.  On a same-cycle wakeup the clocked rD write
+            // captures the exact bypass value, so the completion pulse may
+            // disappear without changing the held packet.
+            for (hold_assert_lane = 0; hold_assert_lane < 2;
+                 hold_assert_lane = hold_assert_lane + 1) begin
+                if (!flush && hold_payload_check[hold_assert_lane] &&
+                    (!issue_valid[hold_assert_lane] ||
+                     (issue[hold_assert_lane] !==
+                      held_issue_payload[hold_assert_lane]))) begin
+                    $fatal(1, "DispatchQueue issue payload changed while stalled");
+                end
+                hold_payload_check[hold_assert_lane] <= !flush &&
+                    issue_valid[hold_assert_lane] &&
+                    !issue_ready[hold_assert_lane];
+                if (!flush && issue_valid[hold_assert_lane] &&
+                    !issue_ready[hold_assert_lane]) begin
+                    held_issue_payload[hold_assert_lane] <=
+                        issue[hold_assert_lane];
+                end
+            end
+        end
+    end
+`endif
 
 endmodule

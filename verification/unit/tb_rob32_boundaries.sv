@@ -24,6 +24,7 @@ module tb_rob32_boundaries;
     uop_id_t id31;
     uop_id_t old_id0;
     uop_id_t new_id0;
+    uop_id_t old_epoch_id0;
     integer i;
 
     always #5 clk = ~clk;
@@ -181,16 +182,20 @@ module tb_rob32_boundaries;
         if (occupancy !== 30 || !live_mask[31] || live_mask[0])
             fail("recovery across wrap produced the wrong live window");
 
-        // Reallocate tag0 with the wrapped epoch, then prove an old-epoch
-        // completion cannot mark the replacement entry done.
+        // Reallocate tag0 with the continuous wrapped epoch, then prove a
+        // genuinely old-epoch completion cannot mark the replacement done.
+        // A killed same-ID completion is canceled by the producing execution
+        // or LSU pipeline during recovery before reaching the ROB interface.
         alloc_one(32'h3010, new_id0);
-        if (new_id0.rob_tag !== 5'd0 || new_id0.epoch === old_id0.epoch)
-            fail("tag0 was not reused with a distinct epoch after recovery");
+        if (new_id0.rob_tag !== 5'd0 || new_id0.epoch !== old_id0.epoch)
+            fail("recovery broke the continuous wrapped uop-ID sequence");
         query_id[0] = new_id0;
+        old_epoch_id0 = new_id0;
+        old_epoch_id0.epoch = new_id0.epoch - 1'b1;
         @(negedge clk);
         complete[0] = '0;
         complete[0].valid = 1'b1;
-        complete[0].uop_id = old_id0;
+        complete[0].uop_id = old_epoch_id0;
         complete[0].reg_write = 1'b1;
         complete[0].value = 32'hdead_beef;
         @(posedge clk); #1;

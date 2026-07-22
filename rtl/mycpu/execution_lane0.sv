@@ -99,7 +99,11 @@ module ExecutionLane0 (
         .cpu_clk (cpu_clk),
         .cpu_rstn(cpu_rstn),
         .flush   (kill_issue0),
-        .alu_op  (issue0_q.alu_op),
+        // Do not let an invalid execute slot start the pipelined multiplier.
+        // issue0_q may contain a non-handshaken queue payload even when
+        // issue0_valid_q is clear; starting that ghost operation makes the
+        // next real multiply consume its stale DSP result.
+        .alu_op  (issue0_valid_q ? issue0_q.alu_op : 5'h0),
         .a       (ex_a),
         .b       (ex_b),
         .result  (muldiv_result),

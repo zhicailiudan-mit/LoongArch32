@@ -46,7 +46,11 @@ module LoadStoreUnit (
     output logic [`CACHE_BLK_SIZE-1:0] store_line_alloc_data,
     output logic [`CACHE_BLK_LEN-1:0] store_line_alloc_word_mask
 );
-    localparam integer QDEPTH = 4;
+    localparam integer LQ_DEPTH = 8;
+    localparam integer SQ_DEPTH = 4;
+    localparam integer SB_DEPTH = 4;
+    localparam integer STORE_SLOTS = SQ_DEPTH + SB_DEPTH + 1;
+
     lsu_entry_t load_entry, store_entry, load1_entry, store1_entry,
                 store_release_entry;
     logic load_valid, store_valid, load_ready, store_ready;
@@ -61,23 +65,29 @@ module LoadStoreUnit (
     lsu_entry_t load_head, buffer_head;
     logic load_issue, load_pop, store_pop;
     logic store_release_valid, store_release_fire, buffer_ready;
-    logic [QDEPTH-1:0] load_valid_vec, store_valid_vec, buffer_valid_vec;
-    logic [QDEPTH*32-1:0] load_addr_flat, store_addr_flat, buffer_addr_flat;
-    logic [QDEPTH*`UOP_ID_W-1:0] store_uop_id_flat;
-    logic [QDEPTH*4-1:0] store_wen_flat, buffer_wen_flat;
-    logic [QDEPTH*32-1:0] store_data_flat, buffer_data_flat;
-    logic [QDEPTH*`UOP_ID_W-1:0] buffer_uop_id_flat;
-    logic [QDEPTH*4*`UOP_ID_W-1:0] store_byte_uop_id_flat;
-    logic [QDEPTH*4*`UOP_ID_W-1:0] buffer_byte_uop_id_flat;
-    logic [2*QDEPTH:0] order_valid;
-    logic [QDEPTH-1:0] store_order_valid;
-    logic [QDEPTH-1:0] store_addr_ready_vec;
-    logic [2*QDEPTH:0] order_addr_ready;
-    logic [(2*QDEPTH+1)*32-1:0] order_addr_flat;
-    logic [(2*QDEPTH+1)*4-1:0] order_wen_flat;
-    logic [(2*QDEPTH+1)*32-1:0] order_data_flat;
-    logic [(2*QDEPTH+1)*`UOP_ID_W-1:0] order_uop_id_flat;
-    logic [(2*QDEPTH+1)*4*`UOP_ID_W-1:0] order_byte_uop_id_flat;
+    logic [LQ_DEPTH-1:0] load_valid_vec;
+    logic [SQ_DEPTH-1:0] store_valid_vec;
+    logic [SB_DEPTH-1:0] buffer_valid_vec;
+    logic [LQ_DEPTH*32-1:0] load_addr_flat;
+    logic [SQ_DEPTH*32-1:0] store_addr_flat;
+    logic [SB_DEPTH*32-1:0] buffer_addr_flat;
+    logic [SQ_DEPTH*`UOP_ID_W-1:0] store_uop_id_flat;
+    logic [SQ_DEPTH*4-1:0] store_wen_flat;
+    logic [SB_DEPTH*4-1:0] buffer_wen_flat;
+    logic [SQ_DEPTH*32-1:0] store_data_flat;
+    logic [SB_DEPTH*32-1:0] buffer_data_flat;
+    logic [SB_DEPTH*`UOP_ID_W-1:0] buffer_uop_id_flat;
+    logic [SQ_DEPTH*4*`UOP_ID_W-1:0] store_byte_uop_id_flat;
+    logic [SB_DEPTH*4*`UOP_ID_W-1:0] buffer_byte_uop_id_flat;
+    logic [STORE_SLOTS-1:0] order_valid;
+    logic [SQ_DEPTH-1:0] store_order_valid;
+    logic [SQ_DEPTH-1:0] store_addr_ready_vec;
+    logic [STORE_SLOTS-1:0] order_addr_ready;
+    logic [STORE_SLOTS*32-1:0] order_addr_flat;
+    logic [STORE_SLOTS*4-1:0] order_wen_flat;
+    logic [STORE_SLOTS*32-1:0] order_data_flat;
+    logic [STORE_SLOTS*`UOP_ID_W-1:0] order_uop_id_flat;
+    logic [STORE_SLOTS*4*`UOP_ID_W-1:0] order_byte_uop_id_flat;
     logic executing_store_is_older;
     logic load_blocked;
     logic [3:0] load_ren;
@@ -102,7 +112,7 @@ module LoadStoreUnit (
     logic [31:0] aligned_load_data;
     logic [3:0] store_wen;
     logic [31:0] store_data;
-    logic [2:0] lq_occupancy;
+    logic [3:0] lq_occupancy;
     logic [2:0] sq_occupancy;
     logic [2:0] sb_occupancy;
     completion_t main_completion_next;
@@ -208,23 +218,15 @@ module LoadStoreUnit (
         store0_selected = store0_raw && (!store1_raw || !store1_older);
         store1_selected = store1_raw && (!store0_raw || store1_older);
 
-        // LoadQueue and StoreQueue have retained their two-input interface
-        // for compatibility, but this LSU intentionally drives one ingress
-        // per queue per cycle.
-        load_valid = load0_selected || load1_selected;
-        load1_valid = 1'b0;
-        store_valid = store0_selected || store1_selected;
-        store1_valid = 1'b0;
-        store0_accept = store0_selected && store_ready && !flush;
-        store1_accept = store1_selected && store_ready && !flush;
-        // Stores complete at address/data generation.  Their architectural
-        // side effect remains deferred until ROB commit moves them from the
-        // StoreQueue into the StoreBuffer.
-        // Branch recovery is now a registered event.  The resolving uop's
-        // completion was captured by main_completion one cycle before flush;
-        // execute_result during the flush cycle belongs to a younger uop and
-        // must not be preserved, otherwise a stale completion can corrupt a
-        // quickly reused ROB tag (ABA).
+        // Dual ingress LSU: both execution lanes can submit Load/Store AGU results
+        // concurrently into LoadQueue and StoreQueue.
+        load_valid = load0_raw;
+        load1_valid = load1_raw;
+        store_valid = store0_raw;
+        store1_valid = store1_raw;
+        store0_accept = store0_raw && store_ready && !flush;
+        store1_accept = store1_raw && store1_ready && !flush;
+        // Stores complete at address/data generation once accepted by SQ.
         direct_valid = execute_result.valid && !flush &&
                        (!execute_result.is_ld_st || execute_result.ldst_unalign ||
                         store0_accept);
@@ -272,8 +274,8 @@ module LoadStoreUnit (
                                                   execute_result1.store_mask,
                                                   execute_result1.alu_result[1:0]);
 
-        load_accept_entry = load0_selected ? load_entry : load1_entry;
-        store_accept_entry = store0_selected ? store_entry : store1_entry;
+        load_accept_entry = (load1_raw && (!load0_raw || load1_older)) ? load1_entry : load_entry;
+        store_accept_entry = (store1_raw && (!store0_raw || store1_older)) ? store1_entry : store_entry;
 
         direct_completion = '0;
         direct_completion.valid = direct_valid;
@@ -295,7 +297,7 @@ module LoadStoreUnit (
         // creates a circular wait because they cannot commit until this load
         // retires.  StoreBuffer entries have already committed and are thus
         // necessarily older than every live, unretired load.
-        for (order_i = 0; order_i < QDEPTH; order_i = order_i + 1)
+        for (order_i = 0; order_i < SQ_DEPTH; order_i = order_i + 1)
             store_order_valid[order_i] = store_valid_vec[order_i] &&
                 !uop_is_younger(store_uop_id_flat[order_i*`UOP_ID_W +: `UOP_ID_W],
                                 load_head.uop_id);
@@ -303,12 +305,12 @@ module LoadStoreUnit (
         // Without this extra slot, a younger queued Load could issue in the
         // cycle before that Store becomes visible in SQ and observe stale
         // DCache data.
-        executing_store_is_older = store_valid && load_head_valid &&
+        executing_store_is_older = (store0_raw || store1_raw) && load_head_valid &&
             !uop_is_younger(store_accept_entry.uop_id, load_head.uop_id);
         order_valid = {executing_store_is_older,
                        buffer_valid_vec, store_order_valid};
         order_addr_ready = {executing_store_is_older,
-                            {QDEPTH{1'b1}}, store_addr_ready_vec};
+                            {SB_DEPTH{1'b1}}, store_addr_ready_vec};
         order_addr_flat = {store_accept_entry.address,
                            buffer_addr_flat, store_addr_flat};
         order_wen_flat = {store_accept_entry.store_wen,
@@ -332,7 +334,7 @@ module LoadStoreUnit (
 
         for (order_byte = 0; order_byte < 4; order_byte = order_byte + 1) begin
             for (order_i = 0; order_i < 16; order_i = order_i + 1) begin
-                if (order_i < 2*QDEPTH+1) begin
+                if (order_i < STORE_SLOTS) begin
                     fwd_cand[order_byte][order_i].valid = order_valid[order_i] &&
                         ((order_addr_flat[order_i*32 +: 32] & 32'hffff_fffc) == (load_head.address & 32'hffff_fffc)) &&
                         order_wen_flat[order_i*4 + order_byte];
@@ -374,7 +376,7 @@ module LoadStoreUnit (
             ref_forward_data = 32'b0;
             ref_forward_id_flat = '0;
             
-            for (order_i = 0; order_i < 2*QDEPTH+1; order_i = order_i + 1) begin
+            for (order_i = 0; order_i < STORE_SLOTS; order_i = order_i + 1) begin
                 if (order_valid[order_i] &&
                     ((order_addr_flat[order_i*32 +: 32] & 32'hffff_fffc) ==
                      (load_head.address & 32'hffff_fffc))) begin
@@ -420,12 +422,12 @@ module LoadStoreUnit (
         // Only a full input queue backpressures execute.  Waiting for the
         // cache response itself does not stop independent work.
         ldst_suspend = !flush &&
-                       ((load0_raw && (!load0_selected || !load_ready)) ||
-                        (store0_raw && (!store0_selected || !store_ready)));
+                       ((load0_raw && !load_ready) ||
+                        (store0_raw && !store_ready));
         ldst1_suspend = !flush &&
-                        ((load1_raw && (!load1_selected || !load_ready)) ||
-                         (store1_raw && (!store1_selected || !store_ready)));
-        perf_lq_occupancy = lq_occupancy;
+                        ((load1_raw && !load1_ready) ||
+                         (store1_raw && !store1_ready));
+        perf_lq_occupancy = lq_occupancy[2:0];
         perf_sq_occupancy = sq_occupancy;
         perf_sb_occupancy = sb_occupancy;
         perf_order_block = load_l1_valid && load_l1_blocked &&
@@ -441,28 +443,58 @@ module LoadStoreUnit (
         perf_store_drain = store_pop;
     end
 
-    LoadQueue #(.DEPTH(QDEPTH)) u_load_queue (
+    logic [LQ_DEPTH-1:0] lq_unissued_vec;
+    lsu_entry_t lq_entries [0:LQ_DEPTH-1];
+    logic [2:0] selected_lq_idx;
+    logic selected_lq_found;
+
+    always_comb begin
+        selected_lq_found = 1'b0;
+        selected_lq_idx = 3'd0;
+        load_head = '0;
+        for (integer idx = 0; idx < LQ_DEPTH; idx = idx + 1) begin
+            if (!selected_lq_found && lq_unissued_vec[idx]) begin
+                logic idx_is_mmio;
+                logic idx_mmio_allowed;
+                idx_is_mmio = (lq_entries[idx].address[31:16] == 16'h1f00);
+                idx_mmio_allowed = !idx_is_mmio || (rob_head_valid && uop_id_equal(lq_entries[idx].uop_id, rob_head_id));
+
+                if (idx_mmio_allowed) begin
+                    selected_lq_found = 1'b1;
+                    selected_lq_idx = idx[2:0];
+                    load_head = lq_entries[idx];
+                end
+            end
+        end
+        if (!selected_lq_found && (lq_occupancy != 0)) begin
+            load_head = lq_entries[0];
+        end
+    end
+    assign load_head_valid = selected_lq_found;
+
+    LoadQueue #(.DEPTH(LQ_DEPTH)) u_load_queue (
         .clk(cpu_clk), .rstn(cpu_rstn),
         .flush(flush),
         .recover_valid(recover_valid), .system_flush(system_flush),
         .recover_id(recover_id),
-        .accept_valid(load_valid), .accept_entry(load_accept_entry),
-        .accept_ready(load_ready), .head_valid(load_head_valid),
-        .accept1_valid(1'b0), .accept1_entry('0),
+        .accept_valid(load0_raw), .accept_entry(load_entry),
+        .accept_ready(load_ready), .head_valid(),
+        .accept1_valid(load1_raw), .accept1_entry(load1_entry),
         .accept1_ready(load1_ready),
-        .head_entry(load_head), .issue_mark(load_issue), .pop(load_pop),
+        .head_entry(), .issue_mark(load_issue), .issue_idx(selected_lq_idx), .pop(load_pop),
+        .unissued_vec(lq_unissued_vec), .entries_flat(lq_entries),
         .valid_vec(load_valid_vec), .addr_flat(load_addr_flat),
         .occupancy(lq_occupancy)
     );
 
-    StoreQueue #(.DEPTH(QDEPTH)) u_store_queue (
+    StoreQueue #(.DEPTH(SQ_DEPTH)) u_store_queue (
         .clk(cpu_clk), .rstn(cpu_rstn),
         .flush(flush),
         .recover_valid(recover_valid), .system_flush(system_flush),
         .recover_id(recover_id),
-        .accept_valid(store_valid), .accept_entry(store_accept_entry),
+        .accept_valid(store0_raw), .accept_entry(store_entry),
         .accept_ready(store_ready),
-        .accept1_valid(1'b0), .accept1_entry('0),
+        .accept1_valid(store1_raw), .accept1_entry(store1_entry),
         .accept1_ready(store1_ready),
         .commit0(commit0), .commit1(commit1),
         .release_valid(store_release_valid), .release_entry(store_release_entry),
@@ -475,7 +507,7 @@ module LoadStoreUnit (
         .occupancy(sq_occupancy)
     );
 
-    StoreBuffer #(.DEPTH(QDEPTH)) u_store_buffer (
+    StoreBuffer #(.DEPTH(SB_DEPTH)) u_store_buffer (
         .clk(cpu_clk), .rstn(cpu_rstn),
         .accept_valid(store_release_valid), .accept_entry(store_release_entry),
         .accept_ready(buffer_ready), .head_valid(buffer_head_valid),
@@ -493,7 +525,7 @@ module LoadStoreUnit (
     );
     assign store_release_fire = store_release_valid && buffer_ready && !flush;
 
-    MemoryOrderChecker #(.STORE_SLOTS(2*QDEPTH+1)) u_memory_order_checker (
+    MemoryOrderChecker #(.STORE_SLOTS(STORE_SLOTS)) u_memory_order_checker (
         .load_valid(load_head_valid), .load_addr(load_head.address),
         .load_ren(load_ren), .store_valid(order_valid),
         .store_addr_ready(order_addr_ready),

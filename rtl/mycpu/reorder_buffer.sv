@@ -193,13 +193,12 @@ module ReorderBuffer (
                     end
                 end
                 tail <= recover_id.rob_tag + {{(`ROB_TAG_W-1){1'b0}}, 1'b1};
-                // Start a fresh allocation generation after recovery.  The
-                // natural wrap increment alone would immediately reuse the
-                // exact uop_id of the first killed entry, allowing its late
-                // completion to update a newly allocated correct-path uop.
-                // Epoch width is unchanged; this is only a generation step
-                // in addition to the normal tag-wrap step.
-                tail_epoch <= recover_id.epoch + 1'b1 +
+                // Keep the packed uop ID as a continuous modular allocation
+                // sequence.  Execution/LSU recovery cancels killed work;
+                // adding another epoch step here breaks age comparisons after
+                // repeated loop recoveries when the epoch field is only two
+                // bits wide.
+                tail_epoch <= recover_id.epoch +
                               (recover_id.rob_tag == {`ROB_TAG_W{1'b1}});
                 count <= {1'b0, recover_distance} + 1'b1 -
                          commit0_valid - commit1_valid;
