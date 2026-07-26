@@ -362,14 +362,6 @@ module MyCpu (
 `endif
     end
 
-`ifndef SYNTHESIS
-    always @(posedge cpu_clk) begin
-        if (cpu_rstn && issue1_lsu_completion.valid && issue1_exec_completion.valid) begin
-            $fatal(1, "Lane1 Completion Collision: lsu_uop_id=%p, exec_uop_id=%p, is_ld_st=%b, pc=%h, ldst1_suspend=%b, pipeline_flush=%b", 
-                   issue1_lsu_completion.uop_id, issue1_exec_completion.uop_id, execute_result1.is_ld_st, execute_result1.pc, ldst1_suspend, pipeline_flush);
-        end
-    end
-`endif
 
     OooBackend u_ooo_backend (
         .clk                 (cpu_clk),

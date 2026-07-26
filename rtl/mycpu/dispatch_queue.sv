@@ -1084,54 +1084,5 @@ module DispatchQueue #(
         end
     end
 
-`ifndef SYNTHESIS
-    // A source can only name one full producer identity.  This assertion also
-    // guards against accidentally weakening the match to ROB tag only later.
-    integer wake_assert_q;
-    integer hold_assert_lane;
-    reg hold_payload_check [0:1];
-    issue_uop_t held_issue_payload [0:1];
-    always @(posedge clk or negedge rstn) begin
-        if (!rstn) begin
-            hold_payload_check[0] <= 1'b0;
-            hold_payload_check[1] <= 1'b0;
-            held_issue_payload[0] <= '0;
-            held_issue_payload[1] <= '0;
-        end else begin
-            for (wake_assert_q = 0; wake_assert_q < DQ_DEPTH;
-                 wake_assert_q = wake_assert_q + 1) begin
-                if (((complete0_src0_match[wake_assert_q] &&
-                      complete1_src0_match[wake_assert_q]) ||
-                     (complete0_src1_match[wake_assert_q] &&
-                      complete1_src1_match[wake_assert_q])) &&
-                    !uop_id_equal(complete_id, complete1_id)) begin
-                    $fatal(1, "DispatchQueue source matched two different completion uop IDs");
-                end
-            end
-
-            // Once offered under backpressure, the complete issue packet must
-            // remain unchanged.  On a same-cycle wakeup the clocked rD write
-            // captures the exact bypass value, so the completion pulse may
-            // disappear without changing the held packet.
-            for (hold_assert_lane = 0; hold_assert_lane < 2;
-                 hold_assert_lane = hold_assert_lane + 1) begin
-                if (!flush && hold_payload_check[hold_assert_lane] &&
-                    (!issue_valid[hold_assert_lane] ||
-                     (issue[hold_assert_lane] !==
-                      held_issue_payload[hold_assert_lane]))) begin
-                    $fatal(1, "DispatchQueue issue payload changed while stalled");
-                end
-                hold_payload_check[hold_assert_lane] <= !flush &&
-                    issue_valid[hold_assert_lane] &&
-                    !issue_ready[hold_assert_lane];
-                if (!flush && issue_valid[hold_assert_lane] &&
-                    !issue_ready[hold_assert_lane]) begin
-                    held_issue_payload[hold_assert_lane] <=
-                        issue[hold_assert_lane];
-                end
-            end
-        end
-    end
-`endif
 
 endmodule

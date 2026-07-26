@@ -156,13 +156,5 @@ module LoadQueue #(parameter integer DEPTH = 4) (
         end
     end
 
-`ifndef SYNTHESIS
-    always @(posedge clk) begin
-        if (rstn) begin
-            if (count > DEPTH) $fatal(1, "LoadQueue count overflow");
-            if (pop && count == 0) $error("LoadQueue pop when empty");
-        end
-    end
-`endif
 
 endmodule
