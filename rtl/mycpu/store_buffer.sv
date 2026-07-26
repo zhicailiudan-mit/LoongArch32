@@ -141,7 +141,7 @@ module StoreBuffer #(parameter integer DEPTH = 4) (
         if (rstn) begin
             if (pop && (count == 0))
                 $error("StoreBuffer pop while empty");
-            if ((count == DEPTH) && accept_valid && !pop_do)
+            if ((count == DEPTH) && push_do && !pop_do)
                 $error("StoreBuffer push while full without pop");
             if (count_next > DEPTH)
                 $error("StoreBuffer count overflow");
