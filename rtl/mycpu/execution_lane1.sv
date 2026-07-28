@@ -13,8 +13,6 @@ module ExecutionLane1 (
     input  logic                    recover_valid,
     input  logic                    system_flush,
     input  uop_id_t                 recover_id,
-    input  completion_t             complete0,
-    input  completion_t             complete1,
     input  logic                    result_stall,
     output logic                    issue_ready,
     input  logic                    issue_valid,
@@ -72,14 +70,6 @@ module ExecutionLane1 (
          uop_is_younger(uop_id_q, recover_id));
     wire [31:0]              lane_result = is_mdu_q ? muldiv_result :
                                                                alu_result;
-
-    wire lane1_store_valid = valid_q && is_ld_st_q && (store_mask_q != 4'b0) && !kill_valid_q;
-    wire c0_lane1_match = complete0.valid && complete0.reg_write &&
-                          lane1_store_valid && !src1_ready_q &&
-                          uop_id_equal(complete0.uop_id, src1_id_q);
-    wire c1_lane1_match = complete1.valid && complete1.reg_write &&
-                          lane1_store_valid && !src1_ready_q &&
-                          uop_id_equal(complete1.uop_id, src1_id_q);
 
     assign issue_ready = !valid_q || result_fire;
 
@@ -186,23 +176,6 @@ module ExecutionLane1 (
                 store_mask_q <= issue_store_mask;
                 load_ext_op_q <= issue_load_ext_op;
                 is_ld_st_q <= issue_is_ld_st;
-                if (issue_valid && issue_is_ld_st && (issue_store_mask != 4'b0) && !issue_src1_ready) begin
-                    if (complete0.valid && complete0.reg_write && uop_id_equal(complete0.uop_id, issue_src1_id)) begin
-                        src1_q       <= complete0.value;
-                        src1_ready_q <= 1'b1;
-                    end else if (complete1.valid && complete1.reg_write && uop_id_equal(complete1.uop_id, issue_src1_id)) begin
-                        src1_q       <= complete1.value;
-                        src1_ready_q <= 1'b1;
-                    end
-                end
-            end else if (c0_lane1_match || c1_lane1_match) begin
-                if (c0_lane1_match) begin
-                    src1_q       <= complete0.value;
-                    src1_ready_q <= 1'b1;
-                end else begin
-                    src1_q       <= complete1.value;
-                    src1_ready_q <= 1'b1;
-                end
             end
 
             complete_valid     <= result_fire && !is_ld_st_q;
@@ -212,16 +185,6 @@ module ExecutionLane1 (
                 complete_value <= lane_result;
         end
     end
-
-`ifndef SYNTHESIS
-    always @(posedge clk) begin
-        if (rstn && !kill_valid_q && lane1_store_valid && !src1_ready_q) begin
-            if (c0_lane1_match && c1_lane1_match) begin
-                $fatal(1, "[LANE1-ASSERT] Dual completions matched same Store uop_id=%p simultaneously!", src1_id_q);
-            end
-        end
-    end
-`endif
 
     wire unused_muldiv_busy = muldiv_busy;
 endmodule

@@ -14,8 +14,6 @@ module ExecutionLane0 (
     input  logic                  recover_valid,
     input  logic                  system_flush,
     input  uop_id_t               recover_id,
-    input  completion_t           complete0,
-    input  completion_t           complete1,
 
     input  logic                  issue0_valid,
     input  logic                  issue0_fire,
@@ -59,14 +57,6 @@ module ExecutionLane0 (
         (system_flush || !recover_valid ||
          uop_is_younger(issue0_q.uop_id, recover_id));
 
-    wire lane0_store_valid = issue0_valid_q && issue0_q.is_ld_st && (issue0_q.store_mask != 4'b0) && !kill_issue0;
-    wire c0_lane0_match = complete0.valid && complete0.reg_write &&
-                          lane0_store_valid && !issue0_q.src1_ready &&
-                          uop_id_equal(complete0.uop_id, issue0_q.src1_id);
-    wire c1_lane0_match = complete1.valid && complete1.reg_write &&
-                          lane0_store_valid && !issue0_q.src1_ready &&
-                          uop_id_equal(complete1.uop_id, issue0_q.src1_id);
-
     // Branch recovery is published as one registered event.  Target and ROB
     // tag are sampled together with the resolution result; ROB/RAT/frontend
     // therefore never observe a recovery pulse paired with the next uop's
@@ -95,35 +85,8 @@ module ExecutionLane0 (
         end else if (!pipeline_flush && !lane0_result_stall && !muldiv_hold) begin
             issue0_valid_q <= issue0_fire;
             issue0_q       <= issue0;
-            if (issue0_fire && issue0.is_ld_st && (issue0.store_mask != 4'b0) && !issue0.src1_ready) begin
-                if (complete0.valid && complete0.reg_write && uop_id_equal(complete0.uop_id, issue0.src1_id)) begin
-                    issue0_q.src1_value <= complete0.value;
-                    issue0_q.src1_ready <= 1'b1;
-                end else if (complete1.valid && complete1.reg_write && uop_id_equal(complete1.uop_id, issue0.src1_id)) begin
-                    issue0_q.src1_value <= complete1.value;
-                    issue0_q.src1_ready <= 1'b1;
-                end
-            end
-        end else if (c0_lane0_match || c1_lane0_match) begin
-            if (c0_lane0_match) begin
-                issue0_q.src1_value <= complete0.value;
-                issue0_q.src1_ready <= 1'b1;
-            end else begin
-                issue0_q.src1_value <= complete1.value;
-                issue0_q.src1_ready <= 1'b1;
-            end
         end
     end
-
-`ifndef SYNTHESIS
-    always @(posedge cpu_clk) begin
-        if (cpu_rstn && !kill_issue0 && lane0_store_valid && !issue0_q.src1_ready) begin
-            if (c0_lane0_match && c1_lane0_match) begin
-                $fatal(1, "[LANE0-ASSERT] Dual completions matched same Store uop_id=%p simultaneously!", issue0_q.src1_id);
-            end
-        end
-    end
-`endif
 
     IntegerAluCore u_integer_alu_core (
         .alu_op (issue0_q.alu_op),

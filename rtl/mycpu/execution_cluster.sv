@@ -20,8 +20,6 @@ module ExecutionCluster (
     input  logic                  recover_valid,
     input  logic                  system_flush,
     input  uop_id_t               recover_id,
-    input  completion_t           complete0,
-    input  completion_t           complete1,
 
     input  logic                  issue0_valid,
     input  logic                  issue0_fire,
@@ -59,8 +57,6 @@ module ExecutionCluster (
         .recover_valid      (recover_valid),
         .system_flush       (system_flush),
         .recover_id         (recover_id),
-        .complete0          (complete0),
-        .complete1          (complete1),
         
         .issue0_valid   (issue0_valid),
         .issue0_fire    (issue0_fire),
@@ -89,8 +85,6 @@ module ExecutionCluster (
         .recover_valid      (recover_valid),
         .system_flush       (system_flush),
         .recover_id         (recover_id),
-        .complete0          (complete0),
-        .complete1          (complete1),
         .result_stall       (lane1_result_stall),
         .issue_ready        (lane1_ready),
         .issue_valid        (issue1_fire),
@@ -124,7 +118,7 @@ module ExecutionCluster (
             $stable(execute_result.uop_id) &&
             $stable(execute_result.pc) &&
             $stable(execute_result.alu_result) &&
-            ($past(execute_result.store_data_ready) || $stable(execute_result.src1_value)) &&
+            $stable(execute_result.src1_value) &&
             $stable(execute_result.store_mask)) else $fatal(1, "Lane 0 execute_result hold violation");
 
     assert property (@(posedge cpu_clk) disable iff (!cpu_rstn || system_flush || (recover_valid && uop_is_younger(execute_result1.uop_id, recover_id)))
@@ -133,7 +127,7 @@ module ExecutionCluster (
             $stable(execute_result1.uop_id) &&
             $stable(execute_result1.pc) &&
             $stable(execute_result1.alu_result) &&
-            ($past(execute_result1.store_data_ready) || $stable(execute_result1.src1_value)) &&
+            $stable(execute_result1.src1_value) &&
             $stable(execute_result1.store_mask)) else $fatal(1, "Lane 1 execute_result hold violation");
 `endif
 
