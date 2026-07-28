@@ -296,6 +296,8 @@ module MyCpu (
         .recover_valid        (recover_valid),
         .system_flush         (recovery_event.system_flush),
         .recover_id           (recover_id),
+        .complete0            (store_data_complete0),
+        .complete1            (store_data_complete1),
         .issue0_valid     (issue0_valid),
         .issue0_fire      (issue0_fire),
         .issue0           (issue0),
