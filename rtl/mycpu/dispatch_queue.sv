@@ -476,19 +476,18 @@ module DispatchQueue #(
             // Completion wakeup is still captured into src*_ready/rD* at the
             // clock edge.  The effective state additionally lets that same
             // completion participate in select and operand delivery now.
-            // Correctness boundary:
+            // Store address/data decoupling:
             //
-            // A Store may leave the DispatchQueue only after both its address
-            // source and data source are ready.  Allowing address-only issue
-            // creates a completion ownership gap: after the Store leaves DQ
-            // but before an unresolved Store is safely owned by SQ, its data
-            // producer may complete and the one-cycle wakeup can be lost.
+            // A Store may issue as soon as its address source is ready.  Its
+            // data source may remain unresolved and is carried with the full
+            // producer uop_id through ExecutionLane into StoreQueue.
             //
-            // src1_ready_eff includes same-cycle completion bypass, so a Store
-            // may still issue in the exact cycle in which its data producer
-            // completes, using src1_value_eff as the authoritative value.
+            // src1_ready_eff/src1_value_eff still provide same-cycle bypass
+            // when the Store data producer completes during selection.
             assign slot_ready[q] = src0_ready_eff[q] &&
-                                    src1_ready_eff[q] &&
+                                    (src1_ready_eff[q] ||
+                                     (is_ld_st[q] &&
+                                      (ram_we[q] != `RAM_WE_N))) &&
                                     (!(is_ld_st[q] &&
                                        (ram_we[q] == `RAM_WE_N)) ||
                                      !older_store_pending[q]) &&

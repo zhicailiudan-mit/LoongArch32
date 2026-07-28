@@ -15,6 +15,9 @@ module ExecutionLane0 (
     input  logic                  system_flush,
     input  uop_id_t               recover_id,
 
+    input  completion_t           store_data_complete0,
+    input  completion_t           store_data_complete1,
+
     input  logic                  issue0_valid,
     input  logic                  issue0_fire,
     input  issue_uop_t            issue0,
@@ -57,6 +60,41 @@ module ExecutionLane0 (
         (system_flush || !recover_valid ||
          uop_is_younger(issue0_q.uop_id, recover_id));
 
+    // An address-ready Store is allowed to leave the DispatchQueue before its
+    // data producer completes.  While the Store is held at this execution
+    // boundary by LSU backpressure, continue snooping both completion lanes.
+    //
+    // Matching uses the complete epoch+ROB-tag identity.  Once ready becomes
+    // true, the captured value remains authoritative and cannot be replaced by
+    // a later wrapped ROB tag.
+    wire issue0_q_is_store =
+        issue0_valid_q &&
+        issue0_q.is_ld_st &&
+        (issue0_q.store_mask != `RAM_WE_N);
+
+    wire store_data_wake0 =
+        issue0_q_is_store &&
+        !issue0_q.src1_ready &&
+        store_data_complete0.valid &&
+        store_data_complete0.reg_write &&
+        uop_id_equal(store_data_complete0.uop_id,
+                     issue0_q.src1_id);
+
+    wire store_data_wake1 =
+        issue0_q_is_store &&
+        !issue0_q.src1_ready &&
+        store_data_complete1.valid &&
+        store_data_complete1.reg_write &&
+        uop_id_equal(store_data_complete1.uop_id,
+                     issue0_q.src1_id);
+
+    wire store_data_wake =
+        store_data_wake0 || store_data_wake1;
+
+    wire [31:0] store_data_wake_value =
+        store_data_wake0 ? store_data_complete0.value :
+                           store_data_complete1.value;
+
     // Branch recovery is published as one registered event.  Target and ROB
     // tag are sampled together with the resolution result; ROB/RAT/frontend
     // therefore never observe a recovery pulse paired with the next uop's
@@ -85,6 +123,12 @@ module ExecutionLane0 (
         end else if (!pipeline_flush && !lane0_result_stall && !muldiv_hold) begin
             issue0_valid_q <= issue0_fire;
             issue0_q       <= issue0;
+        end else if (store_data_wake) begin
+            // The resident Store has not yet transferred into SQ.  Preserve
+            // the completion here so the one-cycle wakeup cannot fall into
+            // the DQ-to-SQ ownership gap.
+            issue0_q.src1_value <= store_data_wake_value;
+            issue0_q.src1_ready <= 1'b1;
         end
     end
 

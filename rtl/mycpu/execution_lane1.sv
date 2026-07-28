@@ -13,6 +13,8 @@ module ExecutionLane1 (
     input  logic                    recover_valid,
     input  logic                    system_flush,
     input  uop_id_t                 recover_id,
+    input  completion_t             store_data_complete0,
+    input  completion_t             store_data_complete1,
     input  logic                    result_stall,
     output logic                    issue_ready,
     input  logic                    issue_valid,
@@ -70,6 +72,34 @@ module ExecutionLane1 (
          uop_is_younger(uop_id_q, recover_id));
     wire [31:0]              lane_result = is_mdu_q ? muldiv_result :
                                                                alu_result;
+
+    wire valid_q_is_store =
+        valid_q &&
+        is_ld_st_q &&
+        (store_mask_q != `RAM_WE_N);
+
+    wire store_data_wake0 =
+        valid_q_is_store &&
+        !src1_ready_q &&
+        store_data_complete0.valid &&
+        store_data_complete0.reg_write &&
+        uop_id_equal(store_data_complete0.uop_id,
+                     src1_id_q);
+
+    wire store_data_wake1 =
+        valid_q_is_store &&
+        !src1_ready_q &&
+        store_data_complete1.valid &&
+        store_data_complete1.reg_write &&
+        uop_id_equal(store_data_complete1.uop_id,
+                     src1_id_q);
+
+    wire store_data_wake =
+        store_data_wake0 || store_data_wake1;
+
+    wire [31:0] store_data_wake_value =
+        store_data_wake0 ? store_data_complete0.value :
+                           store_data_complete1.value;
 
     assign issue_ready = !valid_q || result_fire;
 
@@ -176,6 +206,11 @@ module ExecutionLane1 (
                 store_mask_q <= issue_store_mask;
                 load_ext_op_q <= issue_load_ext_op;
                 is_ld_st_q <= issue_is_ld_st;
+            end else if (store_data_wake) begin
+                // The Store is resident in lane1 because SQ has not accepted
+                // it yet.  Capture its data producer completion locally.
+                src1_q       <= store_data_wake_value;
+                src1_ready_q <= 1'b1;
             end
 
             complete_valid     <= result_fire && !is_ld_st_q;
