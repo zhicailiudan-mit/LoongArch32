@@ -173,6 +173,8 @@ module ExecutionLane0 (
         execute_result.pc              = issue0_q.pc;
         execute_result.src0_value      = issue0_q.src0_value;
         execute_result.src1_value      = issue0_q.src1_value;
+        execute_result.store_data_ready = issue0_q.src1_ready;
+        execute_result.store_data_src_id = issue0_q.src1_id;
         execute_result.imm             = issue0_q.imm;
         execute_result.alu_result      = ex_alu_result;
         execute_result.reg_write       = issue0_q.reg_write;

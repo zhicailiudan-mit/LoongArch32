@@ -15,6 +15,7 @@ module sram_bus_master(
     // DCache Interface
     output wire         dc_dev_wrdy  ,
     output wire         dc_dev_wdone ,
+    output wire         dc_dev_widle ,
     input  wire [ 3:0]  dc_cpu_wen   ,      // DCache的写主存使能信号，支持字节使能
     input  wire [31:0]  dc_cpu_waddr ,      // DCache的写主存地址
     input  wire [31:0]  dc_cpu_wdata ,      // DCache的写主存数据
@@ -165,6 +166,7 @@ module sram_bus_master(
         // Cache Write Interface
         .dev_wrdy       (dc_wfifo_rdy ),
         .dev_wdone      (dc_wdone      ),
+        .dev_widle      (dc_dev_widle  ),
         .cpu_wen        (dc_cpu_wen   ),
         .cpu_waddr      (dc_cpu_waddr ),
         .cpu_wdata      (dc_cpu_wdata ),

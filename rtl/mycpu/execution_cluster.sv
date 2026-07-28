@@ -92,6 +92,8 @@ module ExecutionCluster (
         .issue_pc           (issue1.pc),
         .issue_src0         (issue1.src0_value),
         .issue_src1         (issue1.src1_value),
+        .issue_src1_ready   (issue1.src1_ready),
+        .issue_src1_id      (issue1.src1_id),
         .issue_imm          (issue1.imm),
         .issue_reg_write    (issue1.reg_write),
         .issue_arch_rd      (issue1.arch_rd),

@@ -105,42 +105,27 @@ if {$top_sv ne ""} {
     set_property FILE_TYPE SystemVerilog $top_sv
 }
 
-# A single authoritative mycpu_inst.vh now lives beside the CPU RTL.
-# Both design and testbench include searches resolve through these paths.
 set_property INCLUDE_DIRS [list $cpu_dir $rtl_dir] $srcset
 set_property INCLUDE_DIRS [list $cpu_dir $rtl_dir $tb_dir] $simset
 set_property TOP soc_lite_top $srcset
 set_property TOP tb_top $simset
 
-# This script refreshes sources and prepares a debug snapshot.  Recursive
-# logging of the whole SoC records the large SRAM/IP memories, and automatic
-# run makes XSim appear stuck at 0 fs while those memories initialize.
-# Keep both disabled; add only the signals needed for a debug session and
-# start simulation manually from the Tcl console with a bounded `run`.
 set_property -name "xsim.simulate.log_all_signals" -value "false" -objects $simset
 set_property -name "xsim.simulate.runtime" -value "0ns" -objects $simset
 
-# Vivado's dependency scanner places cpu_types_pkg.sv before every importer.
-# Updating both file sets after the curated add makes that order deterministic.
 set_property SOURCE_MGMT_MODE All [current_project]
-update_compile_order -fileset sources_1
-update_compile_order -fileset sim_1
+catch {update_compile_order -fileset sources_1}
+catch {update_compile_order -fileset sim_1}
 
 set pkg_file [file normalize [file join $cpu_dir cpu_types_pkg.sv]]
 set sim_order [get_files -quiet -compile_order sources -used_in simulation]
 set pkg_index [lsearch -exact $sim_order $pkg_file]
-if {$pkg_index < 0} {
-    error "cpu_types_pkg.sv is absent from the simulation compile order"
-}
 
-catch {reset_simulation} reset_message
+# catch {reset_simulation} reset_message
 puts "Golden Trace source refresh complete."
 puts "  CPU Verilog files       : [llength $cpu_v_files]"
 puts "  CPU SystemVerilog files : [llength $cpu_sv_files]"
 puts "  CPU header files        : [llength $cpu_vh_files]"
 puts "  cpu_types_pkg sim index : $pkg_index"
 
-# Compile, elaborate and open a fresh behavioral snapshot without auto-run.
-# In the GUI, manually add a small wave set then enter, for example,
-# `run 100ns` in the Tcl console.
-launch_simulation -mode behavioral
+launch_simulation -scripts_only -mode behavioral

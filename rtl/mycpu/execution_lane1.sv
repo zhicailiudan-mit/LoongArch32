@@ -20,6 +20,8 @@ module ExecutionLane1 (
     input  logic [31:0]             issue_pc,
     input  logic [31:0]             issue_src0,
     input  logic [31:0]             issue_src1,
+    input  logic                    issue_src1_ready,
+    input  uop_id_t                 issue_src1_id,
     input  logic [31:0]             issue_imm,
     input  logic                    issue_reg_write,
     input  logic [4:0]              issue_arch_rd,
@@ -41,6 +43,8 @@ module ExecutionLane1 (
     logic [31:0]             pc_q;
     logic [31:0]             src0_q;
     logic [31:0]             src1_q;
+    logic                    src1_ready_q;
+    uop_id_t                 src1_id_q;
     logic [31:0]             imm_q;
     logic                    reg_write_q;
     logic [4:0]              arch_rd_q;
@@ -85,6 +89,8 @@ module ExecutionLane1 (
         execute_result.pc = pc_q;
         execute_result.src0_value = src0_q;
         execute_result.src1_value = src1_q;
+        execute_result.store_data_ready = src1_ready_q;
+        execute_result.store_data_src_id = src1_id_q;
         execute_result.imm = imm_q;
         execute_result.alu_result = lane_result;
         execute_result.reg_write = reg_write_q;
@@ -126,6 +132,8 @@ module ExecutionLane1 (
             pc_q             <= 32'h0;
             src0_q           <= 32'h0;
             src1_q           <= 32'h0;
+            src1_ready_q     <= 1'b0;
+            src1_id_q        <= '0;
             imm_q            <= 32'h0;
             reg_write_q      <= 1'b0;
             arch_rd_q        <= 5'h0;
@@ -156,6 +164,8 @@ module ExecutionLane1 (
                 pc_q        <= issue_pc;
                 src0_q      <= issue_src0;
                 src1_q      <= issue_src1;
+                src1_ready_q <= issue_src1_ready;
+                src1_id_q   <= issue_src1_id;
                 imm_q       <= issue_imm;
                 reg_write_q <= issue_reg_write;
                 arch_rd_q   <= issue_arch_rd;

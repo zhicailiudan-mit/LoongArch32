@@ -67,6 +67,14 @@ package cpu_types_pkg;
         SYS_CSRRD    = 3'd5
     } system_op_e;
 
+    typedef enum logic [2:0] {
+        PROD_UNKNOWN = 3'd0,
+        PROD_ALU     = 3'd1,
+        PROD_LOAD    = 3'd2,
+        PROD_MULDIV  = 3'd3,
+        PROD_BRANCH  = 3'd4
+    } producer_type_e;
+
     typedef struct packed {
         logic [31:0] pc;
         decoded_src_t src0;
@@ -97,6 +105,8 @@ package cpu_types_pkg;
         logic [31:0] pc;
         logic [31:0] src0_value;
         logic [31:0] src1_value;
+        logic        src1_ready;
+        uop_id_t     src1_id;
         logic [4:0]  arch_rs1;
         logic [4:0]  arch_rs2;
         logic        src0_used;
@@ -154,6 +164,8 @@ package cpu_types_pkg;
         logic [2:0]              load_ext_op;
         logic                    reg_write;
         logic [4:0]              arch_rd;
+        logic                    store_data_ready;
+        uop_id_t                 store_data_src_id;
     } lsu_entry_t;
 
     typedef struct packed {
@@ -187,6 +199,8 @@ package cpu_types_pkg;
         logic [31:0]             pc;
         logic [31:0]             src0_value;
         logic [31:0]             src1_value;
+        logic                    store_data_ready;
+        uop_id_t                 store_data_src_id;
         logic [31:0]             imm;
         logic [31:0]             alu_result;
         logic                    reg_write;

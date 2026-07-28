@@ -23,6 +23,13 @@ module DispatchQueue #(
     input  uop_id_t              recover_id,
     input  logic                 barrier_release,
     output logic                 perf_true_source_wait,
+    output logic                 perf_source_wait_dep_load,
+    output logic                 perf_source_wait_dep_muldiv,
+    output logic                 perf_source_wait_dep_alu,
+    output logic                 perf_source_wait_dep_branch,
+    output logic                 perf_source_wait_store_addr,
+    output logic                 perf_source_wait_store_data,
+    output logic                 perf_iq_no_ready,
     output logic                 perf_lsu_order,
     output logic                 perf_serializing,
 
@@ -345,6 +352,13 @@ module DispatchQueue #(
         ({{(DQ_DEPTH-1){1'b0}}, 1'b1} << main_hold_sel) :
         {DQ_DEPTH{1'b0}};
 
+    typedef struct packed {
+        logic valid;
+        logic [`UOP_EPOCH_W-1:0] epoch;
+        producer_type_e ptype;
+    } producer_entry_t;
+    producer_entry_t producer_table [0:(1<<`ROB_TAG_W)-1];
+
     // Control-flow recovery is not composable when a younger branch is
     // allowed to redirect before an older unresolved branch.  In that case
     // the younger target can reach the frontend first and later be replaced
@@ -462,7 +476,8 @@ module DispatchQueue #(
             // Completion wakeup is still captured into src*_ready/rD* at the
             // clock edge.  The effective state additionally lets that same
             // completion participate in select and operand delivery now.
-            assign slot_ready[q] = src0_ready_eff[q] && src1_ready_eff[q] &&
+            assign slot_ready[q] = src0_ready_eff[q] &&
+                                    (src1_ready_eff[q] || (is_ld_st[q] && (ram_we[q] != `RAM_WE_N))) &&
                                     (!(is_ld_st[q] &&
                                        (ram_we[q] == `RAM_WE_N)) ||
                                      !older_store_pending[q]) &&
@@ -634,6 +649,8 @@ module DispatchQueue #(
         issue[0].pc = pc[issue_sel];
         issue[0].src0_value = src0_value_eff[issue_sel];
         issue[0].src1_value = src1_value_eff[issue_sel];
+        issue[0].src1_ready = src1_ready_eff[issue_sel];
+        issue[0].src1_id = src1_id[issue_sel];
         issue[0].arch_rs1 = rR1[issue_sel];
         issue[0].arch_rs2 = rR2[issue_sel];
         issue[0].src0_used = rR1_re[issue_sel];
@@ -666,11 +683,60 @@ module DispatchQueue #(
         issue[0].pred.perf_btb_hit = perf_btb_hit[issue_sel];
 
 `ifndef SYNTHESIS
-        perf_true_source_wait = 1'b0;
-        perf_lsu_order = 1'b0;
-        perf_serializing = 1'b0;
+        perf_true_source_wait       = 1'b0;
+        perf_source_wait_dep_load   = 1'b0;
+        perf_source_wait_dep_muldiv = 1'b0;
+        perf_source_wait_dep_alu    = 1'b0;
+        perf_source_wait_dep_branch = 1'b0;
+        perf_source_wait_store_addr = 1'b0;
+        perf_source_wait_store_data = 1'b0;
+        perf_iq_no_ready            = (valid != {DQ_DEPTH{1'b0}}) && ((valid & slot_ready) == {DQ_DEPTH{1'b0}});
+        perf_lsu_order              = 1'b0;
+        perf_serializing            = 1'b0;
+
         if (perf_oldest_is_valid) begin
-            perf_true_source_wait = (!src0_ready_eff[perf_oldest_idx] || !src1_ready_eff[perf_oldest_idx]);
+            begin : PERF_SOURCE_WAIT_EVAL
+                logic s0_wait;
+                logic s1_wait;
+                logic is_store_oldest;
+                logic [`ROB_TAG_W-1:0] s0_t;
+                logic [`ROB_TAG_W-1:0] s1_t;
+                producer_type_e s0_p;
+                producer_type_e s1_p;
+
+                s0_wait = rR1_re[perf_oldest_idx] && (rR1[perf_oldest_idx] != 5'd0) && !src0_ready_eff[perf_oldest_idx];
+                s1_wait = rR2_re[perf_oldest_idx] && (rR2[perf_oldest_idx] != 5'd0) && !src1_ready_eff[perf_oldest_idx];
+
+                s0_t = src0_id[perf_oldest_idx].rob_tag;
+                s1_t = src1_id[perf_oldest_idx].rob_tag;
+
+                s0_p = (s0_wait && producer_table[s0_t].valid && (producer_table[s0_t].epoch == src0_id[perf_oldest_idx].epoch)) ?
+                       producer_table[s0_t].ptype : PROD_UNKNOWN;
+                s1_p = (s1_wait && producer_table[s1_t].valid && (producer_table[s1_t].epoch == src1_id[perf_oldest_idx].epoch)) ?
+                       producer_table[s1_t].ptype : PROD_UNKNOWN;
+
+                is_store_oldest = is_ld_st[perf_oldest_idx] && (ram_we[perf_oldest_idx] != `RAM_WE_N);
+                perf_true_source_wait = is_store_oldest ? s0_wait : (s0_wait || s1_wait);
+
+                if (perf_true_source_wait) begin
+                    if (is_store_oldest) begin
+                        perf_source_wait_dep_load   = (s0_p == PROD_LOAD);
+                        perf_source_wait_dep_muldiv = (s0_p == PROD_MULDIV);
+                        perf_source_wait_dep_alu    = (s0_p == PROD_ALU);
+                        perf_source_wait_dep_branch = (s0_p == PROD_BRANCH);
+                    end else begin
+                        perf_source_wait_dep_load   = (s0_wait && (s0_p == PROD_LOAD))   || (s1_wait && (s1_p == PROD_LOAD));
+                        perf_source_wait_dep_muldiv = (s0_wait && (s0_p == PROD_MULDIV)) || (s1_wait && (s1_p == PROD_MULDIV));
+                        perf_source_wait_dep_alu    = (s0_wait && (s0_p == PROD_ALU))    || (s1_wait && (s1_p == PROD_ALU));
+                        perf_source_wait_dep_branch = (s0_wait && (s0_p == PROD_BRANCH)) || (s1_wait && (s1_p == PROD_BRANCH));
+                    end
+                end
+                if (is_store_oldest) begin
+                    perf_source_wait_store_addr = s0_wait;
+                    perf_source_wait_store_data = s1_wait;
+                end
+            end
+
             perf_lsu_order = src0_ready_eff[perf_oldest_idx] && src1_ready_eff[perf_oldest_idx] &&
                              is_ld_st[perf_oldest_idx] && (ram_we[perf_oldest_idx] == `RAM_WE_N) && older_store_pending[perf_oldest_idx];
             perf_serializing = src0_ready_eff[perf_oldest_idx] && src1_ready_eff[perf_oldest_idx] &&
@@ -684,6 +750,8 @@ module DispatchQueue #(
         issue[1].pc = pc[fast_issue_sel];
         issue[1].src0_value = src0_value_eff[fast_issue_sel];
         issue[1].src1_value = src1_value_eff[fast_issue_sel];
+        issue[1].src1_ready = src1_ready_eff[fast_issue_sel];
+        issue[1].src1_id = src1_id[fast_issue_sel];
         issue[1].imm = ext[fast_issue_sel];
         issue[1].reg_write = rf_we[fast_issue_sel];
         issue[1].arch_rd = wR[fast_issue_sel];
@@ -917,6 +985,9 @@ module DispatchQueue #(
                 ras_count_before[i] <= 4'h0;
                 perf_btb_hit[i] <= 1'b0;
             end
+            for (i = 0; i < (1<<`ROB_TAG_W); i = i + 1) begin
+                producer_table[i] <= '0;
+            end
         end else if (flush) begin
             recover_count = 0;
             for (i = 0; i < DQ_DEPTH; i = i + 1) begin
@@ -1029,6 +1100,11 @@ module DispatchQueue #(
                 ras_sp_before[enq_sel] <= enq_ras_sp_before;
                 ras_count_before[enq_sel] <= enq_ras_count_before;
                 perf_btb_hit[enq_sel] <= enq_perf_btb_hit;
+                producer_table[enq_uop_id.rob_tag].valid <= 1'b1;
+                producer_table[enq_uop_id.rob_tag].epoch <= enq_uop_id.epoch;
+                producer_table[enq_uop_id.rob_tag].ptype <= (enq_is_ld_st && (enq_ram_we == `RAM_WE_N)) ? PROD_LOAD :
+                    (((enq_alu_op == `ALU_MULL) || (enq_alu_op == `ALU_MULH) || (enq_alu_op == `ALU_UMUL)) ? PROD_MULDIV :
+                    (enq_is_br_jmp ? PROD_BRANCH : PROD_ALU));
             end
 
             if (enq1_fire) begin
@@ -1076,6 +1152,11 @@ module DispatchQueue #(
                 ras_sp_before[enq1_sel] <= enq1_ras_sp_before;
                 ras_count_before[enq1_sel] <= enq1_ras_count_before;
                 perf_btb_hit[enq1_sel] <= enq1_perf_btb_hit;
+                producer_table[enq1_uop_id.rob_tag].valid <= 1'b1;
+                producer_table[enq1_uop_id.rob_tag].epoch <= enq1_uop_id.epoch;
+                producer_table[enq1_uop_id.rob_tag].ptype <= (enq1_is_ld_st && (enq1_ram_we == `RAM_WE_N)) ? PROD_LOAD :
+                    (((enq1_alu_op == `ALU_MULL) || (enq1_alu_op == `ALU_MULH) || (enq1_alu_op == `ALU_UMUL)) ? PROD_MULDIV :
+                    (enq1_is_br_jmp ? PROD_BRANCH : PROD_ALU));
             end
 
             count <= count + enq_fire + enq1_fire -

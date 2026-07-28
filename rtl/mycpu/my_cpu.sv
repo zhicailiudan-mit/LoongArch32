@@ -121,12 +121,19 @@ module MyCpu (
     wire perf_icache_wait;
     wire [`ROB_TAG_W:0] perf_rob_occupancy;
     wire [3:0] perf_issue_occupancy;
-    wire [2:0] perf_lq_occupancy;
+    wire [3:0] perf_lq_occupancy;
     wire [2:0] perf_sq_occupancy;
     wire [2:0] perf_sb_occupancy;
     wire perf_rob_block;
     wire perf_issue_queue_block;
     wire perf_true_source_wait;
+    wire perf_source_wait_dep_load;
+    wire perf_source_wait_dep_muldiv;
+    wire perf_source_wait_dep_alu;
+    wire perf_source_wait_dep_branch;
+    wire perf_source_wait_store_addr;
+    wire perf_source_wait_store_data;
+    wire perf_iq_no_ready;
     wire perf_serializing;
     wire perf_lsu_order;
     wire lsu_perf_order_block;
@@ -160,6 +167,8 @@ module MyCpu (
     wire [31:0] store_line_alloc_addr;
     wire [`CACHE_BLK_SIZE-1:0] store_line_alloc_data;
     wire [`CACHE_BLK_LEN-1:0] store_line_alloc_word_mask;
+    completion_t store_data_complete0;
+    completion_t store_data_complete1;
 
     wire frontend_ifetch_rreq;
     wire [31:0] frontend_ifetch_addr;
@@ -322,6 +331,8 @@ module MyCpu (
         .rob_head_id    (rob_head_id),
         .execute_result (execute_result),
         .execute_result1(execute_result1),
+        .store_data_complete0(store_data_complete0),
+        .store_data_complete1(store_data_complete1),
         .commit0        (commit0),
         .commit1        (commit1),
         .ldst_suspend   (ldst_suspend),
@@ -392,11 +403,20 @@ module MyCpu (
         .system_issue        (system_issue),
         .commit0             (commit0),
         .commit1             (commit1),
+        .store_data_complete0(store_data_complete0),
+        .store_data_complete1(store_data_complete1),
         .perf_rob_occupancy  (perf_rob_occupancy),
         .perf_issue_occupancy(perf_issue_occupancy),
         .perf_rob_block      (perf_rob_block),
         .perf_issue_queue_block(perf_issue_queue_block),
         .perf_true_source_wait(perf_true_source_wait),
+        .perf_source_wait_dep_load(perf_source_wait_dep_load),
+        .perf_source_wait_dep_muldiv(perf_source_wait_dep_muldiv),
+        .perf_source_wait_dep_alu(perf_source_wait_dep_alu),
+        .perf_source_wait_dep_branch(perf_source_wait_dep_branch),
+        .perf_source_wait_store_addr(perf_source_wait_store_addr),
+        .perf_source_wait_store_data(perf_source_wait_store_data),
+        .perf_iq_no_ready(perf_iq_no_ready),
         .perf_lsu_order      (perf_lsu_order),
         .perf_serializing    (perf_serializing),
         .perf_dispatch_fire0 (perf_dispatch_fire0),
@@ -491,7 +511,12 @@ module MyCpu (
 
 `ifndef SYNTHESIS
     (* keep_hierarchy = "yes", dont_touch = "yes" *)
-    PerformanceCounters u_performance_counters (
+    PerformanceCounters #(
+        .IQ_DEPTH_P(8),
+        .LQ_DEPTH_P(8),
+        .SQ_DEPTH_P(4),
+        .SB_DEPTH_P(4)
+    ) u_performance_counters (
         .clk                    (cpu_clk),
         .rstn                   (cpu_rstn),
         .decode_valid           (decode_valid),
@@ -517,6 +542,13 @@ module MyCpu (
         .rob_block              (perf_rob_block),
         .issue_queue_block      (perf_issue_queue_block),
         .source_wait            (perf_true_source_wait),
+        .source_wait_dep_load   (perf_source_wait_dep_load),
+        .source_wait_dep_muldiv (perf_source_wait_dep_muldiv),
+        .source_wait_dep_alu    (perf_source_wait_dep_alu),
+        .source_wait_dep_branch (perf_source_wait_dep_branch),
+        .source_wait_store_addr (perf_source_wait_store_addr),
+        .source_wait_store_data (perf_source_wait_store_data),
+        .iq_no_ready            (perf_iq_no_ready),
         .serializing_block      (perf_serializing),
         .lsu_order_block        (perf_lsu_order | lsu_perf_order_block),
         .lsu_queue_block        (ldst_suspend | ldst1_suspend),
@@ -590,10 +622,14 @@ module MyCpu (
     logic [DEBUG_TRACE_PTR_W-1:0] debug_trace_rd_ptr;
     logic [DEBUG_TRACE_PTR_W-1:0] debug_trace_wr_ptr;
     integer debug_trace_count;
+    integer debug_trace_max_count;
     integer debug_trace_deq_i;
     integer debug_trace_direct_i;
     integer debug_trace_enq_i;
     integer debug_trace_available_i;
+
+    reg [63:0] debug_trace_accepted_cnt;
+    reg [63:0] debug_trace_emitted_cnt;
 
     reg [63:0] ipc_decode_count;
     reg [63:0] ipc_issue_count;
@@ -608,20 +644,32 @@ module MyCpu (
         end
     endfunction
 
+    // Observable Register Write condition:
+    // Must be valid, write register, and target register must NOT be $r0.
+    wire commit0_obs = commit0.valid && commit0.reg_write && (commit0.arch_rd != 5'd0);
+    wire commit1_obs = commit1.valid && commit1.reg_write && (commit1.arch_rd != 5'd0);
+
     always @(posedge cpu_clk or negedge cpu_rstn) begin
         if (!cpu_rstn) begin
             debug_trace_rd_ptr <= {DEBUG_TRACE_PTR_W{1'b0}};
             debug_trace_wr_ptr <= {DEBUG_TRACE_PTR_W{1'b0}};
             debug_trace_count <= 0;
+            debug_trace_max_count <= 0;
             debug_trace_head_q <= '0;
             debug_trace_event_q <= 1'b0;
+            debug_trace_accepted_cnt <= 64'd0;
+            debug_trace_emitted_cnt <= 64'd0;
         end else begin
             debug_trace_deq_i = 0;
             debug_trace_direct_i = 0;
             debug_trace_enq_i = 0;
-            debug_trace_available_i = DEBUG_TRACE_FIFO_DEPTH -
-                                       debug_trace_count;
+            debug_trace_available_i = DEBUG_TRACE_FIFO_DEPTH - debug_trace_count;
             debug_trace_event_q <= 1'b0;
+
+            if (debug_trace_event_q && debug_trace_head_q.valid &&
+                debug_trace_head_q.reg_write && (debug_trace_head_q.arch_rd != 5'd0)) begin
+                debug_trace_emitted_cnt <= debug_trace_emitted_cnt + 64'd1;
+            end
 
             // The old output packet was observed during the preceding cycle.
             // Select the next packet first, then enqueue current-cycle
@@ -632,49 +680,57 @@ module MyCpu (
                 debug_trace_rd_ptr <= debug_trace_ptr_add(debug_trace_rd_ptr, 1);
                 debug_trace_deq_i = 1;
                 debug_trace_available_i = debug_trace_available_i + 1;
-            end else if (commit0.valid) begin
+            end else if (commit0_obs) begin
                 debug_trace_head_q <= commit0;
                 debug_trace_event_q <= 1'b1;
                 debug_trace_direct_i = 1;
-            end else if (commit1.valid) begin
+            end else if (commit1_obs) begin
                 debug_trace_head_q <= commit1;
                 debug_trace_event_q <= 1'b1;
                 debug_trace_direct_i = 2;
             end
 
+            if (commit0_obs && (debug_trace_direct_i != 1)) begin
+                if (debug_trace_available_i > 0) begin
+                    debug_trace_fifo[debug_trace_wr_ptr] <= commit0;
+                    debug_trace_enq_i = debug_trace_enq_i + 1;
+                    debug_trace_available_i = debug_trace_available_i - 1;
+                end else begin
+                    $display("[TRACE FATAL] Serializer FIFO overflow; commit0 dropped at %h at time %t",
+                             commit0.pc, $time);
+                    $fatal(1, "[TRACE FATAL] Serializer FIFO overflow!");
+                end
+            end
+            if (commit1_obs && (debug_trace_direct_i != 2)) begin
+                if (debug_trace_available_i > 0) begin
+                    debug_trace_fifo[debug_trace_ptr_add(debug_trace_wr_ptr,
+                                                         debug_trace_enq_i)] <= commit1;
+                    debug_trace_enq_i = debug_trace_enq_i + 1;
+                    debug_trace_available_i = debug_trace_available_i - 1;
+                end else begin
+                    $display("[TRACE FATAL] Serializer FIFO overflow; commit1 dropped at %h at time %t",
+                             commit1.pc, $time);
+                    $fatal(1, "[TRACE FATAL] Serializer FIFO overflow!");
+                end
+            end
 
-            if (commit0.valid && (debug_trace_direct_i != 1) &&
-                (debug_trace_available_i > 0)) begin
-                debug_trace_fifo[debug_trace_wr_ptr] <= commit0;
-                debug_trace_enq_i = debug_trace_enq_i + 1;
-                debug_trace_available_i = debug_trace_available_i - 1;
-            end
-            if (commit1.valid && (debug_trace_direct_i != 2) &&
-                (debug_trace_available_i > 0)) begin
-                debug_trace_fifo[debug_trace_ptr_add(debug_trace_wr_ptr,
-                                                     debug_trace_enq_i)] <= commit1;
-                debug_trace_enq_i = debug_trace_enq_i + 1;
-                debug_trace_available_i = debug_trace_available_i - 1;
-            end
-            if (commit0.valid && (debug_trace_direct_i != 1) &&
-                (debug_trace_available_i == 0))
-                $display("[TRACE] serializer FIFO overflow; commit0 dropped at %h",
-                         commit0.pc);
-            if (commit1.valid && (debug_trace_direct_i != 2) &&
-                (debug_trace_available_i == 0))
-                $display("[TRACE] serializer FIFO overflow; commit1 dropped at %h",
-                         commit1.pc);
+            debug_trace_accepted_cnt <= debug_trace_accepted_cnt + commit0_obs + commit1_obs;
+
             debug_trace_wr_ptr <= debug_trace_ptr_add(debug_trace_wr_ptr,
                                                        debug_trace_enq_i);
             debug_trace_count <= debug_trace_count - debug_trace_deq_i +
                                  debug_trace_enq_i;
+            if (debug_trace_count - debug_trace_deq_i + debug_trace_enq_i > debug_trace_max_count) begin
+                debug_trace_max_count <= debug_trace_count - debug_trace_deq_i + debug_trace_enq_i;
+            end
         end
     end
 
     wire [31:0] debug_wb_pc       = debug_trace_head_q.pc;
     wire [ 3:0] debug_wb_rf_we    = {4{debug_trace_event_q &&
                                       debug_trace_head_q.valid &&
-                                      debug_trace_head_q.reg_write}};
+                                      debug_trace_head_q.reg_write &&
+                                      (debug_trace_head_q.arch_rd != 5'd0)}};
     wire [ 4:0] debug_wb_rf_rd    = debug_trace_head_q.arch_rd;
     wire [31:0] debug_wb_rf_wdata = debug_trace_head_q.value;
 
@@ -710,9 +766,8 @@ module MyCpu (
                                   (commit1.valid && commit1.reg_write);
             ipc_dual_commit_cycles <= ipc_dual_commit_cycles +
                                       (commit0.valid && commit1.valid);
-            if ($test$plusargs("perf_log") &&
-                (((ipc_cycle_count + 64'd1) % 64'd10000) == 0)) begin
-                $display("[IPC] cycles=%0d retired=%0d retire_IPC=%f regwrite_IPC=%f decode_IPC=%f issue_IPC=%f dual_commit_cycles=%0d",
+            if ((((ipc_cycle_count + 64'd1) % 64'd100000) == 0) || $test$plusargs("perf_log")) begin
+                $display("[IPC] cycles=%0d retired=%0d retire_IPC=%f regwrite_IPC=%f decode_IPC=%f issue_IPC=%f dual_commit_cycles=%0d [TRACE] queue_cnt=%0d peak_queue=%0d accepted_obs=%0d emitted_obs=%0d",
                          ipc_cycle_count + 64'd1,
                          ipc_retire_count + commit0.valid + commit1.valid,
                          (1.0 * (ipc_retire_count + commit0.valid +
@@ -730,7 +785,11 @@ module MyCpu (
                                  issue1_fire + system_issue_fire)) /
                          (ipc_cycle_count + 64'd1),
                          ipc_dual_commit_cycles +
-                         (commit0.valid && commit1.valid));
+                         (commit0.valid && commit1.valid),
+                         debug_trace_count,
+                         debug_trace_max_count,
+                         debug_trace_accepted_cnt,
+                         debug_trace_emitted_cnt);
             end
         end
     end

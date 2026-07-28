@@ -31,6 +31,7 @@ module DCache (
     // Interface to Write Bus
     input  wire         dev_wrdy,       // device ready to accept a write
     input  wire         dev_wdone,      // write has actually reached the bus
+    input  wire         dev_widle,      // write FIFO and bus completely idle
     output reg  [ 3:0]  cpu_wen,        // cpu write enable
     output reg  [31:0]  cpu_waddr,      // cpu write data address
     output reg  [31:0]  cpu_wdata,      // cpu write data
@@ -58,6 +59,38 @@ module DCache (
     localparam BLK_WID    = `CACHE_BLK_SIZE + TAG_WID + 1;  // 279 bit
     localparam LINE_WORD_IW = $clog2(`CACHE_BLK_LEN);
     localparam LINE_LAST_WORD = `CACHE_BLK_LEN - 1;
+    localparam integer WORDS_PER_LINE  = `CACHE_BLK_LEN;
+    localparam integer LINE_BITS       = `CACHE_BLK_SIZE;
+    localparam integer STORE_FIFO_DEPTH = 4;
+    localparam [2:0] STORE_FIFO_CAPACITY = 3'd4;
+    localparam integer LOAD_REQ_FIFO_DEPTH = 1;
+    localparam [1:0] LOAD_REQ_FIFO_CAPACITY = 2'd1;
+    localparam integer ORD_DEPTH = 4;
+    localparam [2:0] ORD_CAPACITY = 3'd4;
+
+    // Load response ownership is explicit so adding a new response source
+    // cannot silently change the architecturally visible priority.
+    localparam [2:0] RESP_NONE                  = 3'd0;
+    localparam [2:0] RESP_REFILL_CRITICAL       = 3'd1;
+    localparam [2:0] RESP_HUR_SAME_IMMEDIATE    = 3'd2;
+    localparam [2:0] RESP_HUR_SAME_TARGET_BEAT  = 3'd3;
+    localparam [2:0] RESP_HUR_DIFFERENT_LINE    = 3'd4;
+    localparam [2:0] RESP_NORMAL_HIT            = 3'd5;
+    localparam [2:0] RESP_UNCACHED              = 3'd6;
+
+    // Explicit owners document the split demand-read and Store/write ports.
+    // The same encoding is used on both sides so assertions and diagnostics
+    // remain stable as new bank clients are added.
+    localparam [3:0] ARRAY_OWNER_IDLE            = 4'd0;
+    localparam [3:0] ARRAY_OWNER_MAINT           = 4'd1;
+    localparam [3:0] ARRAY_OWNER_UNCACHED_STORE  = 4'd2;
+    localparam [3:0] ARRAY_OWNER_REFILL_COMMIT   = 4'd3;
+    localparam [3:0] ARRAY_OWNER_STORE_UPDATE    = 4'd4;
+    localparam [3:0] ARRAY_OWNER_STORE_TAG       = 4'd5;
+    localparam [3:0] ARRAY_OWNER_REPLAY          = 4'd6;
+    localparam [3:0] ARRAY_OWNER_LOAD_DIRECT     = 4'd7;
+    localparam [3:0] ARRAY_OWNER_LOAD_SKID       = 4'd8;
+    localparam [3:0] ARRAY_OWNER_CONTEXT_HOLD    = 4'd9;
 
 `ifndef SYNTHESIS
     initial begin
@@ -65,6 +98,44 @@ module DCache (
             $error("DCache correctness implementation requires an 8-word/32-byte line");
     end
 `endif
+
+    // Full-line StoreBuffer allocation is intentionally disabled in the
+    // current write-through/no-write-allocate design.  Keep the interface
+    // tied off explicitly until a future cache architecture owns it.
+    assign line_alloc_ready = 1'b0;
+
+    function automatic is_uncached_request;
+        input [31:0] addr;
+        input        cacheable;
+        begin
+            is_uncached_request = !cacheable ||
+                                  (addr[31:16] == 16'hBFAF) ||
+                                  (addr[31:16] == 16'hBFD0);
+        end
+    endfunction
+
+    function automatic [31:0] select_line_word;
+        input [LINE_BITS-1:0] line;
+        input [LINE_WORD_IW-1:0] word_index;
+        begin
+            select_line_word = line[word_index*32 +: 32];
+        end
+    endfunction
+
+    function automatic [31:0] merge_store_bytes;
+        input [31:0] base_word;
+        input [3:0]  byte_enable;
+        input [31:0] store_data;
+        reg   [31:0] merged_word;
+        integer byte_idx;
+        begin
+            merged_word = base_word;
+            for (byte_idx = 0; byte_idx < 4; byte_idx = byte_idx + 1)
+                if (byte_enable[byte_idx])
+                    merged_word[byte_idx*8 +: 8] = store_data[byte_idx*8 +: 8];
+            merge_store_bytes = merged_word;
+        end
+    endfunction
 
     // =========================================================
     // 读写状态机参数定义
@@ -77,14 +148,12 @@ module DCache (
     localparam R_UNC_REQ  = 3'd4; // Uncached 读请求
     localparam R_UNC_WAIT = 3'd5; // Uncached 读等待
 
-    // 写状态机 (Write FSM)
+    // 写状态机 (Write FSM) - 仅用于 uncached Store 串行控制
     localparam W_IDLE     = 3'd0;
     localparam W_TAG_CHK  = 3'd1;
-    localparam W_WR_MEM   = 3'd2; // Write-Through 直接写主存/外设
+    localparam W_WR_MEM   = 3'd2;
     localparam W_WR_WAIT  = 3'd3; 
 
-    // Maintenance state values must be declared before any combinational
-    // ready/accept logic references them.
     localparam M_IDLE     = 3'd0;
     localparam M_LOOKUP   = 3'd1;
     localparam M_APPLY    = 3'd2;
@@ -99,128 +168,570 @@ module DCache (
     reg [255:0] refill_commit_data;
 
     // =========================================================
-    // 1. 请求锁存与地址分解
+    // Explicit MSHR: valid flag living alongside refill context
     // =========================================================
-    // 为了防止流水线信号在等待总线时丢失，第一时间锁存所有请求
-    reg [31:0] req_addr_r;
+    reg        mshr_valid;
+    reg [ 1:0] mshr_slot_id;
+    reg        mshr_critical_done;
+
+    // =========================================================
+    // Response Order Buffer (4-deep, strictly ordered release)
+    // =========================================================
+    reg [ 1:0] ord_head;
+    reg [ 2:0] ord_count;
+    reg [ORD_DEPTH-1:0] ord_valid;
+    reg [ORD_DEPTH-1:0] ord_ready;
+    reg [31:0] ord_data [0:ORD_DEPTH-1];
+    reg [ 1:0] ord_slot_alloc;         // next free slot at read_accept
+
+    // =========================================================
+    // Request and miss-context registers
+    // =========================================================
+    reg [31:0] req_raddr_r;
     reg [ 3:0] req_ren_r;
+    reg        req_rcacheable_r;
+    reg [ 1:0] req_slot_r;             // ord slot allocated at accept
+
+    // =========================================================
+    // 独立 Miss/Refill 上下文与 HUR Replay/Probe 寄存器
+    // =========================================================
+    reg [31:0] refill_raddr_r;
+    reg [ 3:0] refill_ren_r;
+    reg        refill_rcacheable_r;
+
+    wire [INDEX_WID-1:0]  refill_index_r  = refill_raddr_r[INDEX_WID+OFFSET_WID-1 : OFFSET_WID];
+    wire [TAG_WID-1:0]    refill_tag_r    = refill_raddr_r[31 : INDEX_WID+OFFSET_WID];
+    wire [OFFSET_WID-1:0] refill_offset_r = refill_raddr_r[OFFSET_WID-1 : 0];
+
+    reg        replay_pending;
+    reg [31:0] replay_raddr_r;
+    reg [ 3:0] replay_ren_r;
+    reg        replay_rcacheable_r;
+    reg [ 1:0] replay_slot_r;
+    reg        probe_checking_r;
+    reg [7:0]  refill_word_valid_mask;
+    reg        same_line_pending;
+    reg [ 2:0] same_line_p_word;
+    reg [31:0] same_line_p_addr;
+    reg [ 3:0] same_line_p_ren;
+    reg        same_line_p_cacheable;
+    reg [ 1:0] same_line_p_slot;
+
+`ifndef SYNTHESIS
+    reg [1:0]  req_fifo_max_occ;
+    reg [63:0] engine_busy_enqueue;
+    reg [63:0] fifo_full_block;
+    reg [63:0] hur_cycle_count;
+    reg [63:0] hur_probe_launch_cnt;
+    reg [63:0] hur_probe_hit_cnt;
+    reg [63:0] hur_probe_replay_cnt;
+    reg [63:0] hur_same_line_block_cnt;
+    reg [63:0] hur_same_line_probe_cnt;
+    reg [63:0] hur_same_line_buffer_hit_cnt;
+    reg [63:0] hur_same_line_buffer_wait_cnt;
+    reg [63:0] hur_same_line_wait_cycles_cnt;
+    reg [63:0] hur_same_line_replay_cnt;
+    reg [63:0] mshr_alloc_cnt;
+    reg [63:0] mshr_complete_cnt;
+    reg [63:0] mshr_active_cycles_cnt;
+    reg [63:0] mshr_critical_wait_cycles_cnt;
+    reg [63:0] hum_precritical_probe_cnt;
+    reg [63:0] hum_precritical_hit_cnt;
+    reg [63:0] hum_secondary_miss_cnt;
+    reg [63:0] hum_same_set_conflict_cnt;
+    reg [63:0] ord_buffered_completion_cnt;
+    reg [63:0] ord_release_cnt;
+    reg [63:0] ord_full_block_cnt;
+    reg [ 2:0] ord_max_occupancy;
+`endif
+
+    reg [31:0] req_waddr_r;
     reg [ 3:0] req_wen_r;
     reg [31:0] req_wdata_r;
-    reg        req_cacheable_r;
+    reg        req_wcacheable_r;
+
+    // Uncached Store request ownership is kept outside the posted FIFO.
+    reg        uncached_store_valid;
+
+    // 4-Entry Parameterized Posted Store FIFO
+    reg [31:0]  store_fifo_addr         [0:STORE_FIFO_DEPTH-1];
+    reg [ 3:0]  store_fifo_wen          [0:STORE_FIFO_DEPTH-1];
+    reg [31:0]  store_fifo_wdata        [0:STORE_FIFO_DEPTH-1];
+    reg         store_fifo_cacheable    [0:STORE_FIFO_DEPTH-1];
+
+    reg        store_fifo_tag_checked  [0:STORE_FIFO_DEPTH-1];
+    reg        store_fifo_hit          [0:STORE_FIFO_DEPTH-1];
+    reg        store_fifo_hit_way      [0:STORE_FIFO_DEPTH-1];
+    reg        store_fifo_cache_updated[0:STORE_FIFO_DEPTH-1];
+    reg        store_fifo_ext_written  [0:STORE_FIFO_DEPTH-1];
+
+    reg [1:0]  store_fifo_head;
+    reg [1:0]  store_fifo_tail;
+    reg [2:0]  store_fifo_count;
+
+    reg        store_tag_pending;
+
     wire refill_commit = (r_state == R_REFILL) && dev_rvalid &&
-                         (recv_cnt == LINE_LAST_WORD) && req_cacheable_r;
+                         (recv_cnt == LINE_LAST_WORD) && refill_rcacheable_r;
     reg [`CACHE_BLK_NUM-1:0] line_enabled0;
     reg [`CACHE_BLK_NUM-1:0] line_enabled1;
     reg [`CACHE_BLK_NUM-1:0] replace_way;
     reg                      refill_way_r;
-
-    wire is_idle = (r_state == R_IDLE && w_state == W_IDLE) &&
-                   !data_valid && !data_wresp;
+    wire maint_active = (maint_state != M_IDLE);
     wire has_req = (|data_ren) || (|data_wen);
-    wire incoming_uncached = !data_cacheable ||
-                             (data_addr[31:16] == 16'hBFAF) ||
-                             (data_addr[31:16] == 16'hBFD0);
 
-    // Address decomposition is placed before victim/allocation probes so
-    // Vivado does not treat these nets as implicit undeclared identifiers.
-    wire [INDEX_WID-1:0] cache_index = is_idle ? data_addr[INDEX_WID+OFFSET_WID-1 : OFFSET_WID]
-                                                : req_addr_r[INDEX_WID+OFFSET_WID-1 : OFFSET_WID];
-    wire [TAG_WID-1:0]   tag_from_cpu = req_addr_r[31 : INDEX_WID+OFFSET_WID];
-    wire [OFFSET_WID-1:0] offset = req_addr_r[OFFSET_WID-1 : 0];
-    wire uncached = !req_cacheable_r ||
-                    (req_addr_r[31:16] == 16'hBFAF) ||
-                    (req_addr_r[31:16] == 16'hBFD0);
-    // Full-line allocation is intentionally disabled in this correctness
-    // phase.  Keep the wrapper sideband quiescent.
-    assign line_alloc_ready = 1'b0;
-    assign data_wready = is_idle;
-    // A cacheable store is owned by this request slot once accepted. MMIO
-    // remains strongly ordered and reports completion only after the bus ACK.
-    assign data_wposted = is_idle && (|data_wen) && !incoming_uncached;
-    // The LSU samples the response on the same clock edge that the write
-    // state machine leaves W_WR_WAIT.  A registered pulse would only become
-    // visible after that edge and would therefore be missed by the LSU.
+    wire incoming_r_uncached = is_uncached_request(data_addr, data_cacheable);
+    wire incoming_w_uncached = is_uncached_request(data_addr, data_cacheable);
+    wire r_uncached = is_uncached_request(req_raddr_r, req_rcacheable_r);
+    wire w_uncached = is_uncached_request(req_waddr_r, req_wcacheable_r);
+
+    // 地址与 Tag/Offset 分解
+    wire [INDEX_WID-1:0] r_cache_index = (r_state == R_IDLE) ? data_addr[INDEX_WID+OFFSET_WID-1 : OFFSET_WID]
+                                                             : req_raddr_r[INDEX_WID+OFFSET_WID-1 : OFFSET_WID];
+    wire [INDEX_WID-1:0] w_cache_index = req_waddr_r[INDEX_WID+OFFSET_WID-1 : OFFSET_WID];
+
+    wire [TAG_WID-1:0]   r_tag_from_cpu = req_raddr_r[31 : INDEX_WID+OFFSET_WID];
+    wire [TAG_WID-1:0]   w_tag_from_cpu = req_waddr_r[31 : INDEX_WID+OFFSET_WID];
+
+    wire [OFFSET_WID-1:0] r_offset = req_raddr_r[OFFSET_WID-1 : 0];
+    wire [OFFSET_WID-1:0] w_offset = req_waddr_r[OFFSET_WID-1 : 0];
+
+    // =========================================================
+    // 2. Cache 块数据解析与 2 项 Store FIFO 逻辑
+    // =========================================================
+    // Demand/maintenance lookup output (port A of the banked backend).
+    reg [TAG_WID:0] cache_meta_r0;
+    reg [TAG_WID:0] cache_meta_r1;
+    reg [31:0]      cache_word_r0;
+    reg [31:0]      cache_word_r1;
+
+    // Posted-Store lookup output (port B when it is not writing).
+    reg [TAG_WID:0] store_meta_r0;
+    reg [TAG_WID:0] store_meta_r1;
+
+    wire               valid_bit0 = cache_meta_r0[TAG_WID];
+    wire               valid_bit1 = cache_meta_r1[TAG_WID];
+    wire [TAG_WID-1:0] tag_from_cache0 = cache_meta_r0[TAG_WID-1:0];
+    wire [TAG_WID-1:0] tag_from_cache1 = cache_meta_r1[TAG_WID-1:0];
+
+    // 读 Hit 判定
+    wire r_hit0 = valid_bit0 && line_enabled0[r_cache_index] &&
+                  (tag_from_cache0 == r_tag_from_cpu) && !r_uncached;
+    wire r_hit1 = valid_bit1 && line_enabled1[r_cache_index] &&
+                  (tag_from_cache1 == r_tag_from_cpu) && !r_uncached;
+    wire r_hit  = r_hit0 || r_hit1;
+    wire r_hit_way = r_hit0 ? 1'b0 : 1'b1;
+    wire [31:0] r_selected_cache_word = r_hit0 ? cache_word_r0 : cache_word_r1;
+
+    // 写 Hit 判定 (uncached 写专用)
+    wire w_hit0 = valid_bit0 && line_enabled0[w_cache_index] &&
+                  (tag_from_cache0 == w_tag_from_cpu) && !w_uncached;
+    wire w_hit1 = valid_bit1 && line_enabled1[w_cache_index] &&
+                  (tag_from_cache1 == w_tag_from_cpu) && !w_uncached;
+    wire w_hit  = w_hit0 || w_hit1;
+    wire w_hit_way = w_hit0 ? 1'b0 : 1'b1;
+    wire [31:0] w_selected_cache_word = w_hit0 ? cache_word_r0 : cache_word_r1;
+
+    wire miss_way = (!valid_bit0 || !line_enabled0[r_cache_index]) ? 1'b0 :
+                    ((!valid_bit1 || !line_enabled1[r_cache_index]) ? 1'b1 :
+                     replace_way[r_cache_index]);
+    wire hit_r = (r_state == R_TAG_CHK) && r_hit;
+    wire hit_w = (w_state == W_TAG_CHK) && w_hit;
+
+    // Parameterized ordered Load Request FIFO.  Depth 1 is the measured
+    // optimum for the current blocking refill engine; deeper buffering is
+    // reserved for a future non-blocking miss architecture.
+    reg [31:0] req_fifo_addr      [0:LOAD_REQ_FIFO_DEPTH-1];
+    reg [ 3:0] req_fifo_ren       [0:LOAD_REQ_FIFO_DEPTH-1];
+    reg        req_fifo_cacheable [0:LOAD_REQ_FIFO_DEPTH-1];
+    reg [ 1:0] req_fifo_slot     [0:LOAD_REQ_FIFO_DEPTH-1];
+
+    reg        req_fifo_head;
+    reg        req_fifo_tail;
+    reg [1:0]  req_fifo_count;
+
+    wire req_fifo_head_uncached = (req_fifo_count > 0) &&
+                                  is_uncached_request(req_fifo_addr[req_fifo_head], req_fifo_cacheable[req_fifo_head]);
+
+    // Store FIFO 指针与状态控制
+    wire [1:0] head_ptr = store_fifo_head;
+    wire [1:0] tail_ptr = store_fifo_tail;
+
+    wire store_fifo_will_pop = (store_fifo_count > 0) &&
+                               store_fifo_cache_updated[head_ptr] &&
+                               store_fifo_ext_written[head_ptr];
+
+    wire store_fifo_can_accept = (store_fifo_count < STORE_FIFO_CAPACITY) ||
+                                 ((store_fifo_count == STORE_FIFO_CAPACITY) &&
+                                  store_fifo_will_pop);
+
+    wire cacheable_write_ready = !incoming_w_uncached && store_fifo_can_accept && !maint_active;
+    wire uncached_write_ready = incoming_w_uncached && !uncached_store_valid && (store_fifo_count == 0) &&
+                                (r_state == R_IDLE) && (w_state == W_IDLE) &&
+                                !data_valid && !data_wresp && !maint_active &&
+                                dev_widle;
+    assign data_wready = cacheable_write_ready || uncached_write_ready;
+    wire write_accept = data_wready && (|data_wen);
+    assign data_wposted = write_accept && !incoming_w_uncached;
     assign data_wresp = (w_state == W_WR_WAIT) && dev_wdone;
 
+    wire store_fifo_push = write_accept && !incoming_w_uncached;
+    wire store_fifo_pop  = store_fifo_will_pop;
+
+    // External write completion is recorded only on a real ready/valid fire.
+    wire store_ext_write_valid = (store_fifo_count > 0) &&
+                                 !store_fifo_ext_written[head_ptr] &&
+                                 (w_state == W_IDLE);
+
+    wire external_write_fire = store_ext_write_valid && dev_wrdy;
+
+
+    // Store Tag 检查读 Array 命中计算
+    wire [INDEX_WID-1:0] store_head_index  = store_fifo_addr[head_ptr][INDEX_WID+OFFSET_WID-1 : OFFSET_WID];
+    wire [TAG_WID-1:0]   store_head_tag    = store_fifo_addr[head_ptr][31 : INDEX_WID+OFFSET_WID];
+    wire [OFFSET_WID-1:0] store_head_offset = store_fifo_addr[head_ptr][OFFSET_WID-1 : 0];
+    wire store_w_hit0 = store_meta_r0[TAG_WID] && line_enabled0[store_head_index] &&
+                        (store_meta_r0[TAG_WID-1:0] == store_head_tag);
+    wire store_w_hit1 = store_meta_r1[TAG_WID] && line_enabled1[store_head_index] &&
+                        (store_meta_r1[TAG_WID-1:0] == store_head_tag);
+    wire store_w_hit  = store_w_hit0 || store_w_hit1;
+    wire store_w_hit_way = store_w_hit0 ? 1'b0 : 1'b1;
+
+    // 内部 Store Tag 检查与 Cache 更新启动信号
+    wire store_same_refill_line = (r_state == R_REFILL) &&
+                                  (store_fifo_addr[head_ptr][31:OFFSET_WID] == refill_raddr_r[31:OFFSET_WID]);
+
+    wire store_same_refill_set = (r_state == R_REFILL) &&
+                                 (store_head_index == refill_index_r);
+
+    wire store_refill_tail_allow = (r_state == R_REFILL) &&
+                                   (recv_cnt > 0) &&
+                                   (req_fifo_count == 0) &&
+                                   !(|data_ren) &&
+                                   !probe_checking_r &&
+                                   !same_line_pending &&
+                                   !store_same_refill_set;
+
+
+    wire store_service_r_state_ok = (r_state == R_IDLE) ||
+                                    ((r_state == R_TAG_CHK) && r_hit) ||
+                                    store_refill_tail_allow;
+
+    wire store_immediate_launch = (store_fifo_count == 3'd0 || (store_fifo_count == 3'd1 && store_fifo_will_pop)) &&
+                                  write_accept && !incoming_w_uncached;
+
+    wire store_fifo_has_unbound_head = (store_fifo_count > 3'd0) &&
+                                       !store_fifo_tag_checked[head_ptr] &&
+                                       !(store_fifo_count == 3'd1 && store_fifo_will_pop);
+
+    wire store_tag_launch = (store_fifo_has_unbound_head || store_immediate_launch) &&
+                            !store_tag_pending &&
+                            store_service_r_state_ok &&
+                            (w_state == W_IDLE) &&
+                            !replay_pending &&
+                            !refill_commit && !maint_active;
+
+    wire store_update_launch = (store_fifo_count > 3'd0) &&
+                               (store_tag_pending || store_fifo_tag_checked[head_ptr]) &&
+                               (store_tag_pending ? store_w_hit : store_fifo_hit[head_ptr]) &&
+                               !store_fifo_cache_updated[head_ptr] &&
+                               store_service_r_state_ok &&
+                               (w_state == W_IDLE) &&
+                               !replay_pending &&
+                               !refill_commit && !maint_active;
+
+    wire [INDEX_WID-1:0] store_launch_index = store_immediate_launch ?
+        data_addr[INDEX_WID+OFFSET_WID-1 : OFFSET_WID] : store_head_index;
+
+    wire [OFFSET_WID-1:0] store_launch_offset = store_immediate_launch ?
+        data_addr[OFFSET_WID-1 : 0] : store_head_offset;
+
+    wire same_refill_line = mshr_valid &&
+                            (req_raddr_r[31:OFFSET_WID] == refill_raddr_r[31:OFFSET_WID]);
+
+    wire incoming_r_cacheable = (req_fifo_count > 0) ? !req_fifo_head_uncached : !incoming_r_uncached;
+
+    wire [2:0] arriving_word_index = refill_offset_r[4:2] + recv_cnt;
+    wire [2:0] probe_word_index    = req_raddr_r[OFFSET_WID-1:2];
+
+    wire word_available_now = refill_word_valid_mask[probe_word_index] ||
+                              (dev_rvalid && (arriving_word_index == probe_word_index));
+
+    // A single MSHR owns the external miss.  While it is waiting for the bus
+    // or receiving refill beats, an otherwise-idle array read port may probe
+    // one younger request.  The ordered response buffer prevents that probe
+    // from returning ahead of the older miss.
+    wire hur_probe_window = mshr_valid &&
+                            ((r_state == R_RD_MEM) || (r_state == R_REFILL));
+
+    wire hur_probe_can_launch = hur_probe_window &&
+                                incoming_r_cacheable &&
+                                !refill_commit &&
+                                !replay_pending &&
+                                !same_line_pending &&
+                                !probe_checking_r &&
+                                (w_state == W_IDLE) &&
+                                !maint_active;
+
+    wire hur_probe_result       = mshr_valid && probe_checking_r &&
+                                  ((r_state == R_RD_MEM) || (r_state == R_REFILL));
+    wire hur_probe_hit          = hur_probe_result && r_hit && !same_refill_line;
+    wire hur_same_line_imm_hit  = hur_probe_result && same_refill_line && word_available_now;
+
+    wire same_line_target_beat_fire = (r_state == R_REFILL) && dev_rvalid && same_line_pending &&
+                                     (arriving_word_index == same_line_p_word);
+
+    integer f_idx;
     always @(posedge cpu_clk or negedge cpu_rstn) begin
         if (!cpu_rstn) begin
-            req_addr_r <= 0; req_ren_r <= 0; req_wen_r <= 0; req_wdata_r <= 0;
-            req_cacheable_r <= 1'b0;
-        end else if (is_idle && has_req) begin
-            req_addr_r  <= data_addr;
-            req_ren_r   <= data_ren;
-            req_wen_r   <= data_wen;
-            req_wdata_r <= data_wdata;
-            req_cacheable_r <= data_cacheable;
+            store_fifo_head   <= 2'd0;
+            store_fifo_tail   <= 2'd0;
+            store_fifo_count  <= 3'd0;
+            store_tag_pending <= 1'b0;
+
+            for (f_idx = 0; f_idx < STORE_FIFO_DEPTH; f_idx = f_idx + 1) begin
+                store_fifo_tag_checked[f_idx]   <= 1'b0;
+                store_fifo_hit[f_idx]           <= 1'b0;
+                store_fifo_hit_way[f_idx]       <= 1'b0;
+                store_fifo_cache_updated[f_idx] <= 1'b0;
+                store_fifo_ext_written[f_idx]   <= 1'b0;
+                store_fifo_addr[f_idx]          <= 32'h0;
+                store_fifo_wen[f_idx]           <= 4'h0;
+                store_fifo_wdata[f_idx]         <= 32'h0;
+                store_fifo_cacheable[f_idx]     <= 1'b0;
+            end
+        end else begin
+            if (store_fifo_push) begin
+                store_fifo_addr[tail_ptr]          <= data_addr;
+                store_fifo_wen[tail_ptr]           <= data_wen;
+                store_fifo_wdata[tail_ptr]         <= data_wdata;
+                store_fifo_cacheable[tail_ptr]     <= data_cacheable;
+
+                store_fifo_tag_checked[tail_ptr]   <= 1'b0;
+                store_fifo_hit[tail_ptr]           <= 1'b0;
+                store_fifo_hit_way[tail_ptr]       <= 1'b0;
+                store_fifo_cache_updated[tail_ptr] <= 1'b0;
+                store_fifo_ext_written[tail_ptr]   <= 1'b0;
+
+                store_fifo_tail <= store_fifo_tail + 2'd1;
+            end
+
+            if (store_fifo_pop) begin
+                store_fifo_head <= store_fifo_head + 2'd1;
+            end
+
+            store_fifo_count <= store_fifo_count + {2'b0, store_fifo_push} - {2'b0, store_fifo_pop};
+
+            // Port B returns the metadata match one cycle after launch.
+            if (store_tag_launch) begin
+                store_tag_pending <= 1'b1;
+            end else if (store_tag_pending) begin
+                store_tag_pending <= 1'b0;
+                store_fifo_tag_checked[head_ptr] <= 1'b1;
+                store_fifo_hit[head_ptr]         <= store_w_hit;
+                store_fifo_hit_way[head_ptr]     <= store_w_hit_way;
+                if (!store_w_hit || store_update_launch) begin
+                    store_fifo_cache_updated[head_ptr] <= 1'b1;
+                end
+            end
+
+            // 内部 Store Cache Data Array 更新标记
+            if (store_update_launch && !store_tag_pending) begin
+                store_fifo_cache_updated[head_ptr] <= 1'b1;
+            end
+
+            // Track completion of the independent external write obligation.
+            if (external_write_fire) begin
+                store_fifo_ext_written[head_ptr] <= 1'b1;
+            end
+        end
+    end
+
+    // 主 Load 流水线就绪条件
+    wire load_can_start_cond = (((r_state == R_IDLE) || (r_state == R_TAG_CHK && r_hit)) && !replay_pending) &&
+                               (w_state == W_IDLE) &&
+                               !refill_commit && !maint_active;
+
+    wire load_accept_ready = load_can_start_cond || hur_probe_can_launch;
+
+    wire ord_ready_release = (ord_count > 3'd0) &&
+                             ord_valid[ord_head] && ord_ready[ord_head];
+
+    // Load Request FIFO 出队 / 启动定义
+    wire req_fifo_can_dequeue = (req_fifo_count > 0) && load_accept_ready &&
+                                !replay_pending && !same_line_pending && !probe_checking_r;
+    wire req_fifo_pop   = req_fifo_can_dequeue;
+    wire req_fifo_start = req_fifo_can_dequeue;
+
+    wire req_fifo_will_pop   = req_fifo_pop;
+    wire req_fifo_can_accept = (req_fifo_count < LOAD_REQ_FIFO_CAPACITY) ||
+                               ((req_fifo_count == LOAD_REQ_FIFO_CAPACITY) && req_fifo_will_pop);
+
+    // Load 读就绪逻辑 (只要 FIFO 有空间且非 maint/同周期Store 即可 accept，不被 engine 忙状态阻塞)
+    assign data_rready = req_fifo_can_accept &&
+                         !maint_active &&
+                         ((ord_count < ORD_CAPACITY) || ord_ready_release) &&
+                         !(data_wready && (|data_wen));
+
+    wire read_accept = data_rready && (|data_ren);
+
+    // 直连启动要求 FIFO 完全为空且满足 accept 就绪条件（无内部 replay/pending 阻塞）
+    wire can_direct_start = (req_fifo_count == 0) && load_accept_ready &&
+                            !replay_pending && !same_line_pending && !probe_checking_r;
+    wire direct_read_start = read_accept && can_direct_start;
+
+    // Load Req FIFO 入队：新请求被 accept 且不能直连启动
+    wire req_fifo_push = read_accept && !direct_read_start;
+
+    wire [INDEX_WID-1:0] incoming_index =
+        data_addr[INDEX_WID+OFFSET_WID-1:OFFSET_WID];
+
+    // Load req_r* 寄存器更新 (including ord slot propagation)
+    always @(posedge cpu_clk or negedge cpu_rstn) begin
+        if (!cpu_rstn) begin
+            req_raddr_r      <= 32'h0;
+            req_ren_r        <= 4'h0;
+            req_rcacheable_r <= 1'b0;
+            req_slot_r       <= 2'd0;
+        end else if (replay_pending && (r_state == R_REFILL || r_state == R_IDLE)) begin
+            req_raddr_r      <= replay_raddr_r;
+            req_ren_r        <= replay_ren_r;
+            req_rcacheable_r <= replay_rcacheable_r;
+            req_slot_r       <= replay_slot_r;
+        end else if (req_fifo_start) begin
+            req_raddr_r      <= req_fifo_addr[req_fifo_head];
+            req_ren_r        <= req_fifo_ren[req_fifo_head];
+            req_rcacheable_r <= req_fifo_cacheable[req_fifo_head];
+            req_slot_r       <= req_fifo_slot[req_fifo_head];
+        end else if (direct_read_start) begin
+            req_raddr_r      <= data_addr;
+            req_ren_r        <= data_ren;
+            req_rcacheable_r <= data_cacheable;
+            req_slot_r       <= ord_slot_alloc;  // slot allocated same cycle
+        end
+    end
+
+    // Ord slot allocation: when read_accept fires, allocate the next free slot.
+    // direct_read_start consumes ord_slot_alloc immediately (req_slot_r captures it).
+    // For FIFO push cases, the slot must be captured into the FIFO entry.
+    wire [1:0] next_ord_slot = ord_slot_alloc + 1'b1;
+    always @(posedge cpu_clk or negedge cpu_rstn) begin
+        if (!cpu_rstn) begin
+            ord_slot_alloc <= 2'd0;
+        end else if (read_accept) begin
+            ord_slot_alloc <= next_ord_slot;
+        end
+    end
+
+    // Ordered Load Request FIFO control
+    integer rf_idx;
+    always @(posedge cpu_clk or negedge cpu_rstn) begin
+        if (!cpu_rstn) begin
+            req_fifo_head  <= 1'b0;
+            req_fifo_tail  <= 1'b0;
+            req_fifo_count <= 2'd0;
+            for (rf_idx = 0; rf_idx < LOAD_REQ_FIFO_DEPTH; rf_idx = rf_idx + 1) begin
+                req_fifo_addr[rf_idx]      <= 32'h0;
+                req_fifo_ren[rf_idx]       <= 4'h0;
+                req_fifo_cacheable[rf_idx] <= 1'b0;
+                req_fifo_slot[rf_idx]      <= 2'd0;
+            end
+        end else begin
+            if (req_fifo_push) begin
+                req_fifo_addr[req_fifo_tail]      <= data_addr;
+                req_fifo_ren[req_fifo_tail]       <= data_ren;
+                req_fifo_cacheable[req_fifo_tail] <= data_cacheable;
+                req_fifo_slot[req_fifo_tail]      <= ord_slot_alloc;
+                req_fifo_tail                     <= (LOAD_REQ_FIFO_DEPTH == 1) ?
+                                                     1'b0 : req_fifo_tail + 1'b1;
+            end
+            if (req_fifo_pop) begin
+                req_fifo_head <= (LOAD_REQ_FIFO_DEPTH == 1) ?
+                                 1'b0 : req_fifo_head + 1'b1;
+            end
+            req_fifo_count <= req_fifo_count + {1'b0, req_fifo_push} - {1'b0, req_fifo_pop};
+        end
+    end
+
+    // Uncached Store request register and owner lifetime.
+    always @(posedge cpu_clk or negedge cpu_rstn) begin
+        if (!cpu_rstn) begin
+            req_waddr_r          <= 0;
+            req_wen_r            <= 0;
+            req_wdata_r          <= 0;
+            req_wcacheable_r     <= 1'b0;
+            uncached_store_valid <= 1'b0;
+        end else begin
+            if (write_accept && incoming_w_uncached) begin
+                req_waddr_r          <= data_addr;
+                req_wen_r            <= data_wen;
+                req_wdata_r          <= data_wdata;
+                req_wcacheable_r     <= data_cacheable;
+                uncached_store_valid <= 1'b1;
+            end else if (w_state == W_WR_MEM && dev_wrdy && w_uncached) begin
+                uncached_store_valid <= 1'b0;
+            end
         end
     end
 
     // =========================================================
-    // 2. Cache 块数据解析与命中判定
-    // =========================================================
-    wire [BLK_WID-1:0] cache_line_r0;
-    wire [BLK_WID-1:0] cache_line_r1;
-    wire               valid_bit0 = cache_line_r0[BLK_WID-1];
-    wire               valid_bit1 = cache_line_r1[BLK_WID-1];
-    wire [TAG_WID-1:0] tag_from_cache0 = cache_line_r0[BLK_WID-2 : `CACHE_BLK_SIZE];
-    wire [TAG_WID-1:0] tag_from_cache1 = cache_line_r1[BLK_WID-2 : `CACHE_BLK_SIZE];
-
-    // Uncached 请求强制按 Miss 处理，保护 BRAM 数据不被污染
-    wire hit0 = valid_bit0 && line_enabled0[cache_index] &&
-                (tag_from_cache0 == tag_from_cpu) && !uncached;
-    wire hit1 = valid_bit1 && line_enabled1[cache_index] &&
-                (tag_from_cache1 == tag_from_cpu) && !uncached;
-    wire hit = hit0 || hit1;
-    wire hit_way = hit0 ? 1'b0 : 1'b1;
-    wire [BLK_WID-1:0] selected_cache_line = hit0 ? cache_line_r0 : cache_line_r1;
-    wire [TAG_WID-1:0] selected_cache_tag = selected_cache_line[BLK_WID-2 : `CACHE_BLK_SIZE];
-    wire miss_way = (!valid_bit0 || !line_enabled0[cache_index]) ? 1'b0 :
-                    ((!valid_bit1 || !line_enabled1[cache_index]) ? 1'b1 :
-                     replace_way[cache_index]);
-    assign data_rready = is_idle;
-    wire hit_r = (r_state == R_TAG_CHK) && hit;
-    wire hit_w = (w_state == W_TAG_CHK) && hit;
-
-    // =========================================================
-    // 3. DCache 读状态机 (Read FSM)
+    // 3. DCache 读状态机 (Read FSM) - 流水化响应
     // =========================================================
     always @(posedge cpu_clk or negedge cpu_rstn) begin
         if (!cpu_rstn) r_state <= R_IDLE;
         else           r_state <= r_nstat;
     end
 
+    wire replay_r_uncached = is_uncached_request(replay_raddr_r,
+                                                  replay_rcacheable_r);
+
     always @(*) begin
         case(r_state)
             R_IDLE: begin
-                if (|data_ren && is_idle) begin
-                    // 第一时间检测是否为 Uncached 地址
-                    if (!data_cacheable ||
-                        (data_addr[31:16] == 16'hBFAF) ||
-                        (data_addr[31:16] == 16'hBFD0)) r_nstat = R_UNC_REQ;
-                    else                                r_nstat = R_TAG_CHK;
+                if (replay_pending) begin
+                    if (replay_r_uncached) r_nstat = R_UNC_REQ;
+                    else                   r_nstat = R_TAG_CHK;
+                end else if (req_fifo_start) begin
+                    if (req_fifo_head_uncached) r_nstat = R_UNC_REQ;
+                    else                        r_nstat = R_TAG_CHK;
+                end else if (direct_read_start) begin
+                    if (incoming_r_uncached) r_nstat = R_UNC_REQ;
+                    else                     r_nstat = R_TAG_CHK;
                 end else r_nstat = R_IDLE;
             end
             
-            R_TAG_CHK:  r_nstat = hit_r ? R_IDLE : R_RD_MEM;
-            R_RD_MEM:   r_nstat = dev_rrdy ? R_REFILL : R_RD_MEM;
-            // The requested word is returned as soon as its refill beat
-            // arrives; the remaining beats continue filling the selected way.
-            R_REFILL:   r_nstat = (dev_rvalid && recv_cnt == LINE_LAST_WORD) ? R_IDLE : R_REFILL;
+            R_TAG_CHK: begin
+                if (r_hit) begin
+                    if (replay_pending) begin
+                        if (replay_r_uncached) r_nstat = R_UNC_REQ;
+                        else                   r_nstat = R_TAG_CHK;
+                    end else if (direct_read_start) begin
+                        if (incoming_r_uncached) r_nstat = R_UNC_REQ;
+                        else                     r_nstat = R_TAG_CHK;
+                    end else if (req_fifo_start) begin
+                        if (req_fifo_head_uncached) r_nstat = R_UNC_REQ;
+                        else                        r_nstat = R_TAG_CHK;
+                    end else begin
+                        r_nstat = R_IDLE;
+                    end
+                end else begin
+                    r_nstat = R_RD_MEM;
+                end
+            end
+
+            R_RD_MEM:   r_nstat = (dev_rrdy && dev_widle) ? R_REFILL : R_RD_MEM;
+            R_REFILL:   r_nstat = (dev_rvalid && recv_cnt == LINE_LAST_WORD) ?
+                                  ((direct_read_start || req_fifo_start) ? R_TAG_CHK : R_IDLE) : R_REFILL;
             
-            // The read bridge response is transferred with a synchronized
-            // event and may arrive on the same cpu_clk edge that accepts the
-            // request.  Consume it in R_UNC_REQ as well as R_UNC_WAIT;
-            // otherwise the FSM enters WAIT after the only response pulse
-            // and can remain there forever.
-            R_UNC_REQ:  r_nstat = dev_rvalid ? R_IDLE :
-                                   (dev_rrdy ? R_UNC_WAIT : R_UNC_REQ);
-            R_UNC_WAIT: r_nstat = dev_rvalid ? R_IDLE : R_UNC_WAIT;
+            R_UNC_REQ:  r_nstat = dev_rvalid ? (replay_pending ? R_TAG_CHK : R_IDLE) :
+                                   ((dev_rrdy && dev_widle) ? R_UNC_WAIT : R_UNC_REQ);
+            R_UNC_WAIT: r_nstat = dev_rvalid ? (replay_pending ? R_TAG_CHK : R_IDLE) : R_UNC_WAIT;
             default:    r_nstat = R_IDLE;
         endcase
     end
 
     // =========================================================
-    // 4. DCache 写状态机 (Write FSM)
+    // 4. DCache 写状态机 (Write FSM) - Uncached Store 专用
     // =========================================================
     always @(posedge cpu_clk or negedge cpu_rstn) begin
         if (!cpu_rstn) w_state <= W_IDLE;
@@ -229,11 +740,10 @@ module DCache (
 
     always @(*) begin
         case(w_state)
-            W_IDLE:     w_nstat = (|data_wen && is_idle) ? W_TAG_CHK : W_IDLE;
-            // Write-Through策略：无论Hit/Miss，接下来都必须写主存 (Uncached也会安全走到这里)
+            W_IDLE:     w_nstat = (uncached_store_valid && w_uncached) ? W_WR_MEM : W_IDLE;
             W_TAG_CHK:  w_nstat = W_WR_MEM; 
-            W_WR_MEM:   w_nstat = dev_wrdy ? W_WR_WAIT : W_WR_MEM;
-            W_WR_WAIT:  w_nstat = dev_wdone ? W_IDLE : W_WR_WAIT; // 等待总线真正完成
+            W_WR_MEM:   w_nstat = dev_wrdy ? (!w_uncached ? W_IDLE : W_WR_WAIT) : W_WR_MEM;
+            W_WR_WAIT:  w_nstat = dev_wdone ? W_IDLE : W_WR_WAIT;
             default:    w_nstat = W_IDLE;
         endcase
     end
@@ -241,10 +751,8 @@ module DCache (
     // =========================================================
     // 5. 数据重填 (REFILL) 与 Cache 更新逻辑
     // =========================================================
-    // The refill bus may return the requested word first.  The three-bit
-    // addition naturally wraps within the eight-word cache line.
     wire [LINE_WORD_IW-1:0] refill_word_sel =
-        req_addr_r[OFFSET_WID-1:2] + recv_cnt;
+        refill_offset_r[OFFSET_WID-1:2] + recv_cnt;
 
     always @(posedge cpu_clk or negedge cpu_rstn) begin
         if (!cpu_rstn) recv_cnt <= 0;
@@ -283,141 +791,315 @@ module DCache (
         end
     end
 
-    // === 写命中 (Write Hit) 时，利用写掩码更新指定字节 ===
-    reg [255:0] updated_data_blk;
-    integer i;
-    always @(*) begin
-        updated_data_blk = selected_cache_line[255:0]; // 默认保留命中路数据
-        for (i=0; i<8; i=i+1) begin
-            if (offset[OFFSET_WID-1:2] == i) begin
-                // 利用动态切片语法精确修改特定字节
-                if (req_wen_r[0]) updated_data_blk[i*32 + 0  +: 8] = req_wdata_r[7:0];
-                if (req_wen_r[1]) updated_data_blk[i*32 + 8  +: 8] = req_wdata_r[15:8];
-                if (req_wen_r[2]) updated_data_blk[i*32 + 16 +: 8] = req_wdata_r[23:16];
-                if (req_wen_r[3]) updated_data_blk[i*32 + 24 +: 8] = req_wdata_r[31:24];
-            end
-        end
-    end
-
-    // Cache 写使能：读重填结束，或写命中时触发
-    wire cache_we = refill_commit || hit_w;
-    wire cache_we0 = cache_we &&
-                     ((refill_commit ? refill_way_r : hit_way) == 1'b0);
-    wire cache_we1 = cache_we &&
-                     ((refill_commit ? refill_way_r : hit_way) == 1'b1);
     wire refill_word_valid = (r_state == R_REFILL) && dev_rvalid &&
                               (recv_cnt == {LINE_WORD_IW{1'b0}});
 
+    reg [2:0]  response_owner;
     always @(posedge cpu_clk or negedge cpu_rstn) begin
         if (!cpu_rstn) begin
-            refill_way_r <= 1'b0;
+            refill_way_r            <= 1'b0;
+            refill_raddr_r          <= 32'h0;
+            refill_ren_r            <= 4'h0;
+            refill_rcacheable_r     <= 1'b0;
+            mshr_valid              <= 1'b0;
+            mshr_slot_id            <= 2'd0;
+            mshr_critical_done      <= 1'b0;
+            probe_checking_r        <= 1'b0;
+            replay_pending          <= 1'b0;
+            replay_raddr_r          <= 32'h0;
+            replay_ren_r            <= 4'h0;
+            replay_rcacheable_r     <= 1'b0;
+            replay_slot_r           <= 2'd0;
+            refill_word_valid_mask  <= 8'h0;
+            same_line_pending       <= 1'b0;
+            same_line_p_word        <= 3'b0;
+            same_line_p_addr        <= 32'h0;
+            same_line_p_ren         <= 4'h0;
+            same_line_p_cacheable   <= 1'b0;
+            same_line_p_slot        <= 2'd0;
         end else begin
-            if ((r_state == R_TAG_CHK) && !hit) begin
-                refill_way_r <= miss_way;
+            if ((r_state == R_TAG_CHK) && !r_hit && !mshr_valid) begin
+                refill_way_r           <= miss_way;
+                refill_raddr_r         <= req_raddr_r;
+                refill_ren_r           <= req_ren_r;
+                refill_rcacheable_r    <= req_rcacheable_r;
+                refill_word_valid_mask <= 8'h0;
+                mshr_valid             <= 1'b1;
+                mshr_slot_id           <= req_slot_r;
+                mshr_critical_done     <= 1'b0;
             end
-        end
-    end
 
-    // 待写入的 Cache 块拼接
-    wire [BLK_WID-1:0] cache_line_w = (w_state == W_TAG_CHK) ?
-                                      {1'b1, selected_cache_tag, updated_data_blk} : // Hit: 写回修改后的整块
-                                       {1'b1, tag_from_cpu, refill_commit_data}; // Miss: 拼装主存数据
-
-    // =========================================================
-    // 6. 输出信号生成 (规避 concurrent assignment 报错)
-    // =========================================================
-    
-    // 6.1 面向 CPU 的读返回信号。命中数据和外设数据都先寄存，避免
-    // BRAM/tag/word-select 组合路径直接进入流水线全局暂停与写回网络。
-    reg [31:0] hit_rdata;
-    always @(*) begin
-        case (offset[OFFSET_WID-1:2])
-            3'd0: hit_rdata = selected_cache_line[31:0];
-            3'd1: hit_rdata = selected_cache_line[63:32];
-            3'd2: hit_rdata = selected_cache_line[95:64];
-            3'd3: hit_rdata = selected_cache_line[127:96];
-            3'd4: hit_rdata = selected_cache_line[159:128];
-            3'd5: hit_rdata = selected_cache_line[191:160];
-            3'd6: hit_rdata = selected_cache_line[223:192];
-            default: hit_rdata = selected_cache_line[255:224];
-        endcase
-    end
-
-    always @(posedge cpu_clk or negedge cpu_rstn) begin
-        if (!cpu_rstn) begin
-            data_valid <= 1'b0;
-            data_rdata <= 32'h0;
-        end else begin
-            data_valid <= 1'b0;
+            if (refill_commit) begin
+                mshr_valid         <= 1'b0;
+                mshr_critical_done <= 1'b0;
+            end
 
             if (refill_word_valid) begin
-                data_valid <= 1'b1;
-                data_rdata <= dev_rdata;
-            end else if (hit_r) begin
-                data_valid <= 1'b1;
-                data_rdata <= hit_rdata;
-            end else if ((r_state == R_UNC_REQ || r_state == R_UNC_WAIT) &&
-                         dev_rvalid) begin
-                data_valid <= 1'b1;
-                data_rdata <= dev_rdata;
+                mshr_critical_done <= 1'b1;
+            end
+
+            if (r_state == R_REFILL && dev_rvalid) begin
+                refill_word_valid_mask[arriving_word_index] <= 1'b1;
+            end
+
+            if (hur_probe_can_launch && (req_fifo_start || direct_read_start)) begin
+                probe_checking_r <= 1'b1;
+            end else begin
+                probe_checking_r <= 1'b0;
+            end
+
+            if (hur_probe_result) begin
+                if (same_refill_line) begin
+                    if (word_available_now) begin
+                    end else begin
+                        same_line_pending     <= 1'b1;
+                        same_line_p_word      <= probe_word_index;
+                        same_line_p_addr      <= req_raddr_r;
+                        same_line_p_ren       <= req_ren_r;
+                        same_line_p_cacheable <= req_rcacheable_r;
+                        same_line_p_slot      <= req_slot_r;
+                    end
+                end else if (!r_hit) begin
+                    replay_pending      <= 1'b1;
+                    replay_raddr_r      <= req_raddr_r;
+                    replay_ren_r        <= req_ren_r;
+                    replay_rcacheable_r <= req_rcacheable_r;
+                    replay_slot_r       <= req_slot_r;
+                end else begin
+                end
+            end
+
+            if (same_line_pending) begin
+                if (r_state == R_REFILL && dev_rvalid && (arriving_word_index == same_line_p_word)) begin
+                    same_line_pending <= 1'b0;
+                end else if ((r_state != R_RD_MEM) && (r_state != R_REFILL)) begin
+                    same_line_pending   <= 1'b0;
+                    replay_pending      <= 1'b1;
+                    replay_raddr_r      <= same_line_p_addr;
+                    replay_ren_r        <= same_line_p_ren;
+                    replay_rcacheable_r <= same_line_p_cacheable;
+                    replay_slot_r       <= same_line_p_slot;
+                end
+            end
+
+            if (replay_pending && (r_state == R_IDLE)) begin
+                replay_pending <= 1'b0;
             end
         end
     end
 
-    // 6.2 面向 读总线 的信号
+    wire [31:0] hit_rdata = r_selected_cache_word;
+
+    // Apply forwarding in FIFO age order (oldest to youngest).
+    // Younger entries are merged last so they win overlapping byte writes.
+    function automatic [31:0] forward_from_store_fifo;
+        input [31:0] base_data;
+        input [31:0] load_addr;
+        input [1:0]  fifo_head;
+        input [2:0]  fifo_count;
+        reg   [31:0] result;
+        reg   [1:0]  slot;
+        integer k;
+        begin
+            result = base_data;
+            for (k = 0; k < 4; k = k + 1) begin
+                if ({1'b0, fifo_count} > k) begin
+                    slot = fifo_head + k[1:0];
+                    if (store_fifo_addr[slot][31:2] == load_addr[31:2])
+                        result = merge_store_bytes(result, store_fifo_wen[slot], store_fifo_wdata[slot]);
+                end
+            end
+            forward_from_store_fifo = result;
+        end
+    endfunction
+
+    reg [31:0] final_rdata;
+    always @(*) begin
+        final_rdata = forward_from_store_fifo(hit_rdata, req_raddr_r, head_ptr, store_fifo_count);
+    end
+
+    reg [31:0] same_line_imm_rdata;
+    always @(*) begin
+        if (dev_rvalid && (arriving_word_index == probe_word_index)) begin
+            same_line_imm_rdata = dev_rdata;
+        end else begin
+            same_line_imm_rdata = select_line_word(refill_commit_data,
+                                                    probe_word_index);
+        end
+    end
+
+    reg [31:0] same_line_imm_final_rdata;
+    always @(*) begin
+        same_line_imm_final_rdata = forward_from_store_fifo(same_line_imm_rdata, req_raddr_r, head_ptr, store_fifo_count);
+    end
+
+    reg [31:0] same_line_target_beat_raw_rdata;
+    always @(*) begin
+        if (dev_rvalid && (arriving_word_index == same_line_p_word)) begin
+            same_line_target_beat_raw_rdata = dev_rdata;
+        end else begin
+            same_line_target_beat_raw_rdata = select_line_word(refill_commit_data, same_line_p_word);
+        end
+    end
+
+    reg [31:0] same_line_target_beat_final_rdata;
+    always @(*) begin
+        same_line_target_beat_final_rdata = forward_from_store_fifo(same_line_target_beat_raw_rdata, same_line_p_addr, head_ptr, store_fifo_count);
+    end
+
+    // =========================================================
+    // 6b. Response Order Buffer — strictly ordered release
+    // =========================================================
+    // A slot is reserved at the input handshake, not at completion.  A
+    // younger hit may therefore become ready while the head miss is waiting,
+    // but only the ready head is exposed to the untagged LSU response port.
+    wire ord_aux_event = same_line_target_beat_fire ||
+                         hur_same_line_imm_hit || hur_probe_hit ||
+                         hit_r ||
+                         (((r_state == R_UNC_REQ) || (r_state == R_UNC_WAIT)) &&
+                          dev_rvalid);
+    reg [1:0]  ord_aux_slot;
+    reg [31:0] ord_aux_data;
+
+    always @(*) begin
+        ord_aux_slot = req_slot_r;
+        ord_aux_data = final_rdata;
+        if (same_line_target_beat_fire) begin
+            ord_aux_slot = same_line_p_slot;
+            ord_aux_data = same_line_target_beat_final_rdata;
+        end else if (hur_same_line_imm_hit) begin
+            ord_aux_slot = req_slot_r;
+            ord_aux_data = same_line_imm_final_rdata;
+        end else if (hur_probe_hit || hit_r) begin
+            ord_aux_slot = req_slot_r;
+            ord_aux_data = final_rdata;
+        end else if (((r_state == R_UNC_REQ) || (r_state == R_UNC_WAIT)) &&
+                     dev_rvalid) begin
+            ord_aux_slot = req_slot_r;
+            ord_aux_data = dev_rdata;
+        end
+    end
+
+    wire ord_write_event = refill_word_valid || ord_aux_event;
+    wire ord_refill_completes_head = refill_word_valid &&
+                                     (mshr_slot_id == ord_head);
+    wire ord_aux_completes_head = ord_aux_event &&
+                                  (ord_aux_slot == ord_head);
+    wire ord_complete_head_now = (ord_count > 3'd0) &&
+                                 ord_valid[ord_head] &&
+                                 !ord_ready[ord_head] &&
+                                 (ord_refill_completes_head ||
+                                  ord_aux_completes_head);
+    wire ord_emit = ord_ready_release || ord_complete_head_now;
+
+    always @(posedge cpu_clk or negedge cpu_rstn) begin
+        if (!cpu_rstn) begin
+            ord_head       <= 2'd0;
+            ord_count      <= 3'd0;
+            ord_valid      <= {ORD_DEPTH{1'b0}};
+            ord_ready      <= {ORD_DEPTH{1'b0}};
+            ord_data[0]    <= 32'h0;
+            ord_data[1]    <= 32'h0;
+            ord_data[2]    <= 32'h0;
+            ord_data[3]    <= 32'h0;
+            data_valid     <= 1'b0;
+            data_rdata     <= 32'h0;
+        end else begin
+            data_valid <= 1'b0;
+            data_rdata <= 32'h0;
+
+            // Release the old head first.  If the full ring turns around in
+            // this cycle, the following allocation deliberately wins the
+            // nonblocking assignments to that same physical slot.
+            if (ord_emit) begin
+                data_valid          <= 1'b1;
+                if (ord_ready_release)
+                    data_rdata <= ord_data[ord_head];
+                else if (ord_refill_completes_head)
+                    data_rdata <= dev_rdata;
+                else
+                    data_rdata <= ord_aux_data;
+                ord_valid[ord_head] <= 1'b0;
+                ord_ready[ord_head] <= 1'b0;
+                ord_head            <= ord_head + 2'd1;
+            end
+
+            if (read_accept) begin
+                ord_valid[ord_slot_alloc] <= 1'b1;
+                ord_ready[ord_slot_alloc] <= 1'b0;
+                ord_data[ord_slot_alloc]  <= 32'h0;
+            end
+
+            // Refill critical data and one independent completion may land
+            // together.  They belong to distinct accepted requests and are
+            // written into distinct slots; an assertion below enforces this.
+            if (refill_word_valid) begin
+                if (!(ord_complete_head_now &&
+                      (mshr_slot_id == ord_head))) begin
+                    ord_ready[mshr_slot_id] <= 1'b1;
+                    ord_data[mshr_slot_id]  <= dev_rdata;
+                end
+            end
+            if (ord_aux_event) begin
+                if (!(ord_complete_head_now &&
+                      (ord_aux_slot == ord_head))) begin
+                    ord_ready[ord_aux_slot] <= 1'b1;
+                    ord_data[ord_aux_slot]  <= ord_aux_data;
+                end
+            end
+
+            ord_count <= ord_count + {2'b0, read_accept} -
+                         {2'b0, ord_emit};
+        end
+    end
+    // =========================================================
+    // 6a. Response event detection (only used for ord write arbitration)
+    // =========================================================
+    always @(*) begin
+        response_owner = RESP_NONE;
+
+        if (refill_word_valid)                    response_owner = RESP_REFILL_CRITICAL;
+        else if (same_line_target_beat_fire)       response_owner = RESP_HUR_SAME_TARGET_BEAT;
+        else if (hur_same_line_imm_hit)            response_owner = RESP_HUR_SAME_IMMEDIATE;
+        else if (hur_probe_hit)                    response_owner = RESP_HUR_DIFFERENT_LINE;
+        else if (hit_r)                            response_owner = RESP_NORMAL_HIT;
+        else if ((r_state == R_UNC_REQ || r_state == R_UNC_WAIT) && dev_rvalid)
+                                                   response_owner = RESP_UNCACHED;
+    end
+
     always @(*) begin
         cpu_ren   = 4'h0;
         cpu_raddr = 32'h0;
         cpu_rburst = 1'b0;
-        if (r_state == R_RD_MEM && dev_rrdy) begin
+        if (r_state == R_RD_MEM && dev_rrdy && dev_widle) begin
             cpu_ren   = 4'b1111;
-            // Send the demanded word address.  The read bridge performs a
-            // line-wrapped burst so the critical word is returned first.
-            cpu_raddr = {req_addr_r[31:2], 2'b00};
+            cpu_raddr = {refill_raddr_r[31:2], 2'b00};
             cpu_rburst = 1'b1;
-        end else if (r_state == R_UNC_REQ && dev_rrdy) begin
+        end else if (r_state == R_UNC_REQ && dev_rrdy && dev_widle) begin
             cpu_ren   = req_ren_r;
-            cpu_raddr = req_addr_r; // 保持原精确地址
+            cpu_raddr = req_raddr_r;
         end
     end
 
-    // 6.3 面向 CPU 和 写总线 的写出信号 
-    // =========================================================
-    // 【核心修复2】：摒弃组合逻辑，恢复成寄存器打拍输出，严格对齐时钟沿
-    always @(posedge cpu_clk or negedge cpu_rstn) begin
-        if (!cpu_rstn) begin
-            cpu_wen    <= 4'h0;
-            cpu_waddr  <= 32'h0;
-            cpu_wdata  <= 32'h0;
+    // External writes use a stable ready/valid payload until accepted.
+    always @(*) begin
+        if (w_state == W_WR_MEM) begin
+            cpu_wen   = req_wen_r;
+            cpu_waddr = req_waddr_r;
+            cpu_wdata = req_wdata_r;
+        end else if (store_ext_write_valid) begin
+            cpu_wen   = store_fifo_wen[head_ptr];
+            cpu_waddr = store_fifo_addr[head_ptr];
+            cpu_wdata = store_fifo_wdata[head_ptr];
         end else begin
-            // 严格遵循图2-13：在进入 W_WR_MEM 且总线就绪的下一拍，打出写使能
-            if (w_state == W_WR_MEM && dev_wrdy) begin
-                cpu_wen   <= req_wen_r;
-                cpu_waddr <= req_addr_r;
-                cpu_wdata <= req_wdata_r;
-            end else begin
-                cpu_wen   <= 4'h0;
-            end
-            
+            cpu_wen   = 4'h0;
+            cpu_waddr = 32'h0;
+            cpu_wdata = 32'h0;
         end
     end
 
-`ifndef SYNTHESIS
-    // The bus write address must remain the address captured when this Store
-    // entered the DCache request slot.  This catches accidental line/index
-    // reconstruction and stale-request reuse.
-    always @(posedge cpu_clk) begin
-        if (cpu_rstn && (cpu_wen != 4'h0) &&
-            (cpu_waddr !== req_addr_r))
-            $error("DCache cpu_waddr differs from latched Store address");
-        // Older unit benches omit the optional sideband port, leaving it
-        // floating.  Treat only an asserted 1 as a protocol violation.
-        if (cpu_rstn && (line_alloc_valid === 1'b1))
-            $error("DCache line allocation must remain disabled");
-    end
-`endif
     // =========================================================
-    // 7. CACOP maintenance and BRAM port arbitration
+    // 7. External bus generation and central cache-array arbitration
     // =========================================================
     reg [INDEX_WID-1:0] maint_index_r;
     reg [INDEX_WID-1:0] maint_count;
@@ -425,112 +1107,233 @@ module DCache (
     reg [1:0] maint_mode_r;
     reg [31:0] maint_ctag_r;
 
-    wire maint_active = (maint_state != M_IDLE);
-    // CACOP 0x01 is index invalidate.  CACOP 0x09 selects mode01 below;
-    // because this D-cache is write-through and has no dirty state, clearing
-    // valid is architecturally sufficient for writeback-invalidate.
-    wire [INDEX_WID-1:0] bram_index = maint_active ?
-                                         maint_index_r : cache_index;
-    assign maint_ready = (maint_state == M_IDLE) && is_idle && !has_req &&
-                         1'b1;
+    wire replay_lookup_launch = (r_state == R_IDLE) && replay_pending;
 
-    always @(posedge cpu_clk or negedge cpu_rstn) begin
-        if (!cpu_rstn) begin
-            maint_state <= M_IDLE;
-            maint_index_r <= {INDEX_WID{1'b0}};
-            maint_count <= {INDEX_WID{1'b0}};
-            maint_tag_r <= {TAG_WID{1'b0}};
-            maint_mode_r <= 2'b00;
-            maint_ctag_r <= 32'h0;
-            line_enabled0 <= {`CACHE_BLK_NUM{1'b0}};
-            line_enabled1 <= {`CACHE_BLK_NUM{1'b0}};
-            replace_way <= {`CACHE_BLK_NUM{1'b0}};
-            maint_done <= 1'b0;
-        end else begin
-            maint_done <= 1'b0;
-            if (refill_commit) begin
-                if (refill_way_r == 1'b0)
-                    line_enabled0[cache_index] <= 1'b1;
-                else
-                    line_enabled1[cache_index] <= 1'b1;
-                replace_way[cache_index] <= ~refill_way_r;
+    reg [3:0] array_read_owner;
+    reg [INDEX_WID-1:0] array_read_index;
+    reg [LINE_WORD_IW-1:0] array_read_word;
+    reg [3:0] array_write_owner;
+    reg [INDEX_WID-1:0] array_write_index;
+    reg array_write_enable;
+    reg array_write_way;
+    reg array_write_meta_enable;
+    reg [TAG_WID:0] array_write_meta;
+    reg [31:0] array_write_byte_mask;
+    reg [LINE_BITS-1:0] array_write_line;
+
+    // Port A is reserved for demand/maintenance reads.
+    always @(*) begin
+        array_read_owner = ARRAY_OWNER_CONTEXT_HOLD;
+        array_read_index = r_cache_index;
+        array_read_word  = r_offset[OFFSET_WID-1:2];
+
+        if (maint_active) begin
+            array_read_owner = ARRAY_OWNER_MAINT;
+            array_read_index = maint_index_r;
+            array_read_word  = {LINE_WORD_IW{1'b0}};
+        end else if (replay_lookup_launch) begin
+            array_read_owner = ARRAY_OWNER_REPLAY;
+            array_read_index = replay_raddr_r[INDEX_WID+OFFSET_WID-1 : OFFSET_WID];
+            array_read_word  = replay_raddr_r[OFFSET_WID-1:2];
+        end else if (direct_read_start) begin
+            array_read_owner = ARRAY_OWNER_LOAD_DIRECT;
+            array_read_index = incoming_index;
+            array_read_word  = data_addr[OFFSET_WID-1:2];
+        end else if (req_fifo_start) begin
+            array_read_owner = ARRAY_OWNER_LOAD_SKID;
+            array_read_index = req_fifo_addr[req_fifo_head][INDEX_WID+OFFSET_WID-1 : OFFSET_WID];
+            array_read_word  = req_fifo_addr[req_fifo_head][OFFSET_WID-1:2];
+        end else if (w_state != W_IDLE) begin
+            array_read_owner = ARRAY_OWNER_CONTEXT_HOLD;
+            array_read_index = w_cache_index;
+            array_read_word  = w_offset[OFFSET_WID-1:2];
+        end
+    end
+
+    always @(*) begin
+        array_write_owner       = ARRAY_OWNER_IDLE;
+        array_write_index       = r_cache_index;
+        array_write_enable      = 1'b0;
+        array_write_way         = 1'b0;
+        array_write_meta_enable = 1'b0;
+        array_write_meta        = {(TAG_WID+1){1'b0}};
+        array_write_byte_mask   = 32'h0;
+        array_write_line        = {LINE_BITS{1'b0}};
+
+        if (w_state == W_TAG_CHK) begin
+            array_write_owner = ARRAY_OWNER_UNCACHED_STORE;
+            array_write_index = w_cache_index;
+            if (hit_w) begin
+                array_write_enable = 1'b1;
+                array_write_way    = w_hit_way;
+                array_write_byte_mask[w_offset[OFFSET_WID-1:2]*4 +: 4] = req_wen_r;
+                array_write_line[w_offset[OFFSET_WID-1:2]*32 +: 32]    = req_wdata_r;
             end
-            if (hit_r || hit_w)
-                replace_way[cache_index] <= ~hit_way;
-
-            case (maint_state)
-                M_IDLE: begin
-                    if (maint_valid && maint_ready) begin
-                        maint_index_r <= maint_addr[INDEX_WID+OFFSET_WID-1:OFFSET_WID];
-                        maint_tag_r <= maint_addr[31:INDEX_WID+OFFSET_WID];
-                        maint_mode_r <= maint_mode;
-                        maint_ctag_r <= maint_ctag;
-                        maint_count <= {INDEX_WID{1'b0}};
-                        if (maint_all)
-                            maint_state <= M_ALL;
-                        else if ((maint_mode == 2'b10) || (maint_mode == 2'b00))
-                            maint_state <= M_LOOKUP;
-                        else
-                            maint_state <= M_APPLY;
-                    end
-                end
-                M_LOOKUP: maint_state <= M_APPLY;
-                M_APPLY: begin
-                    case (maint_mode_r)
-                        2'b00: begin
-                            line_enabled0[maint_index_r] <= 1'b0;
-                            line_enabled1[maint_index_r] <= 1'b0;
-                        end
-                        2'b01: begin
-                            line_enabled0[maint_index_r] <= 1'b0;
-                            line_enabled1[maint_index_r] <= 1'b0;
-                        end
-                        2'b10: begin
-                            if (valid_bit0 && line_enabled0[maint_index_r] &&
-                                (tag_from_cache0 == maint_tag_r))
-                                line_enabled0[maint_index_r] <= 1'b0;
-                            if (valid_bit1 && line_enabled1[maint_index_r] &&
-                                (tag_from_cache1 == maint_tag_r))
-                                line_enabled1[maint_index_r] <= 1'b0;
-                        end
-                        default: begin end
-                    endcase
-                    maint_state <= M_DONE;
-                end
-                M_ALL: begin
-                    line_enabled0[maint_count] <= 1'b0;
-                    line_enabled1[maint_count] <= 1'b0;
-                    if (maint_count == `CACHE_BLK_NUM-1)
-                        maint_state <= M_DONE;
-                    else
-                        maint_count <= maint_count + 1'b1;
-                end
-                M_DONE: begin
-                    maint_done <= 1'b1;
-                    maint_state <= M_IDLE;
-                end
-                default: maint_state <= M_IDLE;
-            endcase
+        end else if (refill_commit) begin
+            array_write_owner       = ARRAY_OWNER_REFILL_COMMIT;
+            array_write_index       = refill_index_r;
+            array_write_enable      = 1'b1;
+            array_write_way         = refill_way_r;
+            array_write_meta_enable = 1'b1;
+            array_write_meta        = {1'b1, refill_tag_r};
+            array_write_byte_mask   = 32'hFFFFFFFF;
+            array_write_line        = refill_commit_data;
+        end else if (store_update_launch) begin
+            array_write_owner  = ARRAY_OWNER_STORE_UPDATE;
+            array_write_index  = store_head_index;
+            array_write_enable = 1'b1;
+            array_write_way    = store_tag_pending ? store_w_hit_way : store_fifo_hit_way[head_ptr];
+            array_write_byte_mask[store_fifo_addr[head_ptr][OFFSET_WID-1:2]*4 +: 4] = store_fifo_wen[head_ptr];
+            array_write_line[store_fifo_addr[head_ptr][OFFSET_WID-1:2]*32 +: 32]    = store_fifo_wdata[head_ptr];
         end
     end
 
     // =========================================================
-    // 8. BRAM instance (single-port read/write sharing)
+    // 8. Two-port, word-banked cache-array backend
     // =========================================================
-    blk_mem_gen_0 U_dsram_way0 (
-        .clka   (cpu_clk),
-        .wea    (cache_we0),
-        .addra  (bram_index),
-        .dina   (cache_line_w),
-        .douta  (cache_line_r0)
-    );
-    blk_mem_gen_0 U_dsram_way1 (
-        .clka   (cpu_clk),
-        .wea    (cache_we1),
-        .addra  (bram_index),
-        .dina   (cache_line_w),
-        .douta  (cache_line_r1)
-    );
+    reg [TAG_WID:0] cache_meta_way0 [0:`CACHE_BLK_NUM-1];
+    reg [TAG_WID:0] cache_meta_way1 [0:`CACHE_BLK_NUM-1];
+
+    reg [31:0] cache_data_way0_bank0 [0:`CACHE_BLK_NUM-1];
+    reg [31:0] cache_data_way0_bank1 [0:`CACHE_BLK_NUM-1];
+    reg [31:0] cache_data_way0_bank2 [0:`CACHE_BLK_NUM-1];
+    reg [31:0] cache_data_way0_bank3 [0:`CACHE_BLK_NUM-1];
+    reg [31:0] cache_data_way0_bank4 [0:`CACHE_BLK_NUM-1];
+    reg [31:0] cache_data_way0_bank5 [0:`CACHE_BLK_NUM-1];
+    reg [31:0] cache_data_way0_bank6 [0:`CACHE_BLK_NUM-1];
+    reg [31:0] cache_data_way0_bank7 [0:`CACHE_BLK_NUM-1];
+    reg [31:0] cache_data_way1_bank0 [0:`CACHE_BLK_NUM-1];
+    reg [31:0] cache_data_way1_bank1 [0:`CACHE_BLK_NUM-1];
+    reg [31:0] cache_data_way1_bank2 [0:`CACHE_BLK_NUM-1];
+    reg [31:0] cache_data_way1_bank3 [0:`CACHE_BLK_NUM-1];
+    reg [31:0] cache_data_way1_bank4 [0:`CACHE_BLK_NUM-1];
+    reg [31:0] cache_data_way1_bank5 [0:`CACHE_BLK_NUM-1];
+    reg [31:0] cache_data_way1_bank6 [0:`CACHE_BLK_NUM-1];
+    reg [31:0] cache_data_way1_bank7 [0:`CACHE_BLK_NUM-1];
+
+    always @(posedge cpu_clk or negedge cpu_rstn) begin
+        if (!cpu_rstn) begin
+            cache_meta_r0 <= {(TAG_WID+1){1'b0}};
+            cache_meta_r1 <= {(TAG_WID+1){1'b0}};
+            cache_word_r0 <= 32'h0;
+            cache_word_r1 <= 32'h0;
+        end else begin
+            cache_meta_r0 <= cache_meta_way0[array_read_index];
+            cache_meta_r1 <= cache_meta_way1[array_read_index];
+            case (array_read_word)
+                3'd0: begin cache_word_r0 <= cache_data_way0_bank0[array_read_index]; cache_word_r1 <= cache_data_way1_bank0[array_read_index]; end
+                3'd1: begin cache_word_r0 <= cache_data_way0_bank1[array_read_index]; cache_word_r1 <= cache_data_way1_bank1[array_read_index]; end
+                3'd2: begin cache_word_r0 <= cache_data_way0_bank2[array_read_index]; cache_word_r1 <= cache_data_way1_bank2[array_read_index]; end
+                3'd3: begin cache_word_r0 <= cache_data_way0_bank3[array_read_index]; cache_word_r1 <= cache_data_way1_bank3[array_read_index]; end
+                3'd4: begin cache_word_r0 <= cache_data_way0_bank4[array_read_index]; cache_word_r1 <= cache_data_way1_bank4[array_read_index]; end
+                3'd5: begin cache_word_r0 <= cache_data_way0_bank5[array_read_index]; cache_word_r1 <= cache_data_way1_bank5[array_read_index]; end
+                3'd6: begin cache_word_r0 <= cache_data_way0_bank6[array_read_index]; cache_word_r1 <= cache_data_way1_bank6[array_read_index]; end
+                default: begin cache_word_r0 <= cache_data_way0_bank7[array_read_index]; cache_word_r1 <= cache_data_way1_bank7[array_read_index]; end
+            endcase
+        end
+    end
+
+    // Port B lookup only reads Tag/Valid metadata.
+    always @(posedge cpu_clk or negedge cpu_rstn) begin
+        if (!cpu_rstn) begin
+            store_meta_r0 <= {(TAG_WID+1){1'b0}};
+            store_meta_r1 <= {(TAG_WID+1){1'b0}};
+        end else if (store_tag_launch) begin
+            store_meta_r0 <= cache_meta_way0[store_launch_index];
+            store_meta_r1 <= cache_meta_way1[store_launch_index];
+        end
+    end
+
+    // Port B write side.  Nonblocking assignments preserve read-first
+    // behavior for a same-address demand read; Store forwarding supplies the
+    // architecturally newer bytes to that demand response.
+    always @(posedge cpu_clk) begin
+        if (array_write_enable && (array_write_way == 1'b0)) begin
+            if (array_write_meta_enable)
+                cache_meta_way0[array_write_index] <= array_write_meta;
+            if (array_write_byte_mask[ 0]) cache_data_way0_bank0[array_write_index][ 7: 0] <= array_write_line[ 7: 0];
+            if (array_write_byte_mask[ 1]) cache_data_way0_bank0[array_write_index][15: 8] <= array_write_line[15: 8];
+            if (array_write_byte_mask[ 2]) cache_data_way0_bank0[array_write_index][23:16] <= array_write_line[23:16];
+            if (array_write_byte_mask[ 3]) cache_data_way0_bank0[array_write_index][31:24] <= array_write_line[31:24];
+
+            if (array_write_byte_mask[ 4]) cache_data_way0_bank1[array_write_index][ 7: 0] <= array_write_line[39:32];
+            if (array_write_byte_mask[ 5]) cache_data_way0_bank1[array_write_index][15: 8] <= array_write_line[47:40];
+            if (array_write_byte_mask[ 6]) cache_data_way0_bank1[array_write_index][23:16] <= array_write_line[55:48];
+            if (array_write_byte_mask[ 7]) cache_data_way0_bank1[array_write_index][31:24] <= array_write_line[63:56];
+
+            if (array_write_byte_mask[ 8]) cache_data_way0_bank2[array_write_index][ 7: 0] <= array_write_line[71:64];
+            if (array_write_byte_mask[ 9]) cache_data_way0_bank2[array_write_index][15: 8] <= array_write_line[79:72];
+            if (array_write_byte_mask[10]) cache_data_way0_bank2[array_write_index][23:16] <= array_write_line[87:80];
+            if (array_write_byte_mask[11]) cache_data_way0_bank2[array_write_index][31:24] <= array_write_line[95:88];
+
+            if (array_write_byte_mask[12]) cache_data_way0_bank3[array_write_index][ 7: 0] <= array_write_line[103:96];
+            if (array_write_byte_mask[13]) cache_data_way0_bank3[array_write_index][15: 8] <= array_write_line[111:104];
+            if (array_write_byte_mask[14]) cache_data_way0_bank3[array_write_index][23:16] <= array_write_line[119:112];
+            if (array_write_byte_mask[15]) cache_data_way0_bank3[array_write_index][31:24] <= array_write_line[127:120];
+
+            if (array_write_byte_mask[16]) cache_data_way0_bank4[array_write_index][ 7: 0] <= array_write_line[135:128];
+            if (array_write_byte_mask[17]) cache_data_way0_bank4[array_write_index][15: 8] <= array_write_line[143:136];
+            if (array_write_byte_mask[18]) cache_data_way0_bank4[array_write_index][23:16] <= array_write_line[151:144];
+            if (array_write_byte_mask[19]) cache_data_way0_bank4[array_write_index][31:24] <= array_write_line[159:152];
+
+            if (array_write_byte_mask[20]) cache_data_way0_bank5[array_write_index][ 7: 0] <= array_write_line[167:160];
+            if (array_write_byte_mask[21]) cache_data_way0_bank5[array_write_index][15: 8] <= array_write_line[175:168];
+            if (array_write_byte_mask[22]) cache_data_way0_bank5[array_write_index][23:16] <= array_write_line[183:176];
+            if (array_write_byte_mask[23]) cache_data_way0_bank5[array_write_index][31:24] <= array_write_line[191:184];
+
+            if (array_write_byte_mask[24]) cache_data_way0_bank6[array_write_index][ 7: 0] <= array_write_line[199:192];
+            if (array_write_byte_mask[25]) cache_data_way0_bank6[array_write_index][15: 8] <= array_write_line[207:200];
+            if (array_write_byte_mask[26]) cache_data_way0_bank6[array_write_index][23:16] <= array_write_line[215:208];
+            if (array_write_byte_mask[27]) cache_data_way0_bank6[array_write_index][31:24] <= array_write_line[223:216];
+
+            if (array_write_byte_mask[28]) cache_data_way0_bank7[array_write_index][ 7: 0] <= array_write_line[231:224];
+            if (array_write_byte_mask[29]) cache_data_way0_bank7[array_write_index][15: 8] <= array_write_line[239:232];
+            if (array_write_byte_mask[30]) cache_data_way0_bank7[array_write_index][23:16] <= array_write_line[247:240];
+            if (array_write_byte_mask[31]) cache_data_way0_bank7[array_write_index][31:24] <= array_write_line[255:248];
+        end else if (array_write_enable && (array_write_way == 1'b1)) begin
+            if (array_write_meta_enable)
+                cache_meta_way1[array_write_index] <= array_write_meta;
+            if (array_write_byte_mask[ 0]) cache_data_way1_bank0[array_write_index][ 7: 0] <= array_write_line[ 7: 0];
+            if (array_write_byte_mask[ 1]) cache_data_way1_bank0[array_write_index][15: 8] <= array_write_line[15: 8];
+            if (array_write_byte_mask[ 2]) cache_data_way1_bank0[array_write_index][23:16] <= array_write_line[23:16];
+            if (array_write_byte_mask[ 3]) cache_data_way1_bank0[array_write_index][31:24] <= array_write_line[31:24];
+
+            if (array_write_byte_mask[ 4]) cache_data_way1_bank1[array_write_index][ 7: 0] <= array_write_line[39:32];
+            if (array_write_byte_mask[ 5]) cache_data_way1_bank1[array_write_index][15: 8] <= array_write_line[47:40];
+            if (array_write_byte_mask[ 6]) cache_data_way1_bank1[array_write_index][23:16] <= array_write_line[55:48];
+            if (array_write_byte_mask[ 7]) cache_data_way1_bank1[array_write_index][31:24] <= array_write_line[63:56];
+
+            if (array_write_byte_mask[ 8]) cache_data_way1_bank2[array_write_index][ 7: 0] <= array_write_line[71:64];
+            if (array_write_byte_mask[ 9]) cache_data_way1_bank2[array_write_index][15: 8] <= array_write_line[79:72];
+            if (array_write_byte_mask[10]) cache_data_way1_bank2[array_write_index][23:16] <= array_write_line[87:80];
+            if (array_write_byte_mask[11]) cache_data_way1_bank2[array_write_index][31:24] <= array_write_line[95:88];
+
+            if (array_write_byte_mask[12]) cache_data_way1_bank3[array_write_index][ 7: 0] <= array_write_line[103:96];
+            if (array_write_byte_mask[13]) cache_data_way1_bank3[array_write_index][15: 8] <= array_write_line[111:104];
+            if (array_write_byte_mask[14]) cache_data_way1_bank3[array_write_index][23:16] <= array_write_line[119:112];
+            if (array_write_byte_mask[15]) cache_data_way1_bank3[array_write_index][31:24] <= array_write_line[127:120];
+
+            if (array_write_byte_mask[16]) cache_data_way1_bank4[array_write_index][ 7: 0] <= array_write_line[135:128];
+            if (array_write_byte_mask[17]) cache_data_way1_bank4[array_write_index][15: 8] <= array_write_line[143:136];
+            if (array_write_byte_mask[18]) cache_data_way1_bank4[array_write_index][23:16] <= array_write_line[151:144];
+            if (array_write_byte_mask[19]) cache_data_way1_bank4[array_write_index][31:24] <= array_write_line[159:152];
+
+            if (array_write_byte_mask[20]) cache_data_way1_bank5[array_write_index][ 7: 0] <= array_write_line[167:160];
+            if (array_write_byte_mask[21]) cache_data_way1_bank5[array_write_index][15: 8] <= array_write_line[175:168];
+            if (array_write_byte_mask[22]) cache_data_way1_bank5[array_write_index][23:16] <= array_write_line[183:176];
+            if (array_write_byte_mask[23]) cache_data_way1_bank5[array_write_index][31:24] <= array_write_line[191:184];
+
+            if (array_write_byte_mask[24]) cache_data_way1_bank6[array_write_index][ 7: 0] <= array_write_line[199:192];
+            if (array_write_byte_mask[25]) cache_data_way1_bank6[array_write_index][15: 8] <= array_write_line[207:200];
+            if (array_write_byte_mask[26]) cache_data_way1_bank6[array_write_index][23:16] <= array_write_line[215:208];
+            if (array_write_byte_mask[27]) cache_data_way1_bank6[array_write_index][31:24] <= array_write_line[223:216];
+
+            if (array_write_byte_mask[28]) cache_data_way1_bank7[array_write_index][ 7: 0] <= array_write_line[231:224];
+            if (array_write_byte_mask[29]) cache_data_way1_bank7[array_write_index][15: 8] <= array_write_line[239:232];
+            if (array_write_byte_mask[30]) cache_data_way1_bank7[array_write_index][23:16] <= array_write_line[247:240];
+            if (array_write_byte_mask[31]) cache_data_way1_bank7[array_write_index][31:24] <= array_write_line[255:248];
+        end
+    end
 
 `ifndef SYNTHESIS
     reg [31:0] w_wait_cnt;
@@ -541,8 +1344,423 @@ module DCache (
     end
     always @(posedge cpu_clk) begin
         if (cpu_rstn && w_wait_cnt > 100) begin
-            $display("[T=%0t] DCache watchdog timeout! w_state=%d, req_addr_r=%h, dev_wdone=%b", $time, w_state, req_addr_r, dev_wdone);
+            $display("[T=%0t] DCache watchdog timeout! w_state=%d, req_waddr_r=%h, dev_wdone=%b", $time, w_state, req_waddr_r, dev_wdone);
             $fatal(1, "W_WR_WAIT watchdog");
+        end
+    end
+
+    reg [63:0] store_fifo_push_count;
+    reg [63:0] store_fifo_pop_count;
+    reg [63:0] store_fifo_ext_written_count;
+    reg [63:0] store_fifo_cache_updated_count;
+
+    reg [31:0] head_payload_addr_q;
+    reg [ 3:0] head_payload_wen_q;
+    reg [31:0] head_payload_wdata_q;
+    reg [ 1:0] store_fifo_head_q;
+    reg [ 2:0] store_fifo_count_q;
+    reg        store_fifo_pop_q;
+
+    reg [ 3:0] ext_req_wen_q;
+    reg [31:0] ext_req_waddr_q;
+    reg [31:0] ext_req_wdata_q;
+    reg        ext_req_stalled_q;
+
+    reg [3:0] prev_ext_written;
+    reg       prev_ext_fire;
+    reg [1:0] prev_ext_fire_head;
+
+    always @(posedge cpu_clk or negedge cpu_rstn) begin
+        if (!cpu_rstn) begin
+            store_fifo_push_count          <= 64'd0;
+            store_fifo_pop_count           <= 64'd0;
+            store_fifo_ext_written_count   <= 64'd0;
+            store_fifo_cache_updated_count <= 64'd0;
+            head_payload_addr_q            <= 32'd0;
+            head_payload_wen_q             <= 4'd0;
+            head_payload_wdata_q           <= 32'd0;
+            store_fifo_head_q              <= 2'b0;
+            store_fifo_count_q             <= 3'd0;
+            store_fifo_pop_q               <= 1'b0;
+            ext_req_wen_q                  <= 4'd0;
+            ext_req_waddr_q                <= 32'd0;
+            ext_req_wdata_q                <= 32'd0;
+            ext_req_stalled_q              <= 1'b0;
+            prev_ext_written               <= 4'b0000;
+            prev_ext_fire                  <= 1'b0;
+            prev_ext_fire_head             <= 2'b0;
+        end else begin
+            store_fifo_head_q  <= store_fifo_head;
+            store_fifo_count_q <= store_fifo_count;
+            store_fifo_pop_q   <= store_fifo_pop;
+
+            ext_req_stalled_q  <= (cpu_wen != 4'h0) && !dev_wrdy;
+            if (cpu_wen != 4'h0) begin
+                ext_req_wen_q   <= cpu_wen;
+                ext_req_waddr_q <= cpu_waddr;
+                ext_req_wdata_q <= cpu_wdata;
+            end
+
+            prev_ext_written[0] <= store_fifo_ext_written[0];
+            prev_ext_written[1] <= store_fifo_ext_written[1];
+            prev_ext_written[2] <= store_fifo_ext_written[2];
+            prev_ext_written[3] <= store_fifo_ext_written[3];
+            prev_ext_fire      <= external_write_fire;
+            prev_ext_fire_head <= head_ptr;
+
+            if (store_fifo_push)
+                store_fifo_push_count <= store_fifo_push_count + 64'd1;
+            if (store_fifo_pop)
+                store_fifo_pop_count <= store_fifo_pop_count + 64'd1;
+            if (external_write_fire)
+                store_fifo_ext_written_count <= store_fifo_ext_written_count + 64'd1;
+            if (store_update_launch || (store_tag_pending && !store_w_hit))
+                store_fifo_cache_updated_count <= store_fifo_cache_updated_count + 64'd1;
+
+            if (store_fifo_count > 0) begin
+                head_payload_addr_q  <= store_fifo_addr[head_ptr];
+                head_payload_wen_q   <= store_fifo_wen[head_ptr];
+                head_payload_wdata_q <= store_fifo_wdata[head_ptr];
+            end
+        end
+    end
+
+    integer assert_idx;
+    always @(posedge cpu_clk) begin
+        if (cpu_rstn) begin
+            // 1. FIFO occupancy 永远不超过 STORE_FIFO_CAPACITY
+            if (store_fifo_count > STORE_FIFO_CAPACITY)
+                $fatal(1, "[DCACHE-ASSERT] Store FIFO occupancy exceeded STORE_FIFO_CAPACITY!");
+
+            // 2. FIFO push/pop conservation
+            if ((store_fifo_push_count - store_fifo_pop_count) != {61'd0, store_fifo_count})
+                $fatal(1, "[DCACHE-ASSERT] Store FIFO push/pop conservation failed!");
+
+            // 3. FIFO 满且无 pop 时不能 accept
+            if (store_fifo_count == STORE_FIFO_CAPACITY &&
+                !store_fifo_will_pop && write_accept && !incoming_w_uncached)
+                $fatal(1, "[DCACHE-ASSERT] Store FIFO accepted new write while full without pop!");
+
+            // 4. stalled 时 FIFO payload 稳定
+            if ((store_fifo_count_q > 3'd0) && (store_fifo_count > 3'd0) &&
+                (store_fifo_head_q === store_fifo_head) && !store_fifo_pop_q) begin
+                if (store_fifo_addr[head_ptr] !== head_payload_addr_q ||
+                    store_fifo_wen[head_ptr]  !== head_payload_wen_q ||
+                    store_fifo_wdata[head_ptr] !== head_payload_wdata_q)
+                    $fatal(1, "[DCACHE-ASSERT] Store FIFO head payload changed while stalled!");
+            end
+
+            // 5. The head cannot retire until both local and external work finish
+            if (store_fifo_pop && (!store_fifo_cache_updated[head_ptr] || !store_fifo_ext_written[head_ptr]))
+                $fatal(1, "[DCACHE-ASSERT] Store FIFO popped head before cache update and external write completed!");
+
+            // 6. uncached Store 不能产生 data_wposted
+            if (data_wposted && incoming_w_uncached)
+                $fatal(1, "[DCACHE-ASSERT] uncached Store produced data_wposted!");
+
+            // 7. 外部写 stall 协议与握手事件守恒检查
+            if (ext_req_stalled_q && (cpu_wen != 4'h0)) begin
+                if (cpu_wen !== ext_req_wen_q || cpu_waddr !== ext_req_waddr_q || cpu_wdata !== ext_req_wdata_q)
+                    $fatal(1, "[DCACHE-ASSERT] External write request payload changed while stalled!");
+            end
+
+            if (external_write_fire && !((cpu_wen != 4'h0) && dev_wrdy))
+                $fatal(1, "[DCACHE-ASSERT] external_write_fire occurred without valid cpu_wen and dev_wrdy!");
+
+            for (assert_idx = 0; assert_idx < 4; assert_idx = assert_idx + 1) begin
+                if ((store_fifo_ext_written[assert_idx] && !prev_ext_written[assert_idx]) &&
+                    !(prev_ext_fire && prev_ext_fire_head == assert_idx[1:0]))
+                    $fatal(1, "[DCACHE-ASSERT] store_fifo_ext_written set without external_write_fire!");
+            end
+
+            // 8. Array write owner & byte mask check
+            if (array_write_enable &&
+                (array_write_owner != ARRAY_OWNER_UNCACHED_STORE) &&
+                (array_write_owner != ARRAY_OWNER_REFILL_COMMIT) &&
+                (array_write_owner != ARRAY_OWNER_STORE_UPDATE))
+                $fatal(1, "[DCACHE-ASSERT] Array write issued by a read-only owner!");
+
+            if (array_write_enable && (array_write_byte_mask == 32'h0))
+                $fatal(1, "[DCACHE-ASSERT] Array write has no selected byte mask!");
+
+            // 9. 不允许 X/Z 进入指针与计数
+            if (store_fifo_count !== 3'd0 && store_fifo_count !== 3'd1 &&
+                store_fifo_count !== 3'd2 && store_fifo_count !== 3'd3 &&
+                store_fifo_count !== STORE_FIFO_CAPACITY)
+                $fatal(1, "[DCACHE-ASSERT] store_fifo_count is X/Z!");
+        end
+    end
+`endif
+
+    wire maint_hit0 = valid_bit0 && (tag_from_cache0 == maint_tag_r);
+    wire maint_hit1 = valid_bit1 && (tag_from_cache1 == maint_tag_r);
+
+    // Maintenance FSM and cache-line valid / replacement tracking
+    always @(posedge cpu_clk or negedge cpu_rstn) begin
+        if (!cpu_rstn) begin
+            maint_state   <= M_IDLE;
+            line_enabled0 <= {`CACHE_BLK_NUM{1'b0}};
+            line_enabled1 <= {`CACHE_BLK_NUM{1'b0}};
+            replace_way   <= {`CACHE_BLK_NUM{1'b0}};
+            maint_count   <= {INDEX_WID{1'b0}};
+            maint_done    <= 1'b0;
+            maint_index_r <= {INDEX_WID{1'b0}};
+            maint_tag_r   <= {TAG_WID{1'b0}};
+            maint_mode_r  <= 2'b0;
+            maint_ctag_r  <= 32'h0;
+        end else begin
+            maint_done <= 1'b0;
+            case (maint_state)
+                M_IDLE: begin
+                    if (maint_valid && maint_ready) begin
+                        maint_state   <= maint_all ? M_ALL : M_LOOKUP;
+                        maint_count   <= {INDEX_WID{1'b0}};
+                        maint_index_r <= maint_addr[INDEX_WID+OFFSET_WID-1 : OFFSET_WID];
+                        maint_tag_r   <= maint_addr[31 : INDEX_WID+OFFSET_WID];
+                        maint_mode_r  <= maint_mode;
+                        maint_ctag_r  <= maint_ctag;
+                    end
+                end
+                M_LOOKUP: begin
+                    maint_state <= M_APPLY;
+                end
+                M_APPLY: begin
+                    maint_state <= M_DONE;
+                    case (maint_mode_r)
+                        2'b00: begin
+                            line_enabled0[maint_index_r] <= 1'b0;
+                            line_enabled1[maint_index_r] <= 1'b0;
+                        end
+                        2'b01: begin
+                            line_enabled0[maint_index_r] <= 1'b0;
+                            line_enabled1[maint_index_r] <= 1'b0;
+                        end
+                        2'b10: begin
+                            if (maint_hit0) line_enabled0[maint_index_r] <= 1'b0;
+                            if (maint_hit1) line_enabled1[maint_index_r] <= 1'b0;
+                        end
+                        2'b11: begin
+                            line_enabled0 <= {`CACHE_BLK_NUM{1'b0}};
+                            line_enabled1 <= {`CACHE_BLK_NUM{1'b0}};
+                        end
+                    endcase
+                end
+                M_ALL: begin
+                    line_enabled0[maint_count] <= 1'b0;
+                    line_enabled1[maint_count] <= 1'b0;
+                    if (maint_count == `CACHE_BLK_NUM - 1) begin
+                        maint_state <= M_DONE;
+                    end else begin
+                        maint_count <= maint_count + 1'b1;
+                    end
+                end
+                M_DONE: begin
+                    maint_done  <= 1'b1;
+                    maint_state <= M_IDLE;
+                end
+                default: maint_state <= M_IDLE;
+            endcase
+
+            if (refill_commit) begin
+                if (refill_way_r == 1'b0) begin
+                    line_enabled0[refill_index_r] <= 1'b1;
+                    replace_way[refill_index_r]   <= 1'b1;
+                end else begin
+                    line_enabled1[refill_index_r] <= 1'b1;
+                    replace_way[refill_index_r]   <= 1'b0;
+                end
+            end else if (hit_r) begin
+                replace_way[r_cache_index] <= ~r_hit_way;
+            end
+        end
+    end
+
+    // Maintenance must not overtake a Load that has already been accepted at
+    // data_rready but is still queued or held by the HUR replay machinery.
+    assign maint_ready = (maint_state == M_IDLE) &&
+                         (r_state == R_IDLE) &&
+                         (w_state == W_IDLE) &&
+                         !has_req &&
+                         (store_fifo_count == 0) &&
+                         (req_fifo_count == 0) &&
+                         (ord_count == 0) &&
+                         !replay_pending &&
+                         !same_line_pending &&
+                         !probe_checking_r &&
+                         !mshr_valid;
+
+`ifndef SYNTHESIS
+    always @(posedge cpu_clk or negedge cpu_rstn) begin
+        if (!cpu_rstn) begin
+            req_fifo_max_occ             <= 2'd0;
+            engine_busy_enqueue          <= 64'd0;
+            fifo_full_block              <= 64'd0;
+            hur_cycle_count              <= 64'd0;
+            hur_probe_launch_cnt         <= 64'd0;
+            hur_probe_hit_cnt            <= 64'd0;
+            hur_probe_replay_cnt         <= 64'd0;
+            hur_same_line_block_cnt      <= 64'd0;
+            hur_same_line_probe_cnt      <= 64'd0;
+            hur_same_line_buffer_hit_cnt <= 64'd0;
+            hur_same_line_buffer_wait_cnt<= 64'd0;
+            hur_same_line_wait_cycles_cnt<= 64'd0;
+            hur_same_line_replay_cnt     <= 64'd0;
+            mshr_alloc_cnt               <= 64'd0;
+            mshr_complete_cnt            <= 64'd0;
+            mshr_active_cycles_cnt       <= 64'd0;
+            mshr_critical_wait_cycles_cnt<= 64'd0;
+            hum_precritical_probe_cnt    <= 64'd0;
+            hum_precritical_hit_cnt      <= 64'd0;
+            hum_secondary_miss_cnt       <= 64'd0;
+            hum_same_set_conflict_cnt    <= 64'd0;
+            ord_buffered_completion_cnt  <= 64'd0;
+            ord_release_cnt              <= 64'd0;
+            ord_full_block_cnt           <= 64'd0;
+            ord_max_occupancy            <= 3'd0;
+        end else begin
+            hur_cycle_count <= hur_cycle_count + 64'd1;
+
+            if (req_fifo_count > req_fifo_max_occ)
+                req_fifo_max_occ <= req_fifo_count;
+
+            if (req_fifo_push && (!load_accept_ready || replay_pending || same_line_pending || probe_checking_r))
+                engine_busy_enqueue <= engine_busy_enqueue + 64'd1;
+
+            if ((|data_ren) && !req_fifo_can_accept && !maint_active)
+                fifo_full_block <= fifo_full_block + 64'd1;
+
+            if (hur_cycle_count > 64'd0 && (hur_cycle_count % 64'd100000 == 64'd0)) begin
+                $display("[DCACHE-HUR-STATS] cycles=%0d probe=%0d hit=%0d replay=%0d same_line_probe=%0d buf_hit=%0d buf_wait=%0d wait_cycles=%0d buf_replay=%0d",
+                         hur_cycle_count, hur_probe_launch_cnt, hur_probe_hit_cnt, hur_probe_replay_cnt,
+                         hur_same_line_probe_cnt, hur_same_line_buffer_hit_cnt, hur_same_line_buffer_wait_cnt,
+                         hur_same_line_wait_cycles_cnt, hur_same_line_replay_cnt);
+                $display("[DCACHE-REQ-FIFO-STATS] cycles=%0d max_occ=%0d busy_enqueue=%0d full_block=%0d",
+                         hur_cycle_count, req_fifo_max_occ, engine_busy_enqueue, fifo_full_block);
+                $display("[DCACHE-MSHR-STATS] cycles=%0d alloc=%0d complete=%0d active_cycles=%0d critical_wait=%0d precrit_probe=%0d precrit_hit=%0d secondary_miss=%0d same_set_conflict=%0d buffered_completion=%0d release=%0d ord_full_block=%0d max_ord_occ=%0d",
+                         hur_cycle_count, mshr_alloc_cnt, mshr_complete_cnt,
+                         mshr_active_cycles_cnt, mshr_critical_wait_cycles_cnt,
+                         hum_precritical_probe_cnt, hum_precritical_hit_cnt,
+                         hum_secondary_miss_cnt, hum_same_set_conflict_cnt,
+                         ord_buffered_completion_cnt, ord_release_cnt,
+                         ord_full_block_cnt, ord_max_occupancy);
+            end
+
+            if (hur_probe_can_launch && (req_fifo_start || direct_read_start))
+                hur_probe_launch_cnt <= hur_probe_launch_cnt + 64'd1;
+            if (hur_probe_hit)
+                hur_probe_hit_cnt <= hur_probe_hit_cnt + 64'd1;
+            if (hur_probe_result && !same_refill_line && !r_hit)
+                hur_probe_replay_cnt <= hur_probe_replay_cnt + 64'd1;
+            if (same_refill_line && (req_fifo_start || direct_read_start))
+                hur_same_line_block_cnt <= hur_same_line_block_cnt + 64'd1;
+            if (hur_probe_result && same_refill_line)
+                hur_same_line_probe_cnt <= hur_same_line_probe_cnt + 64'd1;
+            if (hur_same_line_imm_hit)
+                hur_same_line_buffer_hit_cnt <= hur_same_line_buffer_hit_cnt + 64'd1;
+            if (same_line_pending) begin
+                hur_same_line_wait_cycles_cnt <= hur_same_line_wait_cycles_cnt + 64'd1;
+                if (r_state != R_REFILL)
+                    hur_same_line_replay_cnt <= hur_same_line_replay_cnt + 64'd1;
+            end
+            if (same_line_pending && (r_state == R_REFILL && dev_rvalid && (arriving_word_index == same_line_p_word)))
+                hur_same_line_buffer_wait_cnt <= hur_same_line_buffer_wait_cnt + 64'd1;
+
+            if ((r_state == R_TAG_CHK) && !r_hit && !mshr_valid)
+                mshr_alloc_cnt <= mshr_alloc_cnt + 64'd1;
+            if (refill_commit)
+                mshr_complete_cnt <= mshr_complete_cnt + 64'd1;
+            if (mshr_valid)
+                mshr_active_cycles_cnt <= mshr_active_cycles_cnt + 64'd1;
+            if (mshr_valid && !mshr_critical_done)
+                mshr_critical_wait_cycles_cnt <= mshr_critical_wait_cycles_cnt + 64'd1;
+            if (hur_probe_can_launch && (req_fifo_start || direct_read_start) &&
+                !mshr_critical_done)
+                hum_precritical_probe_cnt <= hum_precritical_probe_cnt + 64'd1;
+            if ((hur_probe_hit || hur_same_line_imm_hit) &&
+                !mshr_critical_done)
+                hum_precritical_hit_cnt <= hum_precritical_hit_cnt + 64'd1;
+            if (hur_probe_result && !same_refill_line && !r_hit)
+                hum_secondary_miss_cnt <= hum_secondary_miss_cnt + 64'd1;
+            if (hur_probe_result && !same_refill_line && !r_hit &&
+                (r_cache_index == refill_index_r))
+                hum_same_set_conflict_cnt <= hum_same_set_conflict_cnt + 64'd1;
+            if ((refill_word_valid && !ord_refill_completes_head) ||
+                (ord_aux_event && !ord_aux_completes_head))
+                ord_buffered_completion_cnt <= ord_buffered_completion_cnt +
+                    {63'd0, (refill_word_valid && !ord_refill_completes_head)} +
+                    {63'd0, (ord_aux_event && !ord_aux_completes_head)};
+            if (ord_emit)
+                ord_release_cnt <= ord_release_cnt + 64'd1;
+            if ((|data_ren) && (ord_count == ORD_CAPACITY) &&
+                !ord_ready_release && !maint_active)
+                ord_full_block_cnt <= ord_full_block_cnt + 64'd1;
+            if (ord_count > ord_max_occupancy)
+                ord_max_occupancy <= ord_count;
+        end
+    end
+
+    always @(posedge cpu_clk) begin
+        if (cpu_rstn) begin
+            if (req_fifo_count > LOAD_REQ_FIFO_CAPACITY)
+                $fatal(1, "[DCACHE-ASSERT] Load req FIFO occupancy exceeded LOAD_REQ_FIFO_CAPACITY!");
+
+            if (req_fifo_push && (req_fifo_count == LOAD_REQ_FIFO_CAPACITY) && !req_fifo_pop)
+                $fatal(1, "[DCACHE-ASSERT] Load req FIFO accepted push while full without pop!");
+
+            if (ord_count > ORD_CAPACITY)
+                $fatal(1, "[DCACHE-ASSERT] Response order occupancy exceeded capacity!");
+
+            if (ord_count != ({2'b0, ord_valid[0]} +
+                              {2'b0, ord_valid[1]} +
+                              {2'b0, ord_valid[2]} +
+                              {2'b0, ord_valid[3]}))
+                $fatal(1, "[DCACHE-ASSERT] Response-order count/valid conservation failure!");
+
+            if (read_accept && (ord_count == ORD_CAPACITY) &&
+                !ord_ready_release)
+                $fatal(1, "[DCACHE-ASSERT] Load accepted without a response-order slot!");
+
+            if (read_accept && ord_valid[ord_slot_alloc] &&
+                !(ord_ready_release && (ord_slot_alloc == ord_head)))
+                $fatal(1, "[DCACHE-ASSERT] Allocated an occupied response-order slot!");
+
+            if (refill_word_valid && !ord_valid[mshr_slot_id])
+                $fatal(1, "[DCACHE-ASSERT] Refill critical response targets an unallocated slot!");
+
+            if (ord_aux_event && !ord_valid[ord_aux_slot])
+                $fatal(1, "[DCACHE-ASSERT] Load completion targets an unallocated slot!");
+
+            if (refill_word_valid && ord_ready[mshr_slot_id])
+                $fatal(1, "[DCACHE-ASSERT] Refill response filled a slot twice!");
+
+            if (ord_aux_event && ord_ready[ord_aux_slot])
+                $fatal(1, "[DCACHE-ASSERT] Load response filled a slot twice!");
+
+            if (refill_word_valid && ord_aux_event &&
+                (mshr_slot_id == ord_aux_slot))
+                $fatal(1, "[DCACHE-ASSERT] Two completion sources target the same slot!");
+
+            if ((r_state == R_TAG_CHK) && !r_hit && mshr_valid)
+                $fatal(1, "[DCACHE-ASSERT] Attempted to overwrite the active MSHR!");
+
+            if ((r_state == R_TAG_CHK) && !r_hit && !mshr_valid &&
+                !ord_valid[req_slot_r])
+                $fatal(1, "[DCACHE-ASSERT] MSHR allocation has no response-order owner!");
+
+            if (mshr_valid && !mshr_critical_done &&
+                !ord_valid[mshr_slot_id])
+                $fatal(1, "[DCACHE-ASSERT] Pending critical word lost its response-order owner!");
+
+            if (refill_word_valid && !mshr_valid)
+                $fatal(1, "[DCACHE-ASSERT] Critical refill beat arrived without an MSHR!");
+
+            if (refill_commit && !mshr_valid)
+                $fatal(1, "[DCACHE-ASSERT] Refill committed without an active MSHR!");
+
+            if (maint_valid && maint_ready &&
+                ((ord_count != 0) || mshr_valid || (req_fifo_count != 0) ||
+                 replay_pending || same_line_pending || probe_checking_r))
+                $fatal(1, "[DCACHE-ASSERT] Maintenance overtook an accepted Load!");
         end
     end
 `endif
@@ -703,125 +1921,7 @@ module DCache (
     localparam W_IDLE  = 2'b00;
     localparam W_STAT0 = 2'b01;
     localparam W_STAT1 = 2'b11;
-    reg  [1:0] w_state, w_nstat;
-    reg  [3:0] mmio_wen_r;
-    reg [31:0] mmio_addr_r;
-    reg [31:0] mmio_wdata_r;
-    wire       wr_resp = dev_wrdy & (cpu_wen == 4'h0) ? 1'b1 : 1'b0;
-    wire       start_mmio_store = (w_state == W_IDLE) &
-                                  store_src_valid &
-                                  store_src_peri &
-                                  sb_empty;
-
-    always @(posedge cpu_clk or negedge cpu_rstn) begin
-        w_state <= !cpu_rstn ? W_IDLE : w_nstat;
-    end
-
-    always @(*) begin
-        case (w_state)
-            W_IDLE:  w_nstat = start_mmio_store ? (dev_wrdy ? W_STAT1 : W_STAT0) : W_IDLE;
-            W_STAT0: w_nstat = dev_wrdy ? W_STAT1 : W_STAT0;
-            W_STAT1: w_nstat = wr_resp ? W_IDLE : W_STAT1;
-            default: w_nstat = W_IDLE;
-        endcase
-    end
-
-    wire drain_start = !sb_empty &
-                       !sb_drain_busy &
-                       dev_wrdy &
-                       (w_state == W_IDLE) &
-                       !store_src_peri;
-    wire drain_done  = sb_drain_busy & dev_wrdy & (cpu_wen == 4'h0);
-    wire [SB_PTR_W:0] sb_count_next =
-        sb_count + { {SB_PTR_W{1'b0}}, enqueue_store } -
-                   { {SB_PTR_W{1'b0}}, drain_done    };
-
-    always @(posedge cpu_clk or negedge cpu_rstn) begin
-        if (!cpu_rstn) begin
-            data_wresp <= 1'b0;
-            cpu_wen    <= 4'h0;
-            cpu_waddr  <= 32'h0;
-            cpu_wdata  <= 32'h0;
-            sb_rptr    <= {SB_PTR_W{1'b0}};
-            sb_wptr    <= {SB_PTR_W{1'b0}};
-            sb_count   <= {(SB_PTR_W+1){1'b0}};
-            sb_drain_busy <= 1'b0;
-            store_pending <= 1'b0;
-            store_wen_r   <= 4'h0;
-            store_addr_r  <= 32'h0;
-            store_wdata_r <= 32'h0;
-            mmio_wen_r    <= 4'h0;
-            mmio_addr_r   <= 32'h0;
-            mmio_wdata_r  <= 32'h0;
-        end else begin
-            data_wresp <= 1'b0;
-            cpu_wen    <= 4'h0;
-
-            if (enqueue_store) begin
-                sb_wen  [sb_wptr] <= store_src_wen;
-                sb_addr [sb_wptr] <= store_src_addr;
-                sb_wdata[sb_wptr] <= store_src_data;
-                sb_wptr <= sb_wptr + 1'b1;
-                data_wresp <= 1'b1;
-
-                if (store_pending)
-                    store_pending <= 1'b0;
-            end
-            else if ((|data_wen) && !store_pending && !start_mmio_store) begin
-                store_pending <= 1'b1;
-                store_wen_r   <= data_wen;
-                store_addr_r  <= data_addr;
-                store_wdata_r <= data_wdata;
-            end
-
-            if (drain_start) begin
-                cpu_wen   <= sb_wen[sb_rptr];
-                cpu_waddr <= sb_addr[sb_rptr];
-                cpu_wdata <= sb_wdata[sb_rptr];
-                sb_drain_busy <= 1'b1;
-            end
-
-            if (drain_done) begin
-                sb_rptr   <= sb_rptr + 1'b1;
-                sb_drain_busy <= 1'b0;
-            end
-
-            sb_count <= sb_count_next;
-
-            case (w_state)
-                W_IDLE: begin
-                    if (start_mmio_store) begin
-                        mmio_wen_r   <= store_src_wen;
-                        mmio_addr_r  <= store_src_addr;
-                        mmio_wdata_r <= store_src_data;
-
-                        if (dev_wrdy) begin
-                            cpu_wen   <= store_src_wen;
-                            cpu_waddr <= store_src_addr;
-                            cpu_wdata <= store_src_data;
-                        end
-
-                        if (store_pending)
-                            store_pending <= 1'b0;
-                    end
-                end
-                W_STAT0: begin
-                    if (dev_wrdy) begin
-                        cpu_wen   <= mmio_wen_r;
-                        cpu_waddr <= mmio_addr_r;
-                        cpu_wdata <= mmio_wdata_r;
-                    end
-                end
-                W_STAT1: begin
-                    data_wresp <= wr_resp ? 1'b1 : 1'b0;
-                end
-                default: begin
-                    data_wresp <= 1'b0;
-                end
-            endcase
-        end
-    end
-
+    reg [1:0] w_state_no_cache;
 `endif
 
 endmodule

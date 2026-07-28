@@ -24,7 +24,13 @@ module MulDiv (
     wire  [32:0] ext_a = is_unsigned ? {1'b0, a} : {a[31], a};
     wire  [32:0] ext_b = is_unsigned ? {1'b0, b} : {b[31], b};
     wire  [65:0] mul_dout;
-    logic [2 :0] mul_wait_cnt;
+    // mult_gen_0 is configured with C_LATENCY=1.  The execution lane loads
+    // this module's operands through its issue register first; on the next
+    // rising edge the IP samples those registered operands, and its product is
+    // valid after that edge.  State 1 is therefore the one result-valid cycle.
+    // Keep a counter-shaped state here so the relationship to the configured
+    // IP latency remains explicit, without introducing an II=1 tag pipeline.
+    logic [2:0] mul_wait_cnt;
     logic [65:0] mul_res_latch;
 
     always @(posedge cpu_clk or negedge cpu_rstn) begin
@@ -39,7 +45,7 @@ module MulDiv (
         end else if (is_mul && (mul_wait_cnt == 3'b000)) begin
             mul_wait_cnt <= 3'b001;
         end else if (mul_wait_cnt != 3'b000) begin
-            if (mul_wait_cnt == 3'b100) begin
+            if (mul_wait_cnt == 3'b001) begin
                 mul_wait_cnt  <= 3'b000;
                 mul_res_latch <= mul_dout;
             end else begin
@@ -48,7 +54,8 @@ module MulDiv (
         end
     end
 
-    wire mul_done = (mul_wait_cnt == 3'b100);
+    wire mul_start = is_mul && (mul_wait_cnt == 3'b000);
+    wire mul_done  = is_mul && (mul_wait_cnt == 3'b001);
 
     mult_gen_0 u_mult (
         .CLK (cpu_clk),
@@ -66,6 +73,45 @@ module MulDiv (
             default: result = 32'h0;
         endcase
         done = is_mul ? mul_done : 1'b1;
-        busy = is_mul && (mul_wait_cnt != 3'b000) && !mul_done;
+        // Include the launch cycle in busy.  The result-valid cycle is done,
+        // not busy; the enclosing execution lane may accept the next uop on
+        // the following edge, giving the conservative two-cycle initiation
+        // interval requested for this first implementation.
+        busy = is_mul && !mul_done;
     end
+
+`ifndef SYNTHESIS
+    // The generated multiplier has no valid port, so keep the local control
+    // contract executable in simulation.  These checks catch an off-by-one
+    // wait change, a ghost completion after flush, or operand movement while
+    // the one-cycle IP transaction is in flight.
+    assert property (@(posedge cpu_clk) disable iff (!cpu_rstn || flush)
+        mul_start |=> mul_done)
+        else $fatal(1, "MulDiv: C_LATENCY=1 start was not followed by done");
+
+    assert property (@(posedge cpu_clk) disable iff (!cpu_rstn || flush)
+        mul_done |-> $past(mul_start))
+        else $fatal(1, "MulDiv: done without a matching start");
+
+    assert property (@(posedge cpu_clk) disable iff (!cpu_rstn || flush)
+        mul_start |=> $stable({alu_op, a, b}))
+        else $fatal(1, "MulDiv: operands changed before the IP result became valid");
+
+    assert property (@(posedge cpu_clk) disable iff (!cpu_rstn)
+        !(busy && mul_done))
+        else $fatal(1, "MulDiv: busy and done asserted together");
+
+    assert property (@(posedge cpu_clk) disable iff (!cpu_rstn)
+        flush |=> (mul_wait_cnt == 3'b000) && !mul_done &&
+                   (mul_res_latch == 66'h0))
+        else $fatal(1, "MulDiv: flush did not cancel local multiply state");
+
+    assert property (@(posedge cpu_clk) disable iff (!cpu_rstn || flush)
+        mul_done |=> (mul_res_latch == $past(mul_dout)))
+        else $fatal(1, "MulDiv: completed product was not retained");
+
+    assert property (@(posedge cpu_clk) disable iff (!cpu_rstn)
+        mul_wait_cnt inside {3'b000, 3'b001})
+        else $fatal(1, "MulDiv: illegal wait state");
+`endif
 endmodule

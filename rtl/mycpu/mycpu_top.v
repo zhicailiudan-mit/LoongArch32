@@ -54,6 +54,7 @@ module mycpu_top(
 
     wire        dev2dc_wrdy  ;
     wire        dev2dc_wdone ;
+    wire        dev2dc_widle ;
     wire [ 3:0] dc2dev_wen   ;
     wire [31:0] dc2dev_waddr ;
     wire [31:0] dc2dev_wdata ;
@@ -168,6 +169,7 @@ module mycpu_top(
         // Interface to Bus
         .dev_wrdy       (dev2dc_wrdy  ),
         .dev_wdone      (dev2dc_wdone ),
+        .dev_widle      (dev2dc_widle ),
         .cpu_wen        (dc2dev_wen   ),
         .cpu_waddr      (dc2dev_waddr ),
         .cpu_wdata      (dc2dev_wdata ),
@@ -199,6 +201,7 @@ module mycpu_top(
         // DCache Interface
         .dc_dev_wrdy    (dev2dc_wrdy   ),
         .dc_dev_wdone   (dev2dc_wdone  ),
+        .dc_dev_widle   (dev2dc_widle  ),
         .dc_cpu_wen     (dc2dev_wen    ),
         .dc_cpu_waddr   (dc2dev_waddr  ),
         .dc_cpu_wdata   (dc2dev_wdata  ),

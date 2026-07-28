@@ -41,11 +41,21 @@ module OooBackend (
     output commit_t                      commit0,
     output commit_t                      commit1,
 
+    output completion_t                  store_data_complete0,
+    output completion_t                  store_data_complete1,
+
     output logic [`ROB_TAG_W:0]          perf_rob_occupancy,
     output logic [3:0]                   perf_issue_occupancy,
     output logic                         perf_rob_block,
     output logic                         perf_issue_queue_block,
     output logic                         perf_true_source_wait,
+    output logic                         perf_source_wait_dep_load,
+    output logic                         perf_source_wait_dep_muldiv,
+    output logic                         perf_source_wait_dep_alu,
+    output logic                         perf_source_wait_dep_branch,
+    output logic                         perf_source_wait_store_addr,
+    output logic                         perf_source_wait_store_data,
+    output logic                         perf_iq_no_ready,
     output logic                         perf_lsu_order,
     output logic                         perf_serializing,
     output logic                         perf_dispatch_fire0,
@@ -160,6 +170,13 @@ module OooBackend (
         .issue1               (issue1),
         .occupancy            (scheduler_occupancy),
         .perf_true_source_wait(perf_true_source_wait),
+        .perf_source_wait_dep_load(perf_source_wait_dep_load),
+        .perf_source_wait_dep_muldiv(perf_source_wait_dep_muldiv),
+        .perf_source_wait_dep_alu(perf_source_wait_dep_alu),
+        .perf_source_wait_dep_branch(perf_source_wait_dep_branch),
+        .perf_source_wait_store_addr(perf_source_wait_store_addr),
+        .perf_source_wait_store_data(perf_source_wait_store_data),
+        .perf_iq_no_ready(perf_iq_no_ready),
         .perf_lsu_order       (perf_lsu_order),
         .perf_serializing     (perf_serializing)
     );
@@ -196,6 +213,8 @@ module OooBackend (
 
     assign commit0 = commit_internal[0];
     assign commit1 = commit_internal[1];
+    assign store_data_complete0 = complete[0];
+    assign store_data_complete1 = complete[1];
     assign perf_rob_occupancy = rob_occupancy;
     assign perf_issue_occupancy = scheduler_occupancy;
     assign perf_rob_block = (decode_valid[0] && !rob_alloc_ready[0]) ||

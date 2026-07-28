@@ -5,8 +5,8 @@
 // logic are simulation-only; no counter feeds a functional control signal.
 module PerformanceCounters #(
     parameter integer ROB_DEPTH_P = `ROB_DEPTH,
-    parameter integer IQ_DEPTH_P  = 4,
-    parameter integer LQ_DEPTH_P  = 4,
+    parameter integer IQ_DEPTH_P  = 8,
+    parameter integer LQ_DEPTH_P  = 8,
     parameter integer SQ_DEPTH_P  = 4,
     parameter integer SB_DEPTH_P  = 4
 ) (
@@ -29,12 +29,19 @@ module PerformanceCounters #(
     input logic [31:0]             commit1_pc,
     input logic [`ROB_TAG_W:0]     rob_occupancy,
     input logic [3:0]              issue_occupancy,
-    input logic [2:0]              lq_occupancy,
+    input logic [3:0]              lq_occupancy,
     input logic [2:0]              sq_occupancy,
     input logic [2:0]              sb_occupancy,
     input logic                    rob_block,
     input logic                    issue_queue_block,
     input logic                    source_wait,
+    input logic                    source_wait_dep_load,
+    input logic                    source_wait_dep_muldiv,
+    input logic                    source_wait_dep_alu,
+    input logic                    source_wait_dep_branch,
+    input logic                    source_wait_store_addr,
+    input logic                    source_wait_store_data,
+    input logic                    iq_no_ready,
     input logic                    serializing_block,
     input logic                    lsu_order_block,
     input logic                    lsu_queue_block,
@@ -179,9 +186,36 @@ module PerformanceCounters #(
     
     logic [`ROB_TAG_W:0] perf_rob_occupancy_max;
     logic [3:0] perf_issue_occupancy_max;
-    logic [2:0] perf_lq_occupancy_max;
+    logic [3:0] perf_lq_occupancy_max;
     logic [2:0] perf_sq_occupancy_max;
     logic [2:0] perf_sb_occupancy_max;
+
+    // Raw overlapping stall counters
+    logic [63:0] raw_source_wait_cycles;
+    logic [63:0] raw_source_wait_dep_load_cycles;
+    logic [63:0] raw_source_wait_dep_muldiv_cycles;
+    logic [63:0] raw_source_wait_dep_alu_cycles;
+    logic [63:0] raw_source_wait_dep_branch_cycles;
+    logic [63:0] raw_source_wait_store_addr_cycles;
+    logic [63:0] raw_source_wait_store_data_cycles;
+    logic [63:0] raw_iq_no_ready_cycles;
+    logic [63:0] raw_source_wait_stalled_cycles;
+    logic [63:0] raw_lsu_order_block_cycles;
+    logic [63:0] raw_lsu_queue_block_cycles;
+    logic [63:0] raw_dcache_wait_cycles;
+    logic [63:0] raw_dcache_backpressure_cycles;
+    logic [63:0] raw_iq_full_cycles;
+    logic [63:0] raw_lq_full_cycles;
+    logic [63:0] raw_rob_full_cycles;
+    logic [63:0] raw_muldiv_block_cycles;
+
+    // Memory event counters
+    logic [63:0] perf_load_issue_count;
+    logic [63:0] perf_load_forward_count;
+    logic [63:0] perf_load_response_count;
+    logic [63:0] perf_store_issue_count;
+    logic [63:0] perf_store_release_count;
+    logic [63:0] perf_store_drain_count;
     
     logic [63:0] perf_branch_count;
     logic [63:0] perf_branch_taken_count;
@@ -239,12 +273,16 @@ module PerformanceCounters #(
         perf_end_pc_cfg = 32'h0;
         perf_log_interval_cfg = 10000;
         perf_start_count_cfg = 0;
+        perf_summary_interval_cfg = 100000;
+        perf_summary_interval_arg = 1;
+        perf_summary_arg = 1;
         perf_start_arg = $value$plusargs("perf_start_pc=%h", perf_start_pc_cfg);
         perf_end_arg = $value$plusargs("perf_end_pc=%h", perf_end_pc_cfg);
         perf_count_arg = $value$plusargs("perf_start_count=%d", perf_start_count_cfg);
         perf_log_arg = $test$plusargs("perf_log");
-        perf_summary_arg = $test$plusargs("perf_summary");
-        perf_summary_interval_arg = $value$plusargs("perf_summary_interval=%d", perf_summary_interval_cfg);
+        if ($test$plusargs("perf_summary")) perf_summary_arg = 1;
+        if ($value$plusargs("perf_summary_interval=%d", perf_summary_interval_cfg))
+            perf_summary_interval_arg = 1;
         if (!$value$plusargs("perf_log_interval=%d", perf_log_interval_cfg) ||
             (perf_log_interval_cfg < 1))
             perf_log_interval_cfg = 10000;
@@ -331,6 +369,29 @@ module PerformanceCounters #(
             interval_snapshot_retired_uops <= 0;
             interval_snapshot_rob_occ_sum <= 0;
             interval_snapshot_iq_occ_sum <= 0;
+            raw_source_wait_cycles <= 0;
+            raw_source_wait_dep_load_cycles <= 0;
+            raw_source_wait_dep_muldiv_cycles <= 0;
+            raw_source_wait_dep_alu_cycles <= 0;
+            raw_source_wait_dep_branch_cycles <= 0;
+            raw_source_wait_store_addr_cycles <= 0;
+            raw_source_wait_store_data_cycles <= 0;
+            raw_iq_no_ready_cycles <= 0;
+            raw_source_wait_stalled_cycles <= 0;
+            raw_lsu_order_block_cycles <= 0;
+            raw_lsu_queue_block_cycles <= 0;
+            raw_dcache_wait_cycles <= 0;
+            raw_dcache_backpressure_cycles <= 0;
+            raw_iq_full_cycles <= 0;
+            raw_lq_full_cycles <= 0;
+            raw_rob_full_cycles <= 0;
+            raw_muldiv_block_cycles <= 0;
+            perf_load_issue_count <= 0;
+            perf_load_forward_count <= 0;
+            perf_load_response_count <= 0;
+            perf_store_issue_count <= 0;
+            perf_store_release_count <= 0;
+            perf_store_drain_count <= 0;
             for (integer i=0; i<PRIMARY_REASON_COUNT; i++) perf_primary[i] <= 0;
             for (integer i=0; i<=ROB_DEPTH_P; i++) rob_hist[i] <= 0;
             for (integer i=0; i<=IQ_DEPTH_P; i++) iq_hist[i] <= 0;
@@ -385,6 +446,29 @@ module PerformanceCounters #(
                 interval_snapshot_retired_uops <= 0;
                 interval_snapshot_rob_occ_sum <= 0;
                 interval_snapshot_iq_occ_sum <= 0;
+                raw_source_wait_cycles <= 0;
+                raw_source_wait_dep_load_cycles <= 0;
+                raw_source_wait_dep_muldiv_cycles <= 0;
+                raw_source_wait_dep_alu_cycles <= 0;
+                raw_source_wait_dep_branch_cycles <= 0;
+                raw_source_wait_store_addr_cycles <= 0;
+                raw_source_wait_store_data_cycles <= 0;
+                raw_iq_no_ready_cycles <= 0;
+                raw_source_wait_stalled_cycles <= 0;
+                raw_lsu_order_block_cycles <= 0;
+                raw_lsu_queue_block_cycles <= 0;
+                raw_dcache_wait_cycles <= 0;
+                raw_dcache_backpressure_cycles <= 0;
+                raw_iq_full_cycles <= 0;
+                raw_lq_full_cycles <= 0;
+                raw_rob_full_cycles <= 0;
+                raw_muldiv_block_cycles <= 0;
+                perf_load_issue_count <= 0;
+                perf_load_forward_count <= 0;
+                perf_load_response_count <= 0;
+                perf_store_issue_count <= 0;
+                perf_store_release_count <= 0;
+                perf_store_drain_count <= 0;
                 for (integer i=0; i<PRIMARY_REASON_COUNT; i++) perf_primary[i] <= 0;
                 for (integer i=0; i<=ROB_DEPTH_P; i++) rob_hist[i] <= 0;
                 for (integer i=0; i<=IQ_DEPTH_P; i++) iq_hist[i] <= 0;
@@ -430,6 +514,31 @@ module PerformanceCounters #(
                 if (lq_occupancy > perf_lq_occupancy_max) perf_lq_occupancy_max <= lq_occupancy;
                 if (sq_occupancy > perf_sq_occupancy_max) perf_sq_occupancy_max <= sq_occupancy;
                 if (sb_occupancy > perf_sb_occupancy_max) perf_sb_occupancy_max <= sb_occupancy;
+
+                if (source_wait)            raw_source_wait_cycles <= raw_source_wait_cycles + 1;
+                if (source_wait_dep_load)   raw_source_wait_dep_load_cycles <= raw_source_wait_dep_load_cycles + 1;
+                if (source_wait_dep_muldiv) raw_source_wait_dep_muldiv_cycles <= raw_source_wait_dep_muldiv_cycles + 1;
+                if (source_wait_dep_alu)    raw_source_wait_dep_alu_cycles <= raw_source_wait_dep_alu_cycles + 1;
+                if (source_wait_dep_branch) raw_source_wait_dep_branch_cycles <= raw_source_wait_dep_branch_cycles + 1;
+                if (source_wait_store_addr) raw_source_wait_store_addr_cycles <= raw_source_wait_store_addr_cycles + 1;
+                if (source_wait_store_data) raw_source_wait_store_data_cycles <= raw_source_wait_store_data_cycles + 1;
+                if (iq_no_ready)            raw_iq_no_ready_cycles <= raw_iq_no_ready_cycles + 1;
+                if (source_wait && iq_no_ready) raw_source_wait_stalled_cycles <= raw_source_wait_stalled_cycles + 1;
+                if (lsu_order_block)      raw_lsu_order_block_cycles <= raw_lsu_order_block_cycles + 1;
+                if (lsu_queue_block)      raw_lsu_queue_block_cycles <= raw_lsu_queue_block_cycles + 1;
+                if (dcache_wait)         raw_dcache_wait_cycles <= raw_dcache_wait_cycles + 1;
+                if (dcache_backpressure) raw_dcache_backpressure_cycles <= raw_dcache_backpressure_cycles + 1;
+                if (issue_occupancy == IQ_DEPTH_P) raw_iq_full_cycles <= raw_iq_full_cycles + 1;
+                if (lq_occupancy == LQ_DEPTH_P)   raw_lq_full_cycles <= raw_lq_full_cycles + 1;
+                if (rob_occupancy == ROB_DEPTH_P)  raw_rob_full_cycles <= raw_rob_full_cycles + 1;
+                if (muldiv_block)        raw_muldiv_block_cycles <= raw_muldiv_block_cycles + 1;
+
+                perf_load_issue_count    <= perf_load_issue_count + load_issue;
+                perf_load_forward_count  <= perf_load_forward_count + load_forward;
+                perf_load_response_count <= perf_load_response_count + load_response;
+                perf_store_issue_count   <= perf_store_issue_count + store_issue;
+                perf_store_release_count <= perf_store_release_count + store_release;
+                perf_store_drain_count   <= perf_store_drain_count + store_drain;
                 
                 rob_hist[rob_occupancy] <= rob_hist[rob_occupancy] + 1;
                 iq_hist[issue_occupancy] <= iq_hist[issue_occupancy] + 1;
@@ -540,6 +649,36 @@ module PerformanceCounters #(
                 if (perf_primary[i] > 0)
                     $display("  %s: %0d (%.2f%%)", primary_name(i), perf_primary[i], ratio_pct(perf_primary[i], perf_issue_width0_cycles));
             end
+            $display("----------------------------------------------------------");
+            $display("RAW_STALL_SIGNALS:");
+            $display("  source_wait=%0d (%.2f%%)", raw_source_wait_cycles, ratio_pct(raw_source_wait_cycles, perf_cycles));
+            $display("  lsu_order=%0d (%.2f%%)", raw_lsu_order_block_cycles, ratio_pct(raw_lsu_order_block_cycles, perf_cycles));
+            $display("  lsu_queue=%0d (%.2f%%)", raw_lsu_queue_block_cycles, ratio_pct(raw_lsu_queue_block_cycles, perf_cycles));
+            $display("  dcache_wait=%0d (%.2f%%)", raw_dcache_wait_cycles, ratio_pct(raw_dcache_wait_cycles, perf_cycles));
+            $display("  dcache_backpressure=%0d (%.2f%%)", raw_dcache_backpressure_cycles, ratio_pct(raw_dcache_backpressure_cycles, perf_cycles));
+            $display("  iq_full=%0d (%.2f%%)", raw_iq_full_cycles, ratio_pct(raw_iq_full_cycles, perf_cycles));
+            $display("  lq_full=%0d (%.2f%%)", raw_lq_full_cycles, ratio_pct(raw_lq_full_cycles, perf_cycles));
+            $display("  rob_full=%0d (%.2f%%)", raw_rob_full_cycles, ratio_pct(raw_rob_full_cycles, perf_cycles));
+            $display("  muldiv=%0d (%.2f%%)", raw_muldiv_block_cycles, ratio_pct(raw_muldiv_block_cycles, perf_cycles));
+            $display("----------------------------------------------------------");
+            $display("SOURCE_WAIT_ATTRIBUTION:");
+            $display("  oldest_source_wait  = %0d (%.2f%%)", raw_source_wait_cycles, ratio_pct(raw_source_wait_cycles, perf_cycles));
+            $display("    dep_load          = %0d (%.2f%%)", raw_source_wait_dep_load_cycles, ratio_pct(raw_source_wait_dep_load_cycles, perf_cycles));
+            $display("    dep_muldiv        = %0d (%.2f%%)", raw_source_wait_dep_muldiv_cycles, ratio_pct(raw_source_wait_dep_muldiv_cycles, perf_cycles));
+            $display("    dep_alu           = %0d (%.2f%%)", raw_source_wait_dep_alu_cycles, ratio_pct(raw_source_wait_dep_alu_cycles, perf_cycles));
+            $display("    dep_branch        = %0d (%.2f%%)", raw_source_wait_dep_branch_cycles, ratio_pct(raw_source_wait_dep_branch_cycles, perf_cycles));
+            $display("    store_addr        = %0d (%.2f%%)", raw_source_wait_store_addr_cycles, ratio_pct(raw_source_wait_store_addr_cycles, perf_cycles));
+            $display("    store_data        = %0d (%.2f%%)", raw_source_wait_store_data_cycles, ratio_pct(raw_source_wait_store_data_cycles, perf_cycles));
+            $display("  iq_no_ready         = %0d (%.2f%%)", raw_iq_no_ready_cycles, ratio_pct(raw_iq_no_ready_cycles, perf_cycles));
+            $display("  source_wait_stalled = %0d (%.2f%%)", raw_source_wait_stalled_cycles, ratio_pct(raw_source_wait_stalled_cycles, perf_cycles));
+            $display("----------------------------------------------------------");
+            $display("MEMORY_EVENTS:");
+            $display("  load_issue=%0d", perf_load_issue_count);
+            $display("  load_forward=%0d", perf_load_forward_count);
+            $display("  load_response=%0d", perf_load_response_count);
+            $display("  store_issue=%0d", perf_store_issue_count);
+            $display("  store_release=%0d", perf_store_release_count);
+            $display("  store_drain=%0d", perf_store_drain_count);
             $display("----------------------------------------------------------");
             $display("BRANCH_STATS:");
             $display("  branch_count=%0d", perf_branch_count);
