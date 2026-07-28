@@ -476,15 +476,29 @@ module DispatchQueue #(
             // Completion wakeup is still captured into src*_ready/rD* at the
             // clock edge.  The effective state additionally lets that same
             // completion participate in select and operand delivery now.
+            // Correctness boundary:
+            //
+            // A Store may leave the DispatchQueue only after both its address
+            // source and data source are ready.  Allowing address-only issue
+            // creates a completion ownership gap: after the Store leaves DQ
+            // but before an unresolved Store is safely owned by SQ, its data
+            // producer may complete and the one-cycle wakeup can be lost.
+            //
+            // src1_ready_eff includes same-cycle completion bypass, so a Store
+            // may still issue in the exact cycle in which its data producer
+            // completes, using src1_value_eff as the authoritative value.
             assign slot_ready[q] = src0_ready_eff[q] &&
-                                    (src1_ready_eff[q] || (is_ld_st[q] && (ram_we[q] != `RAM_WE_N))) &&
+                                    src1_ready_eff[q] &&
                                     (!(is_ld_st[q] &&
                                        (ram_we[q] == `RAM_WE_N)) ||
                                      !older_store_pending[q]) &&
-                                    (!is_br_jmp[q] || !older_branch_pending[q]) &&
-                                   (!BRANCH_AT_ROB_HEAD || !is_br_jmp[q] ||
-                                    (rob_head_valid &&
-                                     uop_id_equal(uop_id[q], rob_head_id)));
+                                    (!is_br_jmp[q] ||
+                                     !older_branch_pending[q]) &&
+                                    (!BRANCH_AT_ROB_HEAD ||
+                                     !is_br_jmp[q] ||
+                                     (rob_head_valid &&
+                                      uop_id_equal(uop_id[q],
+                                                   rob_head_id)));
             assign slot_restricted[q] = is_br_jmp[q] || is_ld_st[q] ||
                                         is_call[q] || is_ret[q] ||
                                         pred_taken[q] ||

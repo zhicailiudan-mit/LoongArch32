@@ -482,11 +482,36 @@ module LoadStoreUnit (
 
 `ifndef SYNTHESIS
     always @(posedge cpu_clk) begin
-        if (cpu_rstn && !flush && load_head_valid) begin
-            if (executing_store0_is_older && executing_store1_is_older) begin
-                if (!order_valid[SQ_DEPTH+SB_DEPTH] || !order_valid[SQ_DEPTH+SB_DEPTH+1]) begin
-                    $fatal(1, "[LSU-ASSERT] Dual executing stores must both appear in order_valid slots!");
+        if (cpu_rstn && !flush) begin
+            if (load_head_valid &&
+                executing_store0_is_older &&
+                executing_store1_is_older) begin
+                if (!order_valid[SQ_DEPTH+SB_DEPTH] ||
+                    !order_valid[SQ_DEPTH+SB_DEPTH+1]) begin
+                    $fatal(1,
+                        "[LSU-ASSERT] Dual executing stores must both appear in order_valid slots!");
                 end
+            end
+
+            // Store address/data decoupling is disabled at the DQ boundary.
+            // Every Store accepted into SQ must therefore already carry its
+            // authoritative data.  Use case inequality so X/Z is also caught.
+            if (store0_accept &&
+                (store_entry.store_data_ready !== 1'b1)) begin
+                $fatal(1,
+                    "[LSU-ASSERT] Lane0 accepted Store without ready data: pc=%h uop_id=%p src_id=%p",
+                    store_entry.pc,
+                    store_entry.uop_id,
+                    store_entry.store_data_src_id);
+            end
+
+            if (store1_accept &&
+                (store1_entry.store_data_ready !== 1'b1)) begin
+                $fatal(1,
+                    "[LSU-ASSERT] Lane1 accepted Store without ready data: pc=%h uop_id=%p src_id=%p",
+                    store1_entry.pc,
+                    store1_entry.uop_id,
+                    store1_entry.store_data_src_id);
             end
         end
     end
