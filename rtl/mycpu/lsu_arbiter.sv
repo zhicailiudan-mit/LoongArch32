@@ -339,22 +339,60 @@ module LsuArbiter (
                     load_pop_uop_id = load_entry.uop_id;
                 end
             end else if (dcache_rsp.valid) begin
-                // Completion Queue is empty or flush active -> DCache response outputs directly if not killed/flushed
+                // The DCache response is untagged and belongs to either the
+                // active MMIO owner or the ordinary owner FIFO head.
+                //
+                // During branch recovery, a response belonging to an older,
+                // surviving Load must not be discarded.  The ROB completion
+                // output is suppressed while flush is active, so save that
+                // response into the Completion Queue and remove the matching
+                // issued entry from the LoadQueue.
                 if (mmio_active) begin
-                    if (!mmio_effective_killed && !flush) begin
-                        completion_valid = 1'b1;
-                        completion_entry = mmio_owner.entry;
-                        completion_rdata = dcache_rsp.rdata;
-                        load_pop = 1'b1;
+                    if (!mmio_effective_killed) begin
+                        if (flush) begin
+                            // Surviving MMIO Load response during branch flush.
+                            comp_push_do     = 1'b1;
+                            comp_push_entry  = mmio_owner.entry;
+                            comp_push_rdata  = dcache_rsp.rdata;
+                            comp_push_killed = 1'b0;
+                        end else begin
+                            // Normal response: use the completion port directly.
+                            completion_valid = 1'b1;
+                            completion_entry = mmio_owner.entry;
+                            completion_rdata = dcache_rsp.rdata;
+                        end
+
+                        // The physical response has been consumed.  Remove the
+                        // matching issued LoadQueue entry in both cases.
+                        load_pop        = 1'b1;
                         load_pop_uop_id = mmio_owner.entry.uop_id;
                     end
                 end else if (owner_count > 3'd0) begin
+                    // A physical DCache response always consumes the owner FIFO
+                    // head, including responses for killed operations.
                     owner_pop_do = 1'b1;
-                    if (!owner_effective_killed && !flush) begin
-                        completion_valid = 1'b1;
-                        completion_entry = owner_fifo[owner_head].entry;
-                        completion_rdata = dcache_rsp.rdata;
-                        load_pop = 1'b1;
+
+                    if (!owner_effective_killed) begin
+                        if (flush) begin
+                            // This Load is older than the recovering branch.
+                            // Preserve its response until completion delivery
+                            // resumes after the flush cycle.
+                            owner_push_comp_do = 1'b1;
+                            comp_push_do       = 1'b1;
+                            comp_push_entry    = owner_fifo[owner_head].entry;
+                            comp_push_rdata    = dcache_rsp.rdata;
+                            comp_push_killed   = 1'b0;
+                        end else begin
+                            // Normal response: use the completion port directly.
+                            completion_valid = 1'b1;
+                            completion_entry = owner_fifo[owner_head].entry;
+                            completion_rdata = dcache_rsp.rdata;
+                        end
+
+                        // Remove the matching issued LoadQueue entry.  During a
+                        // branch flush the LoadQueue compaction logic preserves
+                        // older entries while applying this full-uop-ID pop.
+                        load_pop        = 1'b1;
                         load_pop_uop_id = owner_fifo[owner_head].entry.uop_id;
                     end
                 end
@@ -635,6 +673,57 @@ module LsuArbiter (
             // 8. MMIO and ordinary owner FIFO cannot be in-flight together
             if (mmio_active && owner_count > 3'd0)
                 $fatal(1, "[ASSERT-LSU-2A] MMIO load and ordinary owner FIFO active simultaneously!");
+
+            // 9. A response belonging to a Load older than the recovering
+            // branch must be saved and must remove its issued LQ entry.
+            if (flush && branch_flush && recover_valid &&
+                dcache_rsp.valid) begin
+
+                if (mmio_active && !mmio_effective_killed) begin
+                    if (!comp_push_do)
+                        $fatal(1,
+                            "[ASSERT-LSU-2A] Surviving MMIO Load response was not saved across branch flush!");
+
+                    if (!load_pop)
+                        $fatal(1,
+                            "[ASSERT-LSU-2A] Surviving MMIO Load response did not pop LoadQueue entry!");
+
+                    if (!uop_id_equal(load_pop_uop_id,
+                                     mmio_owner.entry.uop_id))
+                        $fatal(1,
+                            "[ASSERT-LSU-2A] Surviving MMIO Load pop uop_id mismatch!");
+
+                    if (!uop_id_equal(comp_push_entry.uop_id,
+                                     mmio_owner.entry.uop_id))
+                        $fatal(1,
+                            "[ASSERT-LSU-2A] Surviving MMIO completion uop_id mismatch!");
+                end
+
+                if (!mmio_active && owner_count > 3'd0 &&
+                    !owner_effective_killed) begin
+                    if (!owner_pop_do)
+                        $fatal(1,
+                            "[ASSERT-LSU-2A] Surviving Load response did not consume owner FIFO head!");
+
+                    if (!comp_push_do)
+                        $fatal(1,
+                            "[ASSERT-LSU-2A] Surviving Load response was not saved across branch flush!");
+
+                    if (!load_pop)
+                        $fatal(1,
+                            "[ASSERT-LSU-2A] Surviving Load response did not pop LoadQueue entry!");
+
+                    if (!uop_id_equal(load_pop_uop_id,
+                                     owner_fifo[owner_head].entry.uop_id))
+                        $fatal(1,
+                            "[ASSERT-LSU-2A] Surviving Load pop uop_id mismatch!");
+
+                    if (!uop_id_equal(comp_push_entry.uop_id,
+                                     owner_fifo[owner_head].entry.uop_id))
+                        $fatal(1,
+                            "[ASSERT-LSU-2A] Surviving Load completion uop_id mismatch!");
+                end
+            end
         end
     end
 `endif
