@@ -456,15 +456,26 @@ module DispatchQueue #(
                                        wake2_src1_vec[q] || wake3_src1_vec[q];
             assign src0_ready_eff[q] = src0_ready[q] ||
                                         complete0_src0_match[q] ||
-                                        complete1_src0_match[q];
+                                        complete1_src0_match[q] ||
+                                        wake2_src0_vec[q] ||
+                                        wake3_src0_vec[q];
             assign src1_ready_eff[q] = src1_ready[q] ||
                                         complete0_src1_match[q] ||
-                                        complete1_src1_match[q];
+                                        complete1_src1_match[q] ||
+                                        wake2_src1_vec[q] ||
+                                        wake3_src1_vec[q];
+            // A Store may leave the queue while its data is unresolved.  If
+            // the producer retires in that same cycle, carry the commit value
+            // into the issued packet instead of only recording it at the edge.
             assign src0_value_eff[q] = complete0_src0_match[q] ? complete_value :
                                        complete1_src0_match[q] ? complete1_value :
+                                       wake2_src0_vec[q]       ? commit_value :
+                                       wake3_src0_vec[q]       ? commit1_value :
                                        rD1[q];
             assign src1_value_eff[q] = complete0_src1_match[q] ? complete_value :
                                        complete1_src1_match[q] ? complete1_value :
+                                       wake2_src1_vec[q]       ? commit_value :
+                                       wake3_src1_vec[q]       ? commit1_value :
                                        rD2[q];
             // Device reads have an irreversible side effect (for example a
             // UART RBR read pops one RX byte).  Address generation may be

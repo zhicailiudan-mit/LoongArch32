@@ -17,6 +17,8 @@ module ExecutionLane0 (
 
     input  completion_t           store_data_complete0,
     input  completion_t           store_data_complete1,
+    input  commit_t               store_data_commit0,
+    input  commit_t               store_data_commit1,
 
     input  logic                  issue0_valid,
     input  logic                  issue0_fire,
@@ -88,12 +90,31 @@ module ExecutionLane0 (
         uop_id_equal(store_data_complete1.uop_id,
                      issue0_q.src1_id);
 
+    wire store_data_commit_wake0 =
+        issue0_q_is_store &&
+        !issue0_q.src1_ready &&
+        store_data_commit0.valid &&
+        store_data_commit0.reg_write &&
+        uop_id_equal(store_data_commit0.uop_id,
+                     issue0_q.src1_id);
+
+    wire store_data_commit_wake1 =
+        issue0_q_is_store &&
+        !issue0_q.src1_ready &&
+        store_data_commit1.valid &&
+        store_data_commit1.reg_write &&
+        uop_id_equal(store_data_commit1.uop_id,
+                     issue0_q.src1_id);
+
     wire store_data_wake =
-        store_data_wake0 || store_data_wake1;
+        store_data_wake0 || store_data_wake1 ||
+        store_data_commit_wake0 || store_data_commit_wake1;
 
     wire [31:0] store_data_wake_value =
         store_data_wake0 ? store_data_complete0.value :
-                           store_data_complete1.value;
+        store_data_wake1 ? store_data_complete1.value :
+        store_data_commit_wake0 ? store_data_commit0.value :
+                                  store_data_commit1.value;
 
     // Branch recovery is published as one registered event.  Target and ROB
     // tag are sampled together with the resolution result; ROB/RAT/frontend

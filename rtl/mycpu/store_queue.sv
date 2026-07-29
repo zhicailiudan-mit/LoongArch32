@@ -52,7 +52,9 @@ module StoreQueue #(parameter integer DEPTH = 4) (
     function automatic lsu_entry_t snoop_entry(
         input lsu_entry_t in_entry,
         input completion_t c0,
-        input completion_t c1
+        input completion_t c1,
+        input commit_t k0,
+        input commit_t k1
     );
         begin
             snoop_entry = in_entry;
@@ -62,6 +64,16 @@ module StoreQueue #(parameter integer DEPTH = 4) (
                     snoop_entry.store_data_ready = 1'b1;
                 end else if (c1.valid && c1.reg_write && uop_id_equal(c1.uop_id, in_entry.store_data_src_id)) begin
                     snoop_entry.store_data = align_store_data(c1.value, in_entry.store_wen);
+                    snoop_entry.store_data_ready = 1'b1;
+                end else if (k0.valid && k0.reg_write && uop_id_equal(k0.uop_id, in_entry.store_data_src_id)) begin
+                    // A producer can retire after an address-ready Store has
+                    // left the issue queue.  Commit is the last value-bearing
+                    // event for that producer, so SQ must snoop it as well as
+                    // the one-cycle completion buses.
+                    snoop_entry.store_data = align_store_data(k0.value, in_entry.store_wen);
+                    snoop_entry.store_data_ready = 1'b1;
+                end else if (k1.valid && k1.reg_write && uop_id_equal(k1.uop_id, in_entry.store_data_src_id)) begin
+                    snoop_entry.store_data = align_store_data(k1.value, in_entry.store_wen);
                     snoop_entry.store_data_ready = 1'b1;
                 end
             end
@@ -154,7 +166,7 @@ module StoreQueue #(parameter integer DEPTH = 4) (
                     (commit0.valid && uop_id_equal(entries[q].uop_id, commit0.uop_id)) ||
                     (commit1.valid && uop_id_equal(entries[q].uop_id, commit1.uop_id)) ||
                     (!system_flush && recover_valid && !uop_is_younger(entries[q].uop_id, recover_id)))) begin
-                    entries[flush_dst] <= snoop_entry(entries[q], complete0, complete1);
+                    entries[flush_dst] <= snoop_entry(entries[q], complete0, complete1, commit0, commit1);
                     committed[flush_dst] <= committed[q] ||
                         (commit0.valid && uop_id_equal(entries[q].uop_id, commit0.uop_id)) ||
                         (commit1.valid && uop_id_equal(entries[q].uop_id, commit1.uop_id));
@@ -179,7 +191,7 @@ module StoreQueue #(parameter integer DEPTH = 4) (
             if (release_do) begin
                 for (j = 0; j < DEPTH-1; j = j + 1) begin
                     if ((j >= oldest_sel) && (j < count-1)) begin
-                        entries[j] <= snoop_entry(entries[j+1], complete0, complete1);
+                        entries[j] <= snoop_entry(entries[j+1], complete0, complete1, commit0, commit1);
                         committed[j] <= committed[j+1] ||
                             (commit0.valid && uop_id_equal(entries[j+1].uop_id, commit0.uop_id)) ||
                             (commit1.valid && uop_id_equal(entries[j+1].uop_id, commit1.uop_id));
@@ -201,7 +213,7 @@ module StoreQueue #(parameter integer DEPTH = 4) (
             end else begin
                 for (q = 0; q < DEPTH; q = q + 1) begin
                     if (q < count) begin
-                        entries[q] <= snoop_entry(entries[q], complete0, complete1);
+                        entries[q] <= snoop_entry(entries[q], complete0, complete1, commit0, commit1);
                     end
                 end
             end
@@ -228,13 +240,13 @@ module StoreQueue #(parameter integer DEPTH = 4) (
 `endif
             end
             if (accept_do) begin
-                entries[release_do ? count-1 : count] <= snoop_entry(accept_entry, complete0, complete1);
+                entries[release_do ? count-1 : count] <= snoop_entry(accept_entry, complete0, complete1, commit0, commit1);
                 committed[release_do ? count-1 : count] <=
                     (commit0.valid && uop_id_equal(accept_entry.uop_id, commit0.uop_id)) ||
                     (commit1.valid && uop_id_equal(accept_entry.uop_id, commit1.uop_id));
             end
             if (accept1_do) begin
-                entries[(release_do ? count-1 : count) + accept_do] <= snoop_entry(accept1_entry, complete0, complete1);
+                entries[(release_do ? count-1 : count) + accept_do] <= snoop_entry(accept1_entry, complete0, complete1, commit0, commit1);
                 committed[(release_do ? count-1 : count) + accept_do] <=
                     (commit0.valid && uop_id_equal(accept1_entry.uop_id, commit0.uop_id)) ||
                     (commit1.valid && uop_id_equal(accept1_entry.uop_id, commit1.uop_id));

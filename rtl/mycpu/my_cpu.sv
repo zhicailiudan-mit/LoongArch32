@@ -298,6 +298,8 @@ module MyCpu (
         .recover_id           (recover_id),
         .store_data_complete0 (store_data_complete0),
         .store_data_complete1 (store_data_complete1),
+        .store_data_commit0   (commit0),
+        .store_data_commit1   (commit1),
         .issue0_valid     (issue0_valid),
         .issue0_fire      (issue0_fire),
         .issue0           (issue0),
@@ -611,11 +613,81 @@ module MyCpu (
     // These aliases are simulation-only and preserve the hierarchy expected
     // by the supplied mycpu_tb.sv testbench.
 
-    // The external functional-trace checker is one-wide.  Keep the backend
-    // dual-commit interface intact, then serialize commit0 before commit1 in
-    // a simulation-only FIFO.  The visible packet is replaced on the rising
-    // edge.  The supplied checker consumes the next reference when it sees
-    // the visible packet after its #2 sampling delay.
+    // Observable Register Write condition:
+    // Must be valid, write register, and target register must NOT be $r0.
+    wire commit0_obs = commit0.valid && commit0.reg_write && (commit0.arch_rd != 5'd0);
+    wire commit1_obs = commit1.valid && commit1.reg_write && (commit1.arch_rd != 5'd0);
+
+    reg [63:0] ipc_decode_count;
+    reg [63:0] ipc_issue_count;
+    reg [63:0] ipc_regwrite_count;
+    reg [63:0] ipc_dual_commit_cycles;
+
+`ifdef DUAL_COMMIT_TRACE
+    // Capture both retirement slots on the clock edge.  The dual-aware
+    // testbench samples these packets after its existing #2 delay and consumes
+    // the Golden Trace in architectural order: older commit0, then commit1.
+    commit_t debug_trace0_q;
+    commit_t debug_trace1_q;
+    logic [31:0] debug_trace_last_pc_q;
+
+    wire debug_trace0_obs = debug_trace0_q.valid &&
+                            debug_trace0_q.reg_write &&
+                            (debug_trace0_q.arch_rd != 5'd0);
+    wire debug_trace1_obs = debug_trace1_q.valid &&
+                            debug_trace1_q.reg_write &&
+                            (debug_trace1_q.arch_rd != 5'd0);
+
+    integer debug_trace_count;
+    integer debug_trace_max_count;
+    reg [63:0] debug_trace_accepted_cnt;
+    reg [63:0] debug_trace_emitted_cnt;
+
+    always @(posedge cpu_clk or negedge cpu_rstn) begin
+        if (!cpu_rstn) begin
+            debug_trace0_q <= '0;
+            debug_trace1_q <= '0;
+            debug_trace_last_pc_q <= 32'h0000_0000;
+            debug_trace_count <= 0;
+            debug_trace_max_count <= 0;
+            debug_trace_accepted_cnt <= 64'd0;
+            debug_trace_emitted_cnt <= 64'd0;
+        end else begin
+            debug_trace0_q <= commit0;
+            debug_trace1_q <= commit1;
+            // Keep a meaningful progress PC even when the periodically sampled
+            // cycle contains no architectural register write.  When both slots
+            // write, commit1 is younger and therefore the most recent event.
+            if (commit1_obs)
+                debug_trace_last_pc_q <= commit1.pc;
+            else if (commit0_obs)
+                debug_trace_last_pc_q <= commit0.pc;
+            debug_trace_count <= 0;
+            debug_trace_max_count <= 0;
+            debug_trace_accepted_cnt <= debug_trace_accepted_cnt +
+                                        commit0_obs + commit1_obs;
+            debug_trace_emitted_cnt <= debug_trace_emitted_cnt +
+                                       commit0_obs + commit1_obs;
+        end
+    end
+
+    // Preserve the official one-wide output aliases for waveform inspection.
+    // Golden comparison uses both registered packets hierarchically and does
+    // not consume these aliases.  The PC holds its most recent valid value in
+    // idle cycles so the coarse testbench progress print does not show a false
+    // stream of zeroes.
+    wire [31:0] debug_wb_pc = debug_trace0_obs ? debug_trace0_q.pc :
+                              debug_trace1_obs ? debug_trace1_q.pc :
+                                                 debug_trace_last_pc_q;
+    wire [ 3:0] debug_wb_rf_we = {4{debug_trace0_obs || debug_trace1_obs}};
+    wire [ 4:0] debug_wb_rf_rd = debug_trace0_obs ? debug_trace0_q.arch_rd :
+                                 debug_trace1_q.arch_rd;
+    wire [31:0] debug_wb_rf_wdata = debug_trace0_obs ? debug_trace0_q.value :
+                                    debug_trace1_q.value;
+
+`else
+    // Legacy compatibility mode: serialize the two backend commit slots onto
+    // the original one-wide functional-trace interface.
     localparam integer DEBUG_TRACE_FIFO_DEPTH = 4096;
     localparam integer DEBUG_TRACE_PTR_W = $clog2(DEBUG_TRACE_FIFO_DEPTH);
     commit_t debug_trace_fifo [0:DEBUG_TRACE_FIFO_DEPTH-1];
@@ -633,11 +705,6 @@ module MyCpu (
     reg [63:0] debug_trace_accepted_cnt;
     reg [63:0] debug_trace_emitted_cnt;
 
-    reg [63:0] ipc_decode_count;
-    reg [63:0] ipc_issue_count;
-    reg [63:0] ipc_regwrite_count;
-    reg [63:0] ipc_dual_commit_cycles;
-
     function automatic [DEBUG_TRACE_PTR_W-1:0] debug_trace_ptr_add;
         input [DEBUG_TRACE_PTR_W-1:0] base;
         input integer offset;
@@ -645,11 +712,6 @@ module MyCpu (
             debug_trace_ptr_add = base + offset;
         end
     endfunction
-
-    // Observable Register Write condition:
-    // Must be valid, write register, and target register must NOT be $r0.
-    wire commit0_obs = commit0.valid && commit0.reg_write && (commit0.arch_rd != 5'd0);
-    wire commit1_obs = commit1.valid && commit1.reg_write && (commit1.arch_rd != 5'd0);
 
     always @(posedge cpu_clk or negedge cpu_rstn) begin
         if (!cpu_rstn) begin
@@ -735,6 +797,7 @@ module MyCpu (
                                       (debug_trace_head_q.arch_rd != 5'd0)}};
     wire [ 4:0] debug_wb_rf_rd    = debug_trace_head_q.arch_rd;
     wire [31:0] debug_wb_rf_wdata = debug_trace_head_q.value;
+`endif
 
     assign debug0_wb_pc = debug_wb_pc;
     assign debug0_wb_rf_wen = debug_wb_rf_we;
@@ -791,7 +854,7 @@ module MyCpu (
                          debug_trace_count,
                          debug_trace_max_count,
                          debug_trace_accepted_cnt,
-                         debug_trace_emitted_cnt);
+                debug_trace_emitted_cnt);
             end
         end
     end
@@ -808,7 +871,113 @@ module MyCpu (
                                    execute_result.is_br_jmp &&
                                    execute_result.branch_taken;
     wire [31:0] debug_bj_target = execute_result.branch_target;
-    ///////////////////////////////////////////////////////////////////////////
+
+    integer watchdog_stall_cnt;
+    always @(posedge cpu_clk or negedge cpu_rstn) begin
+        if (!cpu_rstn) begin
+            watchdog_stall_cnt <= 0;
+        end else if (commit0.valid || commit1.valid || pipeline_flush) begin
+            watchdog_stall_cnt <= 0;
+        end else begin
+            watchdog_stall_cnt <= watchdog_stall_cnt + 1;
+            if (watchdog_stall_cnt == 5000) begin
+                $display("\n==========================================================");
+                $display("[WATCHDOG DEADLOCK DETECTED] No commits for 5000 cycles at cycle %0d (time %0t ps)", ipc_cycle_count, $time);
+                $display("----------------------------------------------------------");
+                $display("ROB HEAD: valid=%b id={ep:%0d, tag:%0d}",
+                         rob_head_valid, rob_head_id.epoch, rob_head_id.rob_tag);
+                if (u_ooo_backend.u_commit_recovery.u_reorder_buffer.valid[rob_head_id.rob_tag]) begin
+                    $display("ROB HEAD ENTRY: pc=%x done=%b reg_w=%b rd=%0d val=%x ep=%0d has_dest=%b",
+                             u_ooo_backend.u_commit_recovery.u_reorder_buffer.pc[rob_head_id.rob_tag],
+                             u_ooo_backend.u_commit_recovery.u_reorder_buffer.done[rob_head_id.rob_tag],
+                             u_ooo_backend.u_commit_recovery.u_reorder_buffer.result_we[rob_head_id.rob_tag],
+                             u_ooo_backend.u_commit_recovery.u_reorder_buffer.rd[rob_head_id.rob_tag],
+                             u_ooo_backend.u_commit_recovery.u_reorder_buffer.value[rob_head_id.rob_tag],
+                             u_ooo_backend.u_commit_recovery.u_reorder_buffer.epoch[rob_head_id.rob_tag],
+                             u_ooo_backend.u_commit_recovery.u_reorder_buffer.has_dest[rob_head_id.rob_tag]);
+                end
+                $display("----------------------------------------------------------");
+                $display("EXECUTION LANE 0:");
+                $display("  issue0_valid_q=%b pc=%x uop_id={ep:%0d,tag:%0d} store=%b src1_ready=%b src1_id={ep:%0d,tag:%0d}",
+                         u_execution_cluster.u_execution_lane0.issue0_valid_q,
+                         u_execution_cluster.u_execution_lane0.issue0_q.pc,
+                         u_execution_cluster.u_execution_lane0.issue0_q.uop_id.epoch,
+                         u_execution_cluster.u_execution_lane0.issue0_q.uop_id.rob_tag,
+                         u_execution_cluster.u_execution_lane0.issue0_q_is_store,
+                         u_execution_cluster.u_execution_lane0.issue0_q.src1_ready,
+                         u_execution_cluster.u_execution_lane0.issue0_q.src1_id.epoch,
+                         u_execution_cluster.u_execution_lane0.issue0_q.src1_id.rob_tag);
+                $display("  muldiv_hold=%b lane0_result_stall=%b store_data_wake0=%b store_data_wake1=%b",
+                         u_execution_cluster.u_execution_lane0.muldiv_hold,
+                         u_execution_cluster.u_execution_lane0.lane0_result_stall,
+                         u_execution_cluster.u_execution_lane0.store_data_wake0,
+                         u_execution_cluster.u_execution_lane0.store_data_wake1);
+                $display("  MULDIV UNIT: is_mul=%b mul_wait_cnt=%0d mul_done=%b busy=%b",
+                         u_execution_cluster.u_execution_lane0.u_mul_div.is_mul,
+                         u_execution_cluster.u_execution_lane0.u_mul_div.mul_wait_cnt,
+                         u_execution_cluster.u_execution_lane0.u_mul_div.mul_done,
+                         u_execution_cluster.u_execution_lane0.u_mul_div.busy);
+                $display("----------------------------------------------------------");
+                $display("EXECUTION LANE 1:");
+                $display("  valid_q=%b pc=%x uop_id={ep:%0d,tag:%0d} store=%b src1_ready=%b src1_id={ep:%0d,tag:%0d}",
+                         u_execution_cluster.u_execution_lane1.valid_q,
+                         u_execution_cluster.u_execution_lane1.pc_q,
+                         u_execution_cluster.u_execution_lane1.uop_id_q.epoch,
+                         u_execution_cluster.u_execution_lane1.uop_id_q.rob_tag,
+                         u_execution_cluster.u_execution_lane1.valid_q_is_store,
+                         u_execution_cluster.u_execution_lane1.src1_ready_q,
+                         u_execution_cluster.u_execution_lane1.src1_id_q.epoch,
+                         u_execution_cluster.u_execution_lane1.src1_id_q.rob_tag);
+                $display("  result_stall=%b store_data_wake0=%b store_data_wake1=%b",
+                         u_execution_cluster.u_execution_lane1.result_stall,
+                         u_execution_cluster.u_execution_lane1.store_data_wake0,
+                         u_execution_cluster.u_execution_lane1.store_data_wake1);
+                $display("----------------------------------------------------------");
+                $display("DISPATCH QUEUE (IQ): occupancy=%0d full=%b block=%b",
+                         u_ooo_backend.u_scheduler.u_dispatch_queue.occupancy,
+                         u_ooo_backend.u_scheduler.u_dispatch_queue.occupancy == 8,
+                         perf_issue_queue_block);
+                for (int q = 0; q < 8; q = q + 1) begin
+                    if (u_ooo_backend.u_scheduler.u_dispatch_queue.valid[q]) begin
+                        $display("  IQ[%0d]: pc=%x uop_id={ep:%0d,tag:%0d} src0_r=%b src1_r=%b slot_rdy=%b wd=%0d we=%0d ld_st=%b",
+                                 q, u_ooo_backend.u_scheduler.u_dispatch_queue.pc[q],
+                                 u_ooo_backend.u_scheduler.u_dispatch_queue.uop_id[q].epoch,
+                                 u_ooo_backend.u_scheduler.u_dispatch_queue.uop_id[q].rob_tag,
+                                 u_ooo_backend.u_scheduler.u_dispatch_queue.src0_ready_eff[q],
+                                 u_ooo_backend.u_scheduler.u_dispatch_queue.src1_ready_eff[q],
+                                 u_ooo_backend.u_scheduler.u_dispatch_queue.slot_ready[q],
+                                 u_ooo_backend.u_scheduler.u_dispatch_queue.wd_sel[q],
+                                 u_ooo_backend.u_scheduler.u_dispatch_queue.ram_we[q],
+                                 u_ooo_backend.u_scheduler.u_dispatch_queue.is_ld_st[q]);
+                    end
+                end
+                $display("----------------------------------------------------------");
+                $display("STORE QUEUE (SQ): occupancy=%0d", u_load_store_unit.u_store_queue.count);
+                for (int s = 0; s < 4; s = s + 1) begin
+                    if (s < u_load_store_unit.u_store_queue.count) begin
+                        $display("  SQ[%0d]: pc=%x uop_id={ep:%0d,tag:%0d} data_ready=%b data_src_id={ep:%0d,tag:%0d} committed=%b addr=%x data=%x",
+                                 s, u_load_store_unit.u_store_queue.entries[s].pc,
+                                 u_load_store_unit.u_store_queue.entries[s].uop_id.epoch,
+                                 u_load_store_unit.u_store_queue.entries[s].uop_id.rob_tag,
+                                 u_load_store_unit.u_store_queue.entries[s].store_data_ready,
+                                 u_load_store_unit.u_store_queue.entries[s].store_data_src_id.epoch,
+                                 u_load_store_unit.u_store_queue.entries[s].store_data_src_id.rob_tag,
+                                 u_load_store_unit.u_store_queue.committed[s],
+                                 u_load_store_unit.u_store_queue.entries[s].address,
+                                 u_load_store_unit.u_store_queue.entries[s].store_data);
+                    end
+                end
+                $display("----------------------------------------------------------");
+                $display("LOAD STORE UNIT: ldst_suspend=%b ldst1_suspend=%b lq_occ=%0d sq_occ=%0d sb_occ=%0d",
+                         u_load_store_unit.ldst_suspend, u_load_store_unit.ldst1_suspend,
+                         u_load_store_unit.lq_occupancy, u_load_store_unit.sq_occupancy, u_load_store_unit.sb_occupancy);
+                $display("COMPLETIONS: comp0_valid=%b comp0_id={ep:%0d,tag:%0d} comp1_valid=%b comp1_id={ep:%0d,tag:%0d}",
+                         store_data_complete0.valid, store_data_complete0.uop_id.epoch, store_data_complete0.uop_id.rob_tag,
+                         store_data_complete1.valid, store_data_complete1.uop_id.epoch, store_data_complete1.uop_id.rob_tag);
+                $display("==========================================================\n");
+            end
+        end
+    end
 `endif
 
 `ifdef SYNTHESIS

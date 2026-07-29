@@ -146,6 +146,19 @@ module tb_top( );
     wire [4 :0] debug_wb_rf_wnum  = soc_lite.u_cpu.u_mycpu.debug_wb_rf_rd;
     wire [31:0] debug_wb_rf_wdata = soc_lite.u_cpu.u_mycpu.debug_wb_rf_wdata;
 
+`ifdef DUAL_COMMIT_TRACE
+    // Two-wide simulation-only retirement stream.  Packets are registered in
+    // MyCpu so both slots remain stable across this checker's #2 sample delay.
+    wire        debug_trace0_valid = soc_lite.u_cpu.u_mycpu.debug_trace0_obs;
+    wire [31:0] debug_trace0_pc    = soc_lite.u_cpu.u_mycpu.debug_trace0_q.pc;
+    wire [ 4:0] debug_trace0_rd    = soc_lite.u_cpu.u_mycpu.debug_trace0_q.arch_rd;
+    wire [31:0] debug_trace0_data  = soc_lite.u_cpu.u_mycpu.debug_trace0_q.value;
+    wire        debug_trace1_valid = soc_lite.u_cpu.u_mycpu.debug_trace1_obs;
+    wire [31:0] debug_trace1_pc    = soc_lite.u_cpu.u_mycpu.debug_trace1_q.pc;
+    wire [ 4:0] debug_trace1_rd    = soc_lite.u_cpu.u_mycpu.debug_trace1_q.arch_rd;
+    wire [31:0] debug_trace1_data  = soc_lite.u_cpu.u_mycpu.debug_trace1_q.value;
+`endif
+
     wire [ 3:0] debug_wdata_we   = soc_lite.u_cpu.u_mycpu.debug_wdata_we;
     wire [31:0] debug_wdata_pc   = soc_lite.u_cpu.u_mycpu.debug_wdata_pc;
     wire [31:0] debug_wdata_addr = soc_lite.u_cpu.u_mycpu.debug_wdata_addr;
@@ -202,17 +215,58 @@ module tb_top( );
     reg [31:0] ref_bj_pc    ;
     reg [31:0] ref_bj_target;
 
+    reg debug_wb_err;
+
+`ifdef DUAL_COMMIT_TRACE
+    // Consume exactly one valid Golden Register-Write record and compare it
+    // with one architectural commit.  Blocking assignments are intentional:
+    // two calls in one cycle must consume two consecutive Golden records.
+    task automatic check_one_reg_commit;
+        input [31:0] dut_pc;
+        input [ 4:0] dut_rd;
+        input [31:0] dut_wdata;
+        begin
+            trace_cmp_flag = 1'b0;
+            while (!trace_cmp_flag && !($feof(trace_ref))) begin
+                $fscanf(trace_ref, "%h %h %h %h", trace_cmp_flag,
+                        ref_wb_pc, ref_wb_rf_wnum, ref_wb_rf_wdata);
+            end
+
+            if (!trace_cmp_flag) begin
+                $display("[TRACE FATAL] Golden register-write trace ended before DUT commit at PC=0x%8h", dut_pc);
+                debug_wb_err = 1'b1;
+                $fatal(1, "[TRACE FATAL] Golden register-write trace exhausted!");
+            end else if ((dut_pc !== ref_wb_pc) ||
+                         (dut_rd !== ref_wb_rf_wnum) ||
+                         (dut_wdata !== ref_wb_rf_wdata)) begin
+                $display("--------------------------------------------------------------");
+                $display("[%t] Error!!! - Register Write", $time);
+                $display("    reference: PC = 0x%8h, wb_rf_wnum = 0x%2h, wb_rf_wdata = 0x%8h",
+                         ref_wb_pc, ref_wb_rf_wnum, ref_wb_rf_wdata);
+                $display("    mycpu    : PC = 0x%8h, wb_rf_wnum = 0x%2h, wb_rf_wdata = 0x%8h",
+                         dut_pc, dut_rd, dut_wdata);
+                $display("--------------------------------------------------------------");
+                debug_wb_err = 1'b1;
+                #40;
+                $finish;
+            end
+        end
+    endtask
+`endif
+
     reg  resetn_r;
     wire first_rd = !resetn_r & resetn;
     always @(posedge soc_clk) begin
         resetn_r <= resetn;
 
+`ifndef DUAL_COMMIT_TRACE
         if (first_rd || |debug_wb_rf_we && debug_wb_rf_wnum!=5'd0 && !debug_end && `CONFREG_OPEN_TRACE) begin
             trace_cmp_flag = 1'b0;
             while (!trace_cmp_flag && !($feof(trace_ref)))
                 $fscanf(trace_ref, "%h %h %h %h", trace_cmp_flag,
                         ref_wb_pc, ref_wb_rf_wnum, ref_wb_rf_wdata);
         end
+`endif
 
         if (first_rd || |debug_wdata_we && !debug_end && `CONFREG_OPEN_TRACE) begin
             trace_cmp_wdata_flag = 1'b0;
@@ -248,12 +302,22 @@ module tb_top( );
                                    ref_wdata[7 : 0] & {8{  ref_wdata_we[0]}}};
 
     //compare result in rsing edge 
-    reg debug_wb_err;
     always @(posedge soc_clk) begin
         #2;
         if(!resetn) begin
             debug_wb_err <= 1'b0;
         end else begin
+`ifdef DUAL_COMMIT_TRACE
+            // Architectural order is mandatory: commit0 is older than commit1.
+            if (!debug_end && `CONFREG_OPEN_TRACE) begin
+                if (debug_trace0_valid)
+                    check_one_reg_commit(debug_trace0_pc, debug_trace0_rd,
+                                         debug_trace0_data);
+                if (debug_trace1_valid)
+                    check_one_reg_commit(debug_trace1_pc, debug_trace1_rd,
+                                         debug_trace1_data);
+            end
+`else
             if (|debug_wb_rf_we && debug_wb_rf_wnum!=5'd0 && !debug_end && `CONFREG_OPEN_TRACE) begin
                 if (  (debug_wb_pc!==ref_wb_pc) || (debug_wb_rf_wnum!==ref_wb_rf_wnum)
                     ||(debug_wb_rf_wdata_v!==ref_wb_rf_wdata_v) ) begin
@@ -269,6 +333,7 @@ module tb_top( );
                     $finish;
                 end
             end
+`endif
 
             if (|debug_wdata_we && !debug_end && `CONFREG_OPEN_TRACE) begin
                 if (  (debug_wdata_pc!==ref_wdata_pc) || (debug_wdata_addr!==ref_wdata_addr)
@@ -453,7 +518,15 @@ module tb_top( );
 
     //test end
     wire global_err = debug_wb_err || (err_count!=8'd0);
+`ifdef DUAL_COMMIT_TRACE
+    // Do not collapse the retirement pair when detecting the architectural
+    // end marker: END_PC may be in the younger commit1 slot.
+    wire trace_end_pc = (debug_trace0_valid && (debug_trace0_pc == `END_PC)) ||
+                        (debug_trace1_valid && (debug_trace1_pc == `END_PC));
+    wire test_end = trace_end_pc || (uart_display && uart_data==8'hff);
+`else
     wire test_end = (debug_wb_pc==`END_PC) || (uart_display && uart_data==8'hff);
+`endif
     always @(posedge soc_clk) begin
         if (!resetn) begin
             debug_end <= 1'b0;

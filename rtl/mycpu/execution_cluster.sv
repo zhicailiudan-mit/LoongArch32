@@ -23,6 +23,8 @@ module ExecutionCluster (
 
     input  completion_t           store_data_complete0,
     input  completion_t           store_data_complete1,
+    input  commit_t               store_data_commit0,
+    input  commit_t               store_data_commit1,
 
     input  logic                  issue0_valid,
     input  logic                  issue0_fire,
@@ -62,6 +64,8 @@ module ExecutionCluster (
         .recover_id         (recover_id),
         .store_data_complete0(store_data_complete0),
         .store_data_complete1(store_data_complete1),
+        .store_data_commit0  (store_data_commit0),
+        .store_data_commit1  (store_data_commit1),
         
         .issue0_valid   (issue0_valid),
         .issue0_fire    (issue0_fire),
@@ -92,6 +96,8 @@ module ExecutionCluster (
         .recover_id         (recover_id),
         .store_data_complete0(store_data_complete0),
         .store_data_complete1(store_data_complete1),
+        .store_data_commit0  (store_data_commit0),
+        .store_data_commit1  (store_data_commit1),
         .result_stall       (lane1_result_stall),
         .issue_ready        (lane1_ready),
         .issue_valid        (issue1_fire),

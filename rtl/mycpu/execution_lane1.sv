@@ -15,6 +15,8 @@ module ExecutionLane1 (
     input  uop_id_t                 recover_id,
     input  completion_t             store_data_complete0,
     input  completion_t             store_data_complete1,
+    input  commit_t                 store_data_commit0,
+    input  commit_t                 store_data_commit1,
     input  logic                    result_stall,
     output logic                    issue_ready,
     input  logic                    issue_valid,
@@ -94,12 +96,31 @@ module ExecutionLane1 (
         uop_id_equal(store_data_complete1.uop_id,
                      src1_id_q);
 
+    wire store_data_commit_wake0 =
+        valid_q_is_store &&
+        !src1_ready_q &&
+        store_data_commit0.valid &&
+        store_data_commit0.reg_write &&
+        uop_id_equal(store_data_commit0.uop_id,
+                     src1_id_q);
+
+    wire store_data_commit_wake1 =
+        valid_q_is_store &&
+        !src1_ready_q &&
+        store_data_commit1.valid &&
+        store_data_commit1.reg_write &&
+        uop_id_equal(store_data_commit1.uop_id,
+                     src1_id_q);
+
     wire store_data_wake =
-        store_data_wake0 || store_data_wake1;
+        store_data_wake0 || store_data_wake1 ||
+        store_data_commit_wake0 || store_data_commit_wake1;
 
     wire [31:0] store_data_wake_value =
         store_data_wake0 ? store_data_complete0.value :
-                           store_data_complete1.value;
+        store_data_wake1 ? store_data_complete1.value :
+        store_data_commit_wake0 ? store_data_commit0.value :
+                                  store_data_commit1.value;
 
     assign issue_ready = !valid_q || result_fire;
 
