@@ -245,10 +245,6 @@ module DCache (
     reg [63:0] ord_full_block_cnt;
     reg [ 2:0] ord_max_occupancy;
 
-`ifndef ENABLE_DCACHE_NEXTLINE_PREFETCH
-`define ENABLE_DCACHE_NEXTLINE_PREFETCH
-`endif
-
 `ifdef ENABLE_DCACHE_NEXTLINE_PREFETCH
     reg [1:0]  pf_confidence;         // 2-bit saturating stream confidence counter (0..3), threshold >= 2
     reg        pf_last_demand_valid;
