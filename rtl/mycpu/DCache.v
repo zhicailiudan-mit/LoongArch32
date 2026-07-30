@@ -267,18 +267,23 @@ module DCache (
 `ifndef SYNTHESIS
     reg [63:0] pf_candidate_cnt;
     reg [63:0] pf_pending_overwrite_cnt;
-    reg [63:0] pf_launch_cnt;
+    reg [63:0] pf_tag_launch_cnt;
     reg [63:0] pf_tag_hit_redundant_cnt;
+    reg [63:0] pf_tag_miss_cnt;
+    reg [63:0] pf_bus_launch_cnt;
+    reg [63:0] pf_cancel_cnt;
     reg [63:0] pf_fill_complete_cnt;
     reg [63:0] pf_useful_hit_cnt;
     reg [63:0] pf_useless_evict_cnt;
     reg [63:0] pf_demand_merge_imm_cnt;
     reg [63:0] pf_demand_merge_wait_cnt;
     reg [63:0] pf_blocked_demand_cnt;
-    reg [63:0] pf_blocked_store_cnt;
+    reg [63:0] pf_blocked_req_fifo_cnt;
     reg [63:0] pf_blocked_mshr_cnt;
-    reg [63:0] pf_cross_4k_cnt;
-    reg [63:0] pf_uncached_filtered_cnt;
+    reg [63:0] pf_blocked_store_array_cnt;
+    reg [63:0] pf_blocked_write_bus_cnt;
+    reg [63:0] pf_blocked_maint_cnt;
+    reg [63:0] pf_active_cycles_cnt;
 
     reg [`CACHE_BLK_NUM-1:0] pf_line_way0;
     reg [`CACHE_BLK_NUM-1:0] pf_line_way1;
@@ -655,12 +660,6 @@ module DCache (
                       !maint_active &&
                       !maint_valid;
 
-`ifdef ENABLE_DCACHE_NEXTLINE_PREFETCH
-    wire pf_launch = pf_pending_valid && cache_idle;
-`else
-    wire pf_launch = 1'b0;
-`endif
-
     wire demand_observe = read_accept && !incoming_r_uncached;
     wire [26:0] curr_demand_line = data_addr[31:5];
     wire [26:0] next_demand_line = curr_demand_line + 27'd1;
@@ -669,6 +668,8 @@ module DCache (
     wire        cand_same_4k     = (curr_line_addr[31:12] == next_line_addr[31:12]);
     wire        cand_uncached    = is_uncached_request(next_line_addr, 1'b1);
     wire        cand_pass        = cand_same_4k && !cand_uncached;
+
+    wire demand_line_changed = demand_observe && (!pf_last_demand_valid || (curr_demand_line != pf_last_demand_line));
 
     reg [1:0] pf_confidence_next;
     always @(*) begin
@@ -686,6 +687,34 @@ module DCache (
         end
     end
 
+    wire pf_pending_create = demand_observe && demand_line_changed && cand_pass && (pf_confidence_next >= 2'd2);
+
+    wire pf_tag_launch_safe =
+        pf_pending_valid &&
+        (r_state == R_IDLE) &&
+        (w_state == W_IDLE) &&
+        (req_fifo_count == 0) &&
+        !read_accept &&
+        !(|data_ren) &&
+        !replay_pending &&
+        !same_wait_any &&
+        !probe_checking_r &&
+        !mshr_valid &&
+        !maint_active &&
+        !maint_valid &&
+        !refill_commit &&
+        !store_tag_launch &&
+        !store_update_launch &&
+        !store_tag_pending;
+
+`ifdef ENABLE_DCACHE_NEXTLINE_PREFETCH
+    wire pf_launch = pf_tag_launch_safe;
+`else
+    wire pf_launch = 1'b0;
+`endif
+
+    wire pf_tag_launch = pf_launch;
+
 `ifdef ENABLE_DCACHE_NEXTLINE_PREFETCH
     always @(posedge cpu_clk or negedge cpu_rstn) begin
         if (!cpu_rstn) begin
@@ -696,11 +725,18 @@ module DCache (
             pf_pending_line      <= 27'd0;
         end else begin
             if (demand_observe) begin
-                pf_confidence        <= pf_confidence_next;
-                pf_last_demand_valid <= 1'b1;
-                pf_last_demand_line  <= curr_demand_line;
+                if (demand_line_changed) begin
+                    pf_confidence        <= pf_confidence_next;
+                    pf_last_demand_valid <= 1'b1;
+                    pf_last_demand_line  <= curr_demand_line;
+                end
 
-                if (cand_pass && (pf_confidence_next >= 2'd2)) begin
+                if (pf_pending_create) begin
+`ifndef SYNTHESIS
+                    if (pf_pending_valid && (pf_pending_line != next_demand_line))
+                        pf_pending_overwrite_cnt <= pf_pending_overwrite_cnt + 64'd1;
+                    pf_candidate_cnt <= pf_candidate_cnt + 64'd1;
+`endif
                     pf_pending_valid <= 1'b1;
                     pf_pending_line  <= next_demand_line;
                 end else if (curr_demand_line == pf_pending_line) begin
@@ -708,7 +744,10 @@ module DCache (
                 end
             end
 
-            if (pf_launch) begin
+            if (pf_tag_launch) begin
+`ifndef SYNTHESIS
+                pf_tag_launch_cnt <= pf_tag_launch_cnt + 64'd1;
+`endif
                 pf_pending_valid <= 1'b0;
             end else if ((r_state == R_TAG_CHK) && r_hit && req_is_prefetch_r) begin
                 pf_pending_valid <= 1'b0;
@@ -810,6 +849,12 @@ module DCache (
         end
     end
 
+    wire pf_demand_pending = (req_fifo_count != 0) || read_accept || (|data_ren) || replay_pending || maint_valid;
+    wire external_read_fire = (r_state == R_RD_MEM) && dev_rrdy && dev_widle && (!mshr_is_prefetch || !pf_demand_pending);
+    wire pf_waiting_for_bus = mshr_valid && mshr_is_prefetch && (r_state == R_RD_MEM);
+    wire pf_cancel_before_bus = pf_waiting_for_bus && pf_demand_pending && !external_read_fire;
+    wire pf_bus_launch_fire = (r_state == R_RD_MEM) && mshr_is_prefetch && external_read_fire;
+
     // =========================================================
     // 3. DCache 读状态机 (Read FSM) - 流水化响应
     // =========================================================
@@ -853,7 +898,14 @@ module DCache (
                 end
             end
 
-            R_RD_MEM:   r_nstat = (dev_rrdy && dev_widle) ? R_REFILL : R_RD_MEM;
+            R_RD_MEM: begin
+                if (mshr_is_prefetch && pf_demand_pending && !external_read_fire)
+                    r_nstat = R_IDLE;
+                else if (dev_rrdy && dev_widle)
+                    r_nstat = R_REFILL;
+                else
+                    r_nstat = R_RD_MEM;
+            end
             R_REFILL:   r_nstat = (dev_rvalid && recv_cnt == LINE_LAST_WORD) ?
                                   (req_fifo_start ? R_TAG_CHK : R_IDLE) : R_REFILL;
             
@@ -956,7 +1008,16 @@ module DCache (
             same_wait_addr[2]       <= 32'h0;
             same_wait_addr[3]       <= 32'h0;
         end else begin
-            if ((r_state == R_TAG_CHK) && !r_hit && !mshr_valid) begin
+            if (pf_cancel_before_bus) begin
+                mshr_valid              <= 1'b0;
+                mshr_is_prefetch        <= 1'b0;
+                mshr_critical_done      <= 1'b0;
+                refill_word_valid_mask  <= 8'h0;
+                req_is_prefetch_r       <= 1'b0;
+`ifndef SYNTHESIS
+                pf_cancel_cnt           <= pf_cancel_cnt + 64'd1;
+`endif
+            end else if ((r_state == R_TAG_CHK) && !r_hit && !mshr_valid) begin
                 refill_way_r           <= miss_way;
                 refill_raddr_r         <= req_raddr_r;
                 refill_ren_r           <= req_ren_r;
@@ -966,13 +1027,24 @@ module DCache (
                 mshr_slot_id           <= req_slot_r;
                 mshr_critical_done     <= 1'b0;
                 mshr_is_prefetch       <= req_is_prefetch_r;
+`ifndef SYNTHESIS
+                if (!req_is_prefetch_r)
+                    mshr_alloc_cnt     <= mshr_alloc_cnt + 64'd1;
+                else
+                    pf_tag_miss_cnt    <= pf_tag_miss_cnt + 64'd1;
+`endif
             end
 
             if (refill_commit) begin
                 mshr_valid         <= 1'b0;
                 mshr_critical_done <= 1'b0;
-`ifdef ENABLE_DCACHE_NEXTLINE_PREFETCH
                 mshr_is_prefetch   <= 1'b0;
+                req_is_prefetch_r  <= 1'b0;
+`ifndef SYNTHESIS
+                if (!mshr_is_prefetch)
+                    mshr_complete_cnt <= mshr_complete_cnt + 64'd1;
+                else
+                    pf_fill_complete_cnt <= pf_fill_complete_cnt + 64'd1;
 `endif
             end
 
@@ -993,10 +1065,16 @@ module DCache (
             if (hur_probe_result) begin
                 if (same_refill_line) begin
                     if (word_available_now) begin
+`ifndef SYNTHESIS
+                        if (mshr_is_prefetch) pf_demand_merge_imm_cnt <= pf_demand_merge_imm_cnt + 64'd1;
+`endif
                     end else begin
                         same_wait_valid[req_slot_r] <= 1'b1;
                         same_wait_word[req_slot_r]  <= probe_word_index;
                         same_wait_addr[req_slot_r]  <= req_raddr_r;
+`ifndef SYNTHESIS
+                        if (mshr_is_prefetch) pf_demand_merge_wait_cnt <= pf_demand_merge_wait_cnt + 64'd1;
+`endif
                     end
                 end else if (!r_hit) begin
                     replay_pending      <= 1'b1;
@@ -1227,7 +1305,7 @@ module DCache (
         cpu_ren   = 4'h0;
         cpu_raddr = 32'h0;
         cpu_rburst = 1'b0;
-        if (r_state == R_RD_MEM && dev_rrdy && dev_widle) begin
+        if (r_state == R_RD_MEM && dev_rrdy && dev_widle && (!mshr_is_prefetch || !pf_demand_pending)) begin
             cpu_ren   = 4'b1111;
             cpu_raddr = {refill_raddr_r[31:2], 2'b00};
             cpu_rburst = 1'b1;
@@ -1682,24 +1760,50 @@ module DCache (
                         2'b00: begin
                             line_enabled0[maint_index_r] <= 1'b0;
                             line_enabled1[maint_index_r] <= 1'b0;
+`ifndef SYNTHESIS
+                            pf_line_way0[maint_index_r] <= 1'b0;
+                            pf_line_way1[maint_index_r] <= 1'b0;
+`endif
                         end
                         2'b01: begin
                             line_enabled0[maint_index_r] <= 1'b0;
                             line_enabled1[maint_index_r] <= 1'b0;
+`ifndef SYNTHESIS
+                            pf_line_way0[maint_index_r] <= 1'b0;
+                            pf_line_way1[maint_index_r] <= 1'b0;
+`endif
                         end
                         2'b10: begin
-                            if (maint_hit0) line_enabled0[maint_index_r] <= 1'b0;
-                            if (maint_hit1) line_enabled1[maint_index_r] <= 1'b0;
+                            if (maint_hit0) begin
+                                line_enabled0[maint_index_r] <= 1'b0;
+`ifndef SYNTHESIS
+                                pf_line_way0[maint_index_r] <= 1'b0;
+`endif
+                            end
+                            if (maint_hit1) begin
+                                line_enabled1[maint_index_r] <= 1'b0;
+`ifndef SYNTHESIS
+                                pf_line_way1[maint_index_r] <= 1'b0;
+`endif
+                            end
                         end
                         2'b11: begin
                             line_enabled0 <= {`CACHE_BLK_NUM{1'b0}};
                             line_enabled1 <= {`CACHE_BLK_NUM{1'b0}};
+`ifndef SYNTHESIS
+                            pf_line_way0  <= {`CACHE_BLK_NUM{1'b0}};
+                            pf_line_way1  <= {`CACHE_BLK_NUM{1'b0}};
+`endif
                         end
                     endcase
                 end
                 M_ALL: begin
                     line_enabled0[maint_count] <= 1'b0;
                     line_enabled1[maint_count] <= 1'b0;
+`ifndef SYNTHESIS
+                    pf_line_way0[maint_count] <= 1'b0;
+                    pf_line_way1[maint_count] <= 1'b0;
+`endif
                     if (maint_count == `CACHE_BLK_NUM - 1) begin
                         maint_state <= M_DONE;
                     end else begin
@@ -1742,6 +1846,14 @@ module DCache (
                          !mshr_valid;
 
 `ifndef SYNTHESIS
+    initial begin
+`ifdef ENABLE_DCACHE_NEXTLINE_PREFETCH
+        $display("[DCACHE-PF-A3-CONFIG] enabled=1");
+`else
+        $display("[DCACHE-PF-A3-CONFIG] enabled=0");
+`endif
+    end
+
     always @(posedge cpu_clk or negedge cpu_rstn) begin
         if (!cpu_rstn) begin
             req_fifo_max_occ             <= 2'd0;
@@ -1791,6 +1903,27 @@ module DCache (
             interval_word_offset_cnt[5]  <= 64'd0;
             interval_word_offset_cnt[6]  <= 64'd0;
             interval_word_offset_cnt[7]  <= 64'd0;
+            pf_candidate_cnt             <= 64'd0;
+            pf_pending_overwrite_cnt     <= 64'd0;
+            pf_tag_launch_cnt            <= 64'd0;
+            pf_tag_hit_redundant_cnt     <= 64'd0;
+            pf_tag_miss_cnt              <= 64'd0;
+            pf_bus_launch_cnt            <= 64'd0;
+            pf_cancel_cnt                <= 64'd0;
+            pf_fill_complete_cnt         <= 64'd0;
+            pf_useful_hit_cnt            <= 64'd0;
+            pf_useless_evict_cnt         <= 64'd0;
+            pf_demand_merge_imm_cnt      <= 64'd0;
+            pf_demand_merge_wait_cnt     <= 64'd0;
+            pf_blocked_demand_cnt        <= 64'd0;
+            pf_blocked_req_fifo_cnt      <= 64'd0;
+            pf_blocked_mshr_cnt          <= 64'd0;
+            pf_blocked_store_array_cnt   <= 64'd0;
+            pf_blocked_write_bus_cnt     <= 64'd0;
+            pf_blocked_maint_cnt         <= 64'd0;
+            pf_active_cycles_cnt         <= 64'd0;
+            pf_line_way0                 <= {`CACHE_BLK_NUM{1'b0}};
+            pf_line_way1                 <= {`CACHE_BLK_NUM{1'b0}};
         end else begin
             hur_cycle_count <= hur_cycle_count + 64'd1;
 
@@ -1830,6 +1963,8 @@ module DCache (
                          (interval_would_wrong_line_cnt > 0) ? (interval_wrong_cycles_sum / interval_would_wrong_line_cnt) : 64'd0,
                          interval_word_offset_cnt[0], interval_word_offset_cnt[1], interval_word_offset_cnt[2], interval_word_offset_cnt[3],
                          interval_word_offset_cnt[4], interval_word_offset_cnt[5], interval_word_offset_cnt[6], interval_word_offset_cnt[7]);
+                $display("[DCACHE-PF-A3-STATS] cycles=%0d candidate=%0d overwrite=%0d tag_probe=%0d tag_hit=%0d tag_miss=%0d bus_launch=%0d cancel=%0d fill=%0d useful_hit=%0d merge_imm=%0d merge_wait=%0d useless_evict=%0d blocked_demand=%0d blocked_fifo=%0d blocked_mshr=%0d blocked_store=%0d blocked_bus=%0d blocked_maint=%0d active_cycles=%0d confidence=%0d pending=%0d",
+                         hur_cycle_count, pf_candidate_cnt, pf_pending_overwrite_cnt, pf_tag_launch_cnt, pf_tag_hit_redundant_cnt, pf_tag_miss_cnt, pf_bus_launch_cnt, pf_cancel_cnt, pf_fill_complete_cnt, pf_useful_hit_cnt, pf_demand_merge_imm_cnt, pf_demand_merge_wait_cnt, pf_useless_evict_cnt, pf_blocked_demand_cnt, pf_blocked_req_fifo_cnt, pf_blocked_mshr_cnt, pf_blocked_store_array_cnt, pf_blocked_write_bus_cnt, pf_blocked_maint_cnt, pf_active_cycles_cnt, pf_confidence, pf_pending_valid);
 
                 // Reset interval counters per 100k cycles
                 interval_demand_miss_cnt     <= 64'd0;
@@ -1851,7 +1986,7 @@ module DCache (
             end
 
             // Phase A2 Observational Model Tracking Logic
-            if ((r_state == R_TAG_CHK) && !r_hit && !r_uncached && !mshr_valid) begin
+            if ((r_state == R_TAG_CHK) && !r_hit && !r_uncached && !mshr_valid && !req_is_prefetch_r) begin
                 interval_demand_miss_cnt <= interval_demand_miss_cnt + 64'd1;
 
                 // Track demand word offset distribution
@@ -1919,14 +2054,63 @@ module DCache (
                     {63'd0, same_wait_beat_match[2]} +
                     {63'd0, same_wait_beat_match[3]};
 
-            if ((r_state == R_TAG_CHK) && !r_hit && !mshr_valid)
+            if ((r_state == R_TAG_CHK) && !r_hit && !mshr_valid && !req_is_prefetch_r)
                 mshr_alloc_cnt <= mshr_alloc_cnt + 64'd1;
-            if (refill_commit)
+            if (refill_commit && !mshr_is_prefetch)
                 mshr_complete_cnt <= mshr_complete_cnt + 64'd1;
-            if (mshr_valid)
+            if (mshr_valid && !mshr_is_prefetch)
                 mshr_active_cycles_cnt <= mshr_active_cycles_cnt + 64'd1;
-            if (mshr_valid && !mshr_critical_done)
+            if (mshr_valid && !mshr_is_prefetch && !mshr_critical_done)
                 mshr_critical_wait_cycles_cnt <= mshr_critical_wait_cycles_cnt + 64'd1;
+
+            if (pf_bus_launch_fire)
+                pf_bus_launch_cnt <= pf_bus_launch_cnt + 64'd1;
+
+            if (refill_commit) begin
+                if (mshr_is_prefetch) begin
+                    if (refill_way_r == 1'b0) pf_line_way0[refill_index_r] <= 1'b1;
+                    else                      pf_line_way1[refill_index_r] <= 1'b1;
+                end else begin
+                    if (refill_way_r == 1'b0) begin
+                        if (pf_line_way0[refill_index_r]) pf_useless_evict_cnt <= pf_useless_evict_cnt + 64'd1;
+                        pf_line_way0[refill_index_r] <= 1'b0;
+                    end else begin
+                        if (pf_line_way1[refill_index_r]) pf_useless_evict_cnt <= pf_useless_evict_cnt + 64'd1;
+                        pf_line_way1[refill_index_r] <= 1'b0;
+                    end
+                end
+            end
+
+            if (hit_r) begin
+                if (r_hit0 && pf_line_way0[r_cache_index]) begin
+                    pf_useful_hit_cnt <= pf_useful_hit_cnt + 64'd1;
+                    pf_line_way0[r_cache_index] <= 1'b0;
+                end else if (r_hit1 && pf_line_way1[r_cache_index]) begin
+                    pf_useful_hit_cnt <= pf_useful_hit_cnt + 64'd1;
+                    pf_line_way1[r_cache_index] <= 1'b0;
+                end
+            end
+
+            if (pf_pending_valid && !pf_tag_launch) begin
+                if (read_accept || (|data_ren)) begin
+                    pf_blocked_demand_cnt <= pf_blocked_demand_cnt + 64'd1;
+                end else if ((req_fifo_count != 0) || replay_pending || same_wait_any || probe_checking_r) begin
+                    pf_blocked_req_fifo_cnt <= pf_blocked_req_fifo_cnt + 64'd1;
+                end else if (mshr_valid || (r_state != R_IDLE)) begin
+                    pf_blocked_mshr_cnt <= pf_blocked_mshr_cnt + 64'd1;
+                end else if (maint_active || maint_valid) begin
+                    pf_blocked_maint_cnt <= pf_blocked_maint_cnt + 64'd1;
+                end else if (store_tag_launch || store_update_launch || store_tag_pending || (w_state != W_IDLE)) begin
+                    pf_blocked_store_array_cnt <= pf_blocked_store_array_cnt + 64'd1;
+                end else if (!dev_widle) begin
+                    pf_blocked_write_bus_cnt <= pf_blocked_write_bus_cnt + 64'd1;
+                end
+            end
+
+            if (mshr_valid && mshr_is_prefetch) begin
+                pf_active_cycles_cnt <= pf_active_cycles_cnt + 64'd1;
+            end
+
             if (hur_probe_can_launch && req_fifo_start &&
                 !mshr_critical_done)
                 hum_precritical_probe_cnt <= hum_precritical_probe_cnt + 64'd1;
