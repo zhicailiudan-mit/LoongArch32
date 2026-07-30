@@ -4,6 +4,7 @@
 module mycpu_top(
     input  wire        cpu_rstn,
     input  wire        cpu_clk,
+    input  wire        sram_rstn,
     input  wire        sram_uclk,
 
     // BUS Interface 0 (SRAM)
@@ -191,6 +192,7 @@ module mycpu_top(
     sram_bus_master u_sram_bus (
         .cpu_rstn       (cpu_rstn      ),
         .cpu_clk        (cpu_clk       ),
+        .sram_rstn      (sram_rstn     ),
         .sram_uclk      (sram_uclk     ),
         // ICache Interface
         .ic_dev_rrdy    (dev2ic_rrdy   ),

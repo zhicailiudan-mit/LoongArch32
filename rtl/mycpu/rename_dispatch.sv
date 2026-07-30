@@ -97,29 +97,20 @@ module RenameDispatch (
     assign rename_pop_count = dispatch1_fire ? 2'd2 :
                               dispatch0_fire ? 2'd1 : 2'd0;
 
+    // Same-cycle execution completion is intentionally not folded into the
+    // enqueue packet.  DispatchQueue holds a local registered completion copy
+    // which makes a colliding consumer ready in its first issuable cycle.
     assign dispatch_src_ready[0][0] = !source_used[0] || !rat_pending[0] ||
-                                      rob_query_done[0] || complete[0].valid &&
-                                      uop_id_equal(complete[0].uop_id, rat_id[0]) ||
-                                      complete[1].valid &&
-                                      uop_id_equal(complete[1].uop_id, rat_id[0]) ||
+                                      rob_query_done[0] ||
                                       commit0_bypass[0] || commit1_bypass[0];
     assign dispatch_src_ready[0][1] = !source_used[1] || !rat_pending[1] ||
-                                      rob_query_done[1] || complete[0].valid &&
-                                      uop_id_equal(complete[0].uop_id, rat_id[1]) ||
-                                      complete[1].valid &&
-                                      uop_id_equal(complete[1].uop_id, rat_id[1]) ||
+                                      rob_query_done[1] ||
                                       commit0_bypass[1] || commit1_bypass[1];
     assign dispatch_src_ready[1][0] = !source_used[2] || !rat_pending[2] ||
-                                      rob_query_done[2] || complete[0].valid &&
-                                      uop_id_equal(complete[0].uop_id, rat_id[2]) ||
-                                      complete[1].valid &&
-                                      uop_id_equal(complete[1].uop_id, rat_id[2]) ||
+                                      rob_query_done[2] ||
                                       commit0_bypass[2] || commit1_bypass[2];
     assign dispatch_src_ready[1][1] = !source_used[3] || !rat_pending[3] ||
-                                      rob_query_done[3] || complete[0].valid &&
-                                      uop_id_equal(complete[0].uop_id, rat_id[3]) ||
-                                      complete[1].valid &&
-                                      uop_id_equal(complete[1].uop_id, rat_id[3]) ||
+                                      rob_query_done[3] ||
                                       commit0_bypass[3] || commit1_bypass[3];
 
     RenameBundle u_DECODE_RENAME (

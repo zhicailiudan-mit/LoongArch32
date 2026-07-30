@@ -33,6 +33,7 @@ module Scheduler (
 
     input  completion_t              complete0,
     input  completion_t              complete1,
+    input  completion_t              system_complete,
     input  commit_t                  commit0,
     input  commit_t                  commit1,
 
@@ -56,6 +57,26 @@ module Scheduler (
     output logic                     issue1_fire,
     output issue_uop_t               issue1,
     output logic [3:0]               occupancy,
+
+    // Store Reservation Interface (to LoadStoreUnit / StoreQueue)
+    output logic                     reserve0_valid,
+    input  logic                     reserve0_ready,
+    output uop_id_t                  reserve0_uop_id,
+    output logic [31:0]              reserve0_pc,
+    output logic [3:0]               reserve0_store_mask,
+    output logic                     reserve0_src1_ready,
+    output logic [31:0]              reserve0_src1_value,
+    output uop_id_t                  reserve0_src1_id,
+
+    output logic                     reserve1_valid,
+    input  logic                     reserve1_ready,
+    output uop_id_t                  reserve1_uop_id,
+    output logic [31:0]              reserve1_pc,
+    output logic [3:0]               reserve1_store_mask,
+    output logic                     reserve1_src1_ready,
+    output logic [31:0]              reserve1_src1_value,
+    output uop_id_t                  reserve1_src1_id,
+
     output logic                     perf_true_source_wait,
     output logic                     perf_source_wait_dep_load,
     output logic                     perf_source_wait_dep_muldiv,
@@ -101,47 +122,82 @@ module Scheduler (
     end
 
     wire dq_is_system = (dq_issue[0].system_op != SYS_NONE);
+    wire no_sys_active = !system_inflight && !dq_is_system;
     wire system_at_head = rob_head_valid &&
                           uop_id_equal(dq_issue[0].uop_id, rob_head_id);
 
-    // A lane0-selected ALU/MDU/LSU uop may execute on lane1 when lane0 is
-    // occupied. Branch and system operations retain their ordered lane0 path.
+    // A lane0-selected ALU/MDU operation may execute on lane1 when lane0 is
+    // occupied. Memory, Branch and system operations retain their ordered lane0 path.
     wire dq0_fast_eligible = !dq_issue[0].is_br_jmp &&
                              !dq_issue[0].is_call &&
                              !dq_issue[0].is_ret &&
                              !dq_issue[0].pred.taken &&
                              (dq_issue[0].system_op == SYS_NONE) &&
-                             (dq_issue[0].is_ld_st ||
-                              (dq_issue[0].result_sel == `WD_ALU));
-    wire steal_main_to_lane1 = dq_issue_valid[0] && !dq_is_system &&
+                             !dq_issue[0].is_ld_st &&
+                             (dq_issue[0].result_sel == `WD_ALU);
+    wire steal_main_to_lane1 = dq_issue_valid[0] && no_sys_active &&
                                !issue0_ready && issue1_ready &&
                                dq0_fast_eligible && !dq_issue_valid[1] &&
-                               !system_inflight &&
                                !flush;
+
+    wire dq0_is_store = dq_issue_valid[0] && no_sys_active &&
+                        dq_issue[0].is_ld_st && (dq_issue[0].store_mask != `RAM_WE_N);
+    wire dq1_is_store = dq_issue_valid[1] && no_sys_active &&
+                        dq_issue[1].is_ld_st && (dq_issue[1].store_mask != `RAM_WE_N);
+
+    wire issue0_base_valid = dq_issue_valid[0] && no_sys_active &&
+                             !steal_main_to_lane1;
+    wire issue1_base_valid = no_sys_active &&
+                             (steal_main_to_lane1 ? dq_issue_valid[0] :
+                                                   dq_issue_valid[1]);
+
+    // A reservation request is presented once the execution lane can accept
+    // the selected Store.  It intentionally does not depend on reserve*_ready:
+    // reserve_valid -> reserve_ready -> issue_fire is therefore acyclic, and
+    // a queue with exactly one free entry can still grant one of two Stores.
+    assign reserve0_valid = issue0_base_valid && issue0_ready && dq0_is_store;
+    assign reserve1_valid = issue1_base_valid && issue1_ready && dq1_is_store;
+
+    wire dq0_lsu_ready = issue0_ready && (!dq0_is_store || reserve0_ready);
+    wire dq1_lsu_ready = issue1_ready && (!dq1_is_store || reserve1_ready);
 
     assign dq_issue_ready[0] = dq_is_system ?
                                 (system_issue_ready && system_at_head &&
                                  !system_inflight) :
-                                ((steal_main_to_lane1 || issue0_ready) &&
+                                ((steal_main_to_lane1 || dq0_lsu_ready) &&
                                  !system_inflight);
-    assign dq_issue_ready[1] = issue1_ready && !flush &&
+    assign dq_issue_ready[1] = dq1_lsu_ready && !flush &&
                                 !system_inflight && !dq_is_system &&
                                 !steal_main_to_lane1;
 
     assign dispatch0_ready = dq_enq_ready[0];
     assign dispatch1_ready = dq_enq_ready[1];
-    assign issue0_valid = dq_issue_valid[0] && !dq_is_system &&
-                               !system_inflight && !steal_main_to_lane1;
+    assign issue0_valid = issue0_base_valid &&
+                          (!dq0_is_store || reserve0_ready);
     assign issue0_fire = issue0_valid && issue0_ready;
     assign system_issue_valid = dq_issue_valid[0] && dq_is_system &&
                                 system_at_head && !system_inflight;
     assign system_issue_fire = system_issue_valid && system_issue_ready;
-    assign issue1_valid = !system_inflight && !dq_is_system &&
-                          (steal_main_to_lane1 ? dq_issue_valid[0] :
-                                                dq_issue_valid[1]);
+    assign issue1_valid = issue1_base_valid &&
+                          (!dq1_is_store || reserve1_ready);
     assign issue1_fire = issue1_valid && issue1_ready;
     assign occupancy = dq_occupancy;
 
+    assign reserve0_uop_id = issue0.uop_id;
+    assign reserve0_pc = issue0.pc;
+    assign reserve0_store_mask = issue0.store_mask;
+    assign reserve0_src1_ready = issue0.src1_ready;
+    // Decouple store reservation src1_value from long same-cycle bypass chain;
+    // StoreQueue snoops completion/commit directly via its own input ports.
+    assign reserve0_src1_value = issue0.src1_ready ? issue0.src1_value : 32'h0;
+    assign reserve0_src1_id = issue0.src1_id;
+
+    assign reserve1_uop_id = issue1.uop_id;
+    assign reserve1_pc = issue1.pc;
+    assign reserve1_store_mask = issue1.store_mask;
+    assign reserve1_src1_ready = issue1.src1_ready;
+    assign reserve1_src1_value = issue1.src1_ready ? issue1.src1_value : 32'h0;
+    assign reserve1_src1_id = issue1.src1_id;
     DispatchQueue #(
         .RESOURCE_AWARE_PAIRING(1'b1),
         .BRANCH_AT_ROB_HEAD    (1'b0)
@@ -166,6 +222,7 @@ module Scheduler (
         .enq            (dq_enq),
         .enq_ready      (dq_enq_ready),
         .complete       (dq_complete),
+        .system_complete(system_complete),
         .commit         (dq_commit),
         .rob_head_valid (rob_head_valid),
         .rob_head_tag   (rob_head_tag),
@@ -179,5 +236,24 @@ module Scheduler (
     assign issue0 = dq_issue[0];
     assign system_issue = dq_issue[0];
     assign issue1 = steal_main_to_lane1 ? dq_issue[0] : dq_issue[1];
+
+`ifndef SYNTHESIS
+    always @(posedge clk) begin
+        if (rstn && !flush) begin
+            if (issue0_fire && dq0_is_store &&
+                !(reserve0_valid && reserve0_ready))
+                $fatal(1, "[SCHED-ASSERT] lane0 Store issued without SQ reservation");
+            if (issue1_fire && dq1_is_store &&
+                !(reserve1_valid && reserve1_ready))
+                $fatal(1, "[SCHED-ASSERT] lane1 Store issued without SQ reservation");
+            if ((reserve0_valid && reserve0_ready) !=
+                (issue0_fire && dq0_is_store))
+                $fatal(1, "[SCHED-ASSERT] lane0 Store issue/reservation lost atomicity");
+            if ((reserve1_valid && reserve1_ready) !=
+                (issue1_fire && dq1_is_store))
+                $fatal(1, "[SCHED-ASSERT] lane1 Store issue/reservation lost atomicity");
+        end
+    end
+`endif
 
 endmodule

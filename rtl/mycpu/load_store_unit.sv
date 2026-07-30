@@ -6,7 +6,12 @@ import cpu_types_pkg::*;
 // address generation together, but only one Load is admitted to the DCache
 // pipeline and only one Store is admitted to SQ in a cycle. This keeps the
 // externally visible memory path single-ported and age ordered.
-module LoadStoreUnit (
+module LoadStoreUnit #(
+    // Unit tests and legacy wrappers may still inject a fully formed Store at
+    // the AGU boundary.  The real CPU enables the persistent issue-time SQ
+    // reservation path and disables that legacy insertion path.
+    parameter bit DECOUPLED_STORE_RESERVATION = 1'b0
+) (
     input logic cpu_rstn, input logic cpu_clk,
     input logic flush,
     // Branch recovery flush is special: the resolving branch itself is an
@@ -46,12 +51,30 @@ module LoadStoreUnit (
     output logic store_line_alloc_valid,
     output logic [31:0] store_line_alloc_addr,
     output logic [`CACHE_BLK_SIZE-1:0] store_line_alloc_data,
-    output logic [`CACHE_BLK_LEN-1:0] store_line_alloc_word_mask
+    output logic [`CACHE_BLK_LEN-1:0] store_line_alloc_word_mask,
+    // Decoupled Reservation Ports (optional inputs for top-level scheduler connection)
+    input logic reserve0_valid,
+    output logic reserve0_ready,
+    input uop_id_t reserve0_uop_id,
+    input logic [31:0] reserve0_pc,
+    input logic [3:0] reserve0_store_mask,
+    input logic reserve0_src1_ready,
+    input logic [31:0] reserve0_src1_value,
+    input uop_id_t reserve0_src1_id,
+
+    input logic reserve1_valid,
+    output logic reserve1_ready,
+    input uop_id_t reserve1_uop_id,
+    input logic [31:0] reserve1_pc,
+    input logic [3:0] reserve1_store_mask,
+    input logic reserve1_src1_ready,
+    input logic [31:0] reserve1_src1_value,
+    input uop_id_t reserve1_src1_id
 );
     localparam integer LQ_DEPTH = 8;
     localparam integer SQ_DEPTH = 4;
     localparam integer SB_DEPTH = 4;
-    localparam integer STORE_SLOTS = SQ_DEPTH + SB_DEPTH + 2;
+    localparam integer STORE_SLOTS = SQ_DEPTH + SB_DEPTH;
 
     lsu_entry_t load_entry, store_entry, load1_entry, store1_entry,
                 store_release_entry;
@@ -92,16 +115,12 @@ module LoadStoreUnit (
     logic [STORE_SLOTS*32-1:0] order_data_flat;
     logic [STORE_SLOTS*`UOP_ID_W-1:0] order_uop_id_flat;
     logic [STORE_SLOTS*4*`UOP_ID_W-1:0] order_byte_uop_id_flat;
-    logic executing_store0_is_older;
-    logic executing_store1_is_older;
     logic load_blocked;
     logic [3:0] load_ren;
     logic [3:0] load_forward_mask;
     logic [31:0] load_forward_data;
     logic [4*`UOP_ID_W-1:0] load_forward_id_flat;
     logic load_forward_valid;
-    // L0/L1 load-order stage.  The wide SQ/SB search is completed before
-    // this register; the arbiter and DCache only see the registered result.
     logic load_l1_valid;
     lsu_entry_t load_l1_entry;
     logic load_l1_blocked;
@@ -123,6 +142,27 @@ module LoadStoreUnit (
     completion_t main_completion_next;
     integer order_i;
     integer order_byte;
+
+    // Address Update Signals for SQ
+    logic addr_update0_valid;
+    logic addr_update0_ack;
+    uop_id_t addr_update0_uop_id;
+    logic [31:0] addr_update0_address;
+    logic [3:0] addr_update0_store_wen;
+    logic addr_update0_unalign;
+    logic addr_update0_data_ready;
+    logic [31:0] addr_update0_data_value;
+    uop_id_t addr_update0_data_src_id;
+
+    logic addr_update1_valid;
+    logic addr_update1_ack;
+    uop_id_t addr_update1_uop_id;
+    logic [31:0] addr_update1_address;
+    logic [3:0] addr_update1_store_wen;
+    logic addr_update1_unalign;
+    logic addr_update1_data_ready;
+    logic [31:0] addr_update1_data_value;
+    uop_id_t addr_update1_data_src_id;
 
     // Full-line allocation is disabled in the correctness phase.
     assign store_line_alloc_valid = 1'b0;
@@ -196,27 +236,18 @@ module LoadStoreUnit (
     forward_candidate_t tree_stg3 [0:3][0:1];
     forward_candidate_t tree_winner [0:3];
 
-    // This block builds several unpacked forwarding-tree arrays.  XSim 2023.2
-    // may reschedule always_comb processes that both write and read such arrays
-    // indefinitely when the selected LQ entry changes.  It is ordinary
-    // combinational RTL, so use the equivalent explicit wildcard sensitivity.
     always @(*) begin
         load0_raw = execute_result.valid && execute_result.is_ld_st &&
                     !execute_result.ldst_unalign &&
                     (execute_result.store_mask == `RAM_WE_N);
         store0_raw = execute_result.valid && execute_result.is_ld_st &&
-                     !execute_result.ldst_unalign &&
                      (execute_result.store_mask != `RAM_WE_N);
         load1_raw = execute_result1.valid && execute_result1.is_ld_st &&
                     !execute_result1.ldst_unalign &&
                     (execute_result1.store_mask == `RAM_WE_N);
         store1_raw = execute_result1.valid && execute_result1.is_ld_st &&
-                     !execute_result1.ldst_unalign &&
                      (execute_result1.store_mask != `RAM_WE_N);
 
-        // Lane number is not an age guarantee once a stalled result is held.
-        // On a same-cycle conflict admit the older uop and hold the other
-        // execution result until the following cycle.
         load1_older = load0_raw && load1_raw &&
                       uop_is_younger(execute_result.uop_id,
                                      execute_result1.uop_id);
@@ -228,20 +259,50 @@ module LoadStoreUnit (
         store0_selected = store0_raw && (!store1_raw || !store1_older);
         store1_selected = store1_raw && (!store0_raw || store1_older);
 
-        // Dual ingress LSU: both execution lanes can submit Load/Store AGU results
-        // concurrently into LoadQueue and StoreQueue.
         load_valid = load0_raw;
         load1_valid = load1_raw;
-        store_valid = store0_raw;
-        store1_valid = store1_raw;
-        store0_accept = store0_raw && store_ready && !flush;
-        store1_accept = store1_raw && store1_ready && !flush;
-        // Stores complete at address/data generation once accepted by SQ.
+        store_valid = store0_raw && !execute_result.ldst_unalign;
+        store1_valid = store1_raw && !execute_result1.ldst_unalign;
+        store0_accept = !DECOUPLED_STORE_RESERVATION &&
+                        store0_raw && store_ready && !flush;
+        store1_accept = !DECOUPLED_STORE_RESERVATION &&
+                        store1_raw && store1_ready && !flush;
+
+        // Address update signals from AGU execution to StoreQueue
+        addr_update0_valid = store0_raw && !flush;
+        addr_update0_uop_id = execute_result.uop_id;
+        addr_update0_address = execute_result.alu_result;
+        addr_update0_store_wen = make_store_wen(execute_result.store_mask,
+                                                 execute_result.alu_result[1:0]);
+        addr_update0_unalign = execute_result.ldst_unalign;
+        addr_update0_data_ready = execute_result.store_data_ready;
+        addr_update0_data_value = execute_result.src1_value;
+        addr_update0_data_src_id = execute_result.store_data_src_id;
+
+        addr_update1_valid = store1_raw && !flush;
+        addr_update1_uop_id = execute_result1.uop_id;
+        addr_update1_address = execute_result1.alu_result;
+        addr_update1_store_wen = make_store_wen(execute_result1.store_mask,
+                                                 execute_result1.alu_result[1:0]);
+        addr_update1_unalign = execute_result1.ldst_unalign;
+        addr_update1_data_ready = execute_result1.store_data_ready;
+        addr_update1_data_value = execute_result1.src1_value;
+        addr_update1_data_src_id = execute_result1.store_data_src_id;
+
+        // In the CPU configuration a Store completes only after its previously
+        // reserved SQ entry acknowledges this address update.  The legacy
+        // accept term exists solely for direct LSU unit-test compatibility.
         direct_valid = execute_result.valid && !flush &&
                        (!execute_result.is_ld_st || execute_result.ldst_unalign ||
-                        store0_accept);
+                        (store0_raw &&
+                         (DECOUPLED_STORE_RESERVATION ? addr_update0_ack :
+                                                       store0_accept)));
         direct1_valid = execute_result1.valid && !flush &&
-                        (execute_result1.ldst_unalign || store1_accept);
+                        (execute_result1.ldst_unalign ||
+                         (store1_raw &&
+                          (DECOUPLED_STORE_RESERVATION ? addr_update1_ack :
+                                                        store1_accept)));
+
         load_entry = '0;
         load_entry.valid = load0_raw;
         load_entry.uop_id = execute_result.uop_id;
@@ -256,13 +317,13 @@ module LoadStoreUnit (
                                      execute_result.store_mask,
                                      execute_result.alu_result[1:0]);
         store_entry = '0;
-        store_entry.valid = store0_raw;
+        store_entry.valid = store0_raw && !execute_result.ldst_unalign;
         store_entry.uop_id = execute_result.uop_id;
         store_entry.pc = execute_result.pc;
         store_entry.address = execute_result.alu_result;
-        store_entry.store_data = store_data;
-        store_entry.store_wen = store_wen;
-        store_entry.store_data_ready = execute_result.store_data_ready;
+        store_entry.store_data = execute_result.src1_value;
+        store_entry.store_wen = execute_result.store_mask;
+        store_entry.store_data_ready = execute_result.store_data_ready || store0_accept;
         store_entry.store_data_src_id = execute_result.store_data_src_id;
         store_entry.reg_write = 1'b0;
         store_entry.arch_rd = 5'd0;
@@ -276,16 +337,13 @@ module LoadStoreUnit (
         load1_entry.reg_write = execute_result1.reg_write;
         load1_entry.arch_rd = execute_result1.arch_rd;
         store1_entry = '0;
-        store1_entry.valid = store1_raw;
+        store1_entry.valid = store1_raw && !execute_result1.ldst_unalign;
         store1_entry.uop_id = execute_result1.uop_id;
         store1_entry.pc = execute_result1.pc;
         store1_entry.address = execute_result1.alu_result;
-        store1_entry.store_wen = make_store_wen(execute_result1.store_mask,
-                                                execute_result1.alu_result[1:0]);
-        store1_entry.store_data = make_store_data(execute_result1.src1_value,
-                                                  execute_result1.store_mask,
-                                                  execute_result1.alu_result[1:0]);
-        store1_entry.store_data_ready = execute_result1.store_data_ready;
+        store1_entry.store_wen = execute_result1.store_mask;
+        store1_entry.store_data = execute_result1.src1_value;
+        store1_entry.store_data_ready = execute_result1.store_data_ready || store1_accept;
         store1_entry.store_data_src_id = execute_result1.store_data_src_id;
 
         load_accept_entry = (load1_raw && (!load0_raw || load1_older)) ? load1_entry : load_entry;
@@ -308,52 +366,21 @@ module LoadStoreUnit (
 
     end
 
-    // Ordering/forwarding operates on queue state and must not procedurally
-    // rewrite ingress payloads or direct completions.  Keeping those ownership
-    // domains in separate combinational processes cuts the event feedback path
-    // entries_flat -> load_head -> direct_completion -> arbiter -> load_pop.
     always @(*) begin
-        // A load waits only for older same-word stores.  StoreQueue also
-        // contains speculative younger stores; treating those as dependencies
-        // creates a circular wait because they cannot commit until this load
-        // retires.  StoreBuffer entries have already committed and are thus
-        // necessarily older than every live, unretired load.
         for (order_i = 0; order_i < SQ_DEPTH; order_i = order_i + 1)
             store_order_valid[order_i] = store_valid_vec[order_i] &&
                 !uop_is_younger(store_uop_id_flat[order_i*`UOP_ID_W +: `UOP_ID_W],
                                 load_head.uop_id);
-        // Include older Stores currently held at the execution boundary.
-        // Without these extra slots, a younger queued Load could issue in the
-        // cycle before those Stores become visible in SQ and observe stale
-        // DCache data.
-        executing_store0_is_older = store0_raw && load_head_valid &&
-            !uop_is_younger(store_entry.uop_id, load_head.uop_id);
-        executing_store1_is_older = store1_raw && load_head_valid &&
-            !uop_is_younger(store1_entry.uop_id, load_head.uop_id);
 
-        order_valid = {executing_store1_is_older, executing_store0_is_older,
-                       buffer_valid_vec, store_order_valid};
-        order_addr_ready = {executing_store1_is_older, executing_store0_is_older,
-                            {SB_DEPTH{1'b1}}, store_addr_ready_vec};
-        order_store_data_ready = {executing_store1_is_older ? store1_entry.store_data_ready : 1'b1,
-                                  executing_store0_is_older ? store_entry.store_data_ready : 1'b1,
-                                  {SB_DEPTH{1'b1}}, store_data_ready_vec};
-        order_addr_flat = {store1_entry.address, store_entry.address,
-                           buffer_addr_flat, store_addr_flat};
-        order_wen_flat = {store1_entry.store_wen, store_entry.store_wen,
-                          buffer_wen_flat, store_wen_flat};
-        order_data_flat = {store1_entry.store_data, store_entry.store_data,
-                           buffer_data_flat, store_data_flat};
-        order_uop_id_flat = {store1_entry.uop_id, store_entry.uop_id,
-                             buffer_uop_id_flat, store_uop_id_flat};
-        order_byte_uop_id_flat = {{4{store1_entry.uop_id}}, {4{store_entry.uop_id}},
-                                  buffer_byte_uop_id_flat,
-                                  store_byte_uop_id_flat};
+        order_valid = {buffer_valid_vec, store_order_valid};
+        order_addr_ready = {{SB_DEPTH{1'b1}}, store_addr_ready_vec};
+        order_store_data_ready = {{SB_DEPTH{1'b1}}, store_data_ready_vec};
+        order_addr_flat = {buffer_addr_flat, store_addr_flat};
+        order_wen_flat = {buffer_wen_flat, store_wen_flat};
+        order_data_flat = {buffer_data_flat, store_data_flat};
+        order_uop_id_flat = {buffer_uop_id_flat, store_uop_id_flat};
+        order_byte_uop_id_flat = {buffer_byte_uop_id_flat, store_byte_uop_id_flat};
 
-        // Merge the newest older store for each byte lane.  A complete
-        // coverage of the load mask can return locally without waiting for
-        // DCache/SRAM, which breaks store->load backpressure chains while
-        // preserving byte-accurate ordering for partial stores.
         load_ren = make_load_ren(load_head.load_ext_op, load_head.address[1:0]);
         load_forward_mask = 4'b0;
         load_forward_data = 32'b0;
@@ -363,6 +390,7 @@ module LoadStoreUnit (
             for (order_i = 0; order_i < 16; order_i = order_i + 1) begin
                 if (order_i < STORE_SLOTS) begin
                     fwd_cand[order_byte][order_i].valid = order_valid[order_i] &&
+                        order_addr_ready[order_i] &&
                         ((order_addr_flat[order_i*32 +: 32] & 32'hffff_fffc) == (load_head.address & 32'hffff_fffc)) &&
                         order_wen_flat[order_i*4 + order_byte];
                     fwd_cand[order_byte][order_i].data_ready = order_store_data_ready[order_i];
@@ -410,7 +438,7 @@ module LoadStoreUnit (
             ref_cand_ready = 4'b0;
             
             for (order_i = 0; order_i < STORE_SLOTS; order_i = order_i + 1) begin
-                if (order_valid[order_i] &&
+                if (order_valid[order_i] && order_addr_ready[order_i] &&
                     ((order_addr_flat[order_i*32 +: 32] & 32'hffff_fffc) ==
                      (load_head.address & 32'hffff_fffc))) begin
                     for (order_byte = 0; order_byte < 4; order_byte = order_byte + 1) begin
@@ -456,54 +484,37 @@ module LoadStoreUnit (
         load_forward_valid = load_head_valid &&
                              ((load_forward_mask & load_ren) == load_ren);
 
-        // Only a full input queue backpressures execute.  Waiting for the
-        // cache response itself does not stop independent work.
         ldst_suspend = !flush &&
                        ((load0_raw && !load_ready) ||
-                        (store0_raw && !store_ready));
+                        (store0_raw &&
+                         !(DECOUPLED_STORE_RESERVATION ? addr_update0_ack :
+                                                           store_ready)));
         ldst1_suspend = !flush &&
                         ((load1_raw && !load1_ready) ||
-                         (store1_raw && !store1_ready));
+                         (store1_raw &&
+                          !(DECOUPLED_STORE_RESERVATION ? addr_update1_ack :
+                                                            store1_ready)));
         perf_lq_occupancy = lq_occupancy;
         perf_sq_occupancy = sq_occupancy;
         perf_sb_occupancy = sb_occupancy;
         perf_order_block = load_l1_valid && load_l1_blocked &&
                            !load_l1_forward_valid;
         perf_load_issue = load_issue;
-        // load_issue is generated from the registered L1 decision.  Use the
-        // same registered qualifier here so the debug counter cannot report a
-        // forward for a different (newer) L0 head.
         perf_load_forward = load_issue && load_l1_forward_valid;
         perf_load_response = load_pop;
-        perf_store_issue = store0_accept || store1_accept;
+        perf_store_issue = DECOUPLED_STORE_RESERVATION ?
+                           ((reserve0_valid && reserve0_ready) ||
+                            (reserve1_valid && reserve1_ready)) :
+                           (store0_accept || store1_accept);
         perf_store_release = store_release_fire;
         perf_store_drain = store_pop;
     end
-
-`ifndef SYNTHESIS
-    always @(posedge cpu_clk) begin
-        if (cpu_rstn && !flush && load_head_valid) begin
-            if (executing_store0_is_older &&
-                executing_store1_is_older) begin
-                if (!order_valid[SQ_DEPTH+SB_DEPTH] ||
-                    !order_valid[SQ_DEPTH+SB_DEPTH+1]) begin
-                    $fatal(1,
-                        "[LSU-ASSERT] Dual executing stores must both appear in order_valid slots!");
-                end
-            end
-        end
-    end
-`endif
 
     logic [LQ_DEPTH-1:0] lq_unissued_vec;
     lsu_entry_t lq_entries [0:LQ_DEPTH-1];
     logic [2:0] selected_lq_idx;
     logic selected_lq_found;
 
-    // XSim 2023.2 can repeatedly reschedule an always_comb that scans an
-    // unpacked array while updating its own first-match flag.  This is plain
-    // combinational selection; always @(*) gives the intended sensitivity
-    // without the simulator's extra always_comb scheduling semantics.
     always @(*) begin
         selected_lq_found = 1'b0;
         selected_lq_idx = 3'd0;
@@ -547,10 +558,30 @@ module LoadStoreUnit (
         .flush(flush),
         .recover_valid(recover_valid), .system_flush(system_flush),
         .recover_id(recover_id),
-        .accept_valid(store0_raw), .accept_entry(store_entry),
+        .accept_valid(store0_accept), .accept_entry(store_entry),
         .accept_ready(store_ready),
-        .accept1_valid(store1_raw), .accept1_entry(store1_entry),
+        .accept1_valid(store1_accept), .accept1_entry(store1_entry),
         .accept1_ready(store1_ready),
+        .reserve0_valid(reserve0_valid), .reserve0_ready(reserve0_ready),
+        .reserve0_uop_id(reserve0_uop_id), .reserve0_pc(reserve0_pc),
+        .reserve0_store_mask(reserve0_store_mask), .reserve0_src1_ready(reserve0_src1_ready),
+        .reserve0_src1_value(reserve0_src1_value), .reserve0_src1_id(reserve0_src1_id),
+        .reserve1_valid(reserve1_valid), .reserve1_ready(reserve1_ready),
+        .reserve1_uop_id(reserve1_uop_id), .reserve1_pc(reserve1_pc),
+        .reserve1_store_mask(reserve1_store_mask), .reserve1_src1_ready(reserve1_src1_ready),
+        .reserve1_src1_value(reserve1_src1_value), .reserve1_src1_id(reserve1_src1_id),
+        .addr_update0_valid(addr_update0_valid), .addr_update0_ack(addr_update0_ack),
+        .addr_update0_uop_id(addr_update0_uop_id), .addr_update0_address(addr_update0_address),
+        .addr_update0_store_wen(addr_update0_store_wen), .addr_update0_unalign(addr_update0_unalign),
+        .addr_update0_data_ready(addr_update0_data_ready),
+        .addr_update0_data_value(addr_update0_data_value),
+        .addr_update0_data_src_id(addr_update0_data_src_id),
+        .addr_update1_valid(addr_update1_valid), .addr_update1_ack(addr_update1_ack),
+        .addr_update1_uop_id(addr_update1_uop_id), .addr_update1_address(addr_update1_address),
+        .addr_update1_store_wen(addr_update1_store_wen), .addr_update1_unalign(addr_update1_unalign),
+        .addr_update1_data_ready(addr_update1_data_ready),
+        .addr_update1_data_value(addr_update1_data_value),
+        .addr_update1_data_src_id(addr_update1_data_src_id),
         .complete0(store_data_complete0), .complete1(store_data_complete1),
         .commit0(commit0), .commit1(commit1),
         .release_valid(store_release_valid), .release_entry(store_release_entry),
@@ -665,7 +696,7 @@ module LoadStoreUnit (
         // The trace observes the accepted DCache store request, which may
         // occur several cycles after execute/ROB completion.  Keep the PC
         // attached to the StoreBuffer head for that request.
-        if (dcache_req.wen != `RAM_WE_N) mem_pc = buffer_head.pc;
+        if (dcache_req.wen != `RAM_WE_N) mem_pc = u_lsu_arbiter.request_entry_q.pc;
         else if (direct_valid) mem_pc = execute_result.pc;
         else if (arb_completion_valid) mem_pc = arb_completion_entry.pc;
 

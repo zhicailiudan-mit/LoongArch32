@@ -57,30 +57,18 @@ module ReorderBuffer (
     wire [`ROB_TAG_W-1:0] head1 = head +
                                    {{(`ROB_TAG_W-1){1'b0}}, 1'b1};
 
-    wire complete_query [0:3];
-    wire complete1_query [0:3];
     genvar q;
     generate
         for (q = 0; q < 4; q = q + 1) begin : GEN_QUERY
-            assign complete_query[q] = complete[0].valid &&
-                                       valid[query_id[q].rob_tag] &&
-                                       uop_id_equal(complete[0].uop_id,
-                                                    query_id[q]);
-            assign complete1_query[q] = complete[1].valid &&
-                                        valid[query_id[q].rob_tag] &&
-                                        uop_id_equal(complete[1].uop_id,
-                                                     query_id[q]);
+            // Rename observes only registered ROB completion state.  A
+            // same-cycle completion/dispatch collision is recovered by the
+            // scheduler's local registered wakeup packet, avoiding a global
+            // completion -> ROB query -> dispatch-ready combinational path.
             assign query_done[q] = valid[query_id[q].rob_tag] &&
                                     (epoch[query_id[q].rob_tag] == query_id[q].epoch) &&
-                                    ((done[query_id[q].rob_tag] &&
-                                      result_we[query_id[q].rob_tag]) ||
-                                     (complete_query[q] &&
-                                      complete[0].reg_write) ||
-                                     (complete1_query[q] &&
-                                      complete[1].reg_write));
-            assign query_value[q] = complete_query[q] ? complete[0].value :
-                                    complete1_query[q] ? complete[1].value :
-                                    value[query_id[q].rob_tag];
+                                    done[query_id[q].rob_tag] &&
+                                    result_we[query_id[q].rob_tag];
+            assign query_value[q] = value[query_id[q].rob_tag];
         end
     endgenerate
 

@@ -37,7 +37,10 @@ module sram_ctrl #(
         sram_rdata <= !rstn ? 32'h0 : sram_data;
     end
 
-    assign usr_rdata = we ? usr_wdata : sram_rdata;
+    // Always expose the read data captured on the preceding usr_clk edge.
+    // A write may start in the cycle immediately after a read request; using
+    // usr_wdata while that write is active would overwrite the pending read
+    // response observed by cache_rreq_bridge.
+    assign usr_rdata = sram_rdata;
 
 endmodule
-

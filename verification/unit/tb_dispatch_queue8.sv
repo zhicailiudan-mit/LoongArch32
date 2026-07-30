@@ -188,6 +188,39 @@ module tb_dispatch_queue8;
         @(posedge clk); #1;
         if (occupancy !== 0) fail("final flush failed");
 
+        // A Store whose address is ready but whose data is unresolved may
+        // occupy lane0.  It must not also take lane1, because the ready ALU on
+        // lane1 can be the producer needed to drain a full StoreQueue.
+        flush = 1'b0;
+        system_flush = 1'b0;
+        issue_ready[0] = 1'b0;
+        issue_ready[1] = 1'b0;
+        enq[0] = '0;
+        enq[0].valid = 1'b1;
+        enq[0].src0_ready = 1'b1;
+        enq[0].src1_ready = 1'b0;
+        enq[0].uop.uop_id = '{epoch:'0, rob_tag:5'd20};
+        enq[0].uop.pc = 32'h2000;
+        enq[0].uop.is_ld_st = 1'b1;
+        enq[0].uop.store_mask = 4'hf;
+        enq[0].uop.result_sel = `WD_ALU;
+        enq[1] = '0;
+        enq[1].valid = 1'b1;
+        enq[1].src0_ready = 1'b1;
+        enq[1].src1_ready = 1'b1;
+        enq[1].uop.uop_id = '{epoch:'0, rob_tag:5'd21};
+        enq[1].uop.pc = 32'h2004;
+        enq[1].uop.result_sel = `WD_ALU;
+        enq[1].uop.alu_op = `ALU_ADD;
+        @(posedge clk); #1;
+        enq[0].valid = 1'b0;
+        enq[1].valid = 1'b0;
+        if (!issue_valid[0] || issue[0].pc !== 32'h2000)
+            fail("unresolved-data Store was not retained on lane0");
+        if (!issue_valid[1] || issue[1].pc !== 32'h2004 ||
+            issue[1].is_ld_st)
+            fail("unresolved-data Store blocked its ready ALU producer on lane1");
+
         $display("[DQ8-PASS] depth, oldest selection, dual/single issue, simultaneous enqueue, stall and flush passed");
         $finish;
     end

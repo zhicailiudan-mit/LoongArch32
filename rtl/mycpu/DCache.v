@@ -63,8 +63,8 @@ module DCache (
     localparam integer LINE_BITS       = `CACHE_BLK_SIZE;
     localparam integer STORE_FIFO_DEPTH = 4;
     localparam [2:0] STORE_FIFO_CAPACITY = 3'd4;
-    localparam integer LOAD_REQ_FIFO_DEPTH = 1;
-    localparam [1:0] LOAD_REQ_FIFO_CAPACITY = 2'd1;
+    localparam integer LOAD_REQ_FIFO_DEPTH = 2;
+    localparam [1:0] LOAD_REQ_FIFO_CAPACITY = 2'd2;
     localparam integer ORD_DEPTH = 4;
     localparam [2:0] ORD_CAPACITY = 3'd4;
 
@@ -210,12 +210,13 @@ module DCache (
     reg [ 1:0] replay_slot_r;
     reg        probe_checking_r;
     reg [7:0]  refill_word_valid_mask;
-    reg        same_line_pending;
-    reg [ 2:0] same_line_p_word;
-    reg [31:0] same_line_p_addr;
-    reg [ 3:0] same_line_p_ren;
-    reg        same_line_p_cacheable;
-    reg [ 1:0] same_line_p_slot;
+    // A same-refill-line Load owns its ORD slot while waiting for the target
+    // beat.  Track that wait per slot so one future beat does not globally
+    // freeze all younger probes and queued requests.
+    reg [ORD_DEPTH-1:0] same_wait_valid;
+    reg [ 2:0] same_wait_word [0:ORD_DEPTH-1];
+    reg [31:0] same_wait_addr [0:ORD_DEPTH-1];
+    wire                  same_wait_any = |same_wait_valid;
 
 `ifndef SYNTHESIS
     reg [1:0]  req_fifo_max_occ;
@@ -243,6 +244,32 @@ module DCache (
     reg [63:0] ord_release_cnt;
     reg [63:0] ord_full_block_cnt;
     reg [ 2:0] ord_max_occupancy;
+
+    // Phase A2: 2-bit Confidence Stream Detector Observational Model
+    reg [1:0]  stream_conf;           // 2-bit saturating counter (0..3), threshold >= 2
+    reg [26:0] last_miss_line;
+    reg        last_miss_valid;
+
+    reg        pf_a2_active;
+    reg [26:0] pf_a2_line;
+    reg [31:0] pf_a2_timestamp;
+
+    // Per-100k-Cycle Interval Counters
+    reg [63:0] interval_demand_miss_cnt;
+    reg [63:0] interval_would_launch_cnt;
+    reg [63:0] interval_would_useful_cnt;
+    reg [63:0] interval_would_wrong_line_cnt;
+    reg [63:0] interval_would_cross_4k_cnt;
+    reg [63:0] interval_would_uncached_cnt;
+    reg [63:0] interval_useful_cycles_sum;
+    reg [63:0] interval_wrong_cycles_sum;
+    reg [63:0] interval_word_offset_cnt [0:7];
+
+    wire [31:0] a2_curr_addr = {req_raddr_r[31:5], 5'b0};
+    wire [31:0] a2_next_addr = a2_curr_addr + 32'd32;
+    wire        a2_same_4k   = (a2_curr_addr[31:12] == a2_next_addr[31:12]);
+    wire        a2_uncached  = is_uncached_request(a2_next_addr, 1'b1);
+    wire        a2_cand_pass = a2_same_4k && !a2_uncached;
 `endif
 
     reg [31:0] req_waddr_r;
@@ -286,8 +313,7 @@ module DCache (
     wire w_uncached = is_uncached_request(req_waddr_r, req_wcacheable_r);
 
     // 地址与 Tag/Offset 分解
-    wire [INDEX_WID-1:0] r_cache_index = (r_state == R_IDLE) ? data_addr[INDEX_WID+OFFSET_WID-1 : OFFSET_WID]
-                                                             : req_raddr_r[INDEX_WID+OFFSET_WID-1 : OFFSET_WID];
+    wire [INDEX_WID-1:0] r_cache_index = req_raddr_r[INDEX_WID+OFFSET_WID-1 : OFFSET_WID];
     wire [INDEX_WID-1:0] w_cache_index = req_waddr_r[INDEX_WID+OFFSET_WID-1 : OFFSET_WID];
 
     wire [TAG_WID-1:0]   r_tag_from_cpu = req_raddr_r[31 : INDEX_WID+OFFSET_WID];
@@ -409,7 +435,7 @@ module DCache (
                                    (req_fifo_count == 0) &&
                                    !(|data_ren) &&
                                    !probe_checking_r &&
-                                   !same_line_pending &&
+                                   !same_wait_any &&
                                    !store_same_refill_set;
 
 
@@ -417,14 +443,11 @@ module DCache (
                                     ((r_state == R_TAG_CHK) && r_hit) ||
                                     store_refill_tail_allow;
 
-    wire store_immediate_launch = (store_fifo_count == 3'd0 || (store_fifo_count == 3'd1 && store_fifo_will_pop)) &&
-                                  write_accept && !incoming_w_uncached;
-
     wire store_fifo_has_unbound_head = (store_fifo_count > 3'd0) &&
                                        !store_fifo_tag_checked[head_ptr] &&
                                        !(store_fifo_count == 3'd1 && store_fifo_will_pop);
 
-    wire store_tag_launch = (store_fifo_has_unbound_head || store_immediate_launch) &&
+    wire store_tag_launch = store_fifo_has_unbound_head &&
                             !store_tag_pending &&
                             store_service_r_state_ok &&
                             (w_state == W_IDLE) &&
@@ -440,11 +463,8 @@ module DCache (
                                !replay_pending &&
                                !refill_commit && !maint_active;
 
-    wire [INDEX_WID-1:0] store_launch_index = store_immediate_launch ?
-        data_addr[INDEX_WID+OFFSET_WID-1 : OFFSET_WID] : store_head_index;
-
-    wire [OFFSET_WID-1:0] store_launch_offset = store_immediate_launch ?
-        data_addr[OFFSET_WID-1 : 0] : store_head_offset;
+    wire [INDEX_WID-1:0] store_launch_index  = store_head_index;
+    wire [OFFSET_WID-1:0] store_launch_offset = store_head_offset;
 
     wire same_refill_line = mshr_valid &&
                             (req_raddr_r[31:OFFSET_WID] == refill_raddr_r[31:OFFSET_WID]);
@@ -453,6 +473,16 @@ module DCache (
 
     wire [2:0] arriving_word_index = refill_offset_r[4:2] + recv_cnt;
     wire [2:0] probe_word_index    = req_raddr_r[OFFSET_WID-1:2];
+
+    wire [ORD_DEPTH-1:0] same_wait_beat_match;
+    assign same_wait_beat_match[0] = (r_state == R_REFILL) && dev_rvalid &&
+                                     same_wait_valid[0] && (arriving_word_index == same_wait_word[0]);
+    assign same_wait_beat_match[1] = (r_state == R_REFILL) && dev_rvalid &&
+                                     same_wait_valid[1] && (arriving_word_index == same_wait_word[1]);
+    assign same_wait_beat_match[2] = (r_state == R_REFILL) && dev_rvalid &&
+                                     same_wait_valid[2] && (arriving_word_index == same_wait_word[2]);
+    assign same_wait_beat_match[3] = (r_state == R_REFILL) && dev_rvalid &&
+                                     same_wait_valid[3] && (arriving_word_index == same_wait_word[3]);
 
     wire word_available_now = refill_word_valid_mask[probe_word_index] ||
                               (dev_rvalid && (arriving_word_index == probe_word_index));
@@ -468,7 +498,6 @@ module DCache (
                                 incoming_r_cacheable &&
                                 !refill_commit &&
                                 !replay_pending &&
-                                !same_line_pending &&
                                 !probe_checking_r &&
                                 (w_state == W_IDLE) &&
                                 !maint_active;
@@ -477,9 +506,6 @@ module DCache (
                                   ((r_state == R_RD_MEM) || (r_state == R_REFILL));
     wire hur_probe_hit          = hur_probe_result && r_hit && !same_refill_line;
     wire hur_same_line_imm_hit  = hur_probe_result && same_refill_line && word_available_now;
-
-    wire same_line_target_beat_fire = (r_state == R_REFILL) && dev_rvalid && same_line_pending &&
-                                     (arriving_word_index == same_line_p_word);
 
     integer f_idx;
     always @(posedge cpu_clk or negedge cpu_rstn) begin
@@ -559,7 +585,7 @@ module DCache (
 
     // Load Request FIFO 出队 / 启动定义
     wire req_fifo_can_dequeue = (req_fifo_count > 0) && load_accept_ready &&
-                                !replay_pending && !same_line_pending && !probe_checking_r;
+                                !replay_pending && !probe_checking_r;
     wire req_fifo_pop   = req_fifo_can_dequeue;
     wire req_fifo_start = req_fifo_can_dequeue;
 
@@ -567,21 +593,15 @@ module DCache (
     wire req_fifo_can_accept = (req_fifo_count < LOAD_REQ_FIFO_CAPACITY) ||
                                ((req_fifo_count == LOAD_REQ_FIFO_CAPACITY) && req_fifo_will_pop);
 
-    // Load 读就绪逻辑 (只要 FIFO 有空间且非 maint/同周期Store 即可 accept，不被 engine 忙状态阻塞)
+    // Load 读就绪逻辑 (只要 FIFO 有空间且非 maint 即可 accept，不被 engine 忙状态阻塞，消除与 Store 写就绪的死锁/组合环)
     assign data_rready = req_fifo_can_accept &&
                          !maint_active &&
-                         ((ord_count < ORD_CAPACITY) || ord_ready_release) &&
-                         !(data_wready && (|data_wen));
+                         ((ord_count < ORD_CAPACITY) || ord_ready_release);
 
     wire read_accept = data_rready && (|data_ren);
 
-    // 直连启动要求 FIFO 完全为空且满足 accept 就绪条件（无内部 replay/pending 阻塞）
-    wire can_direct_start = (req_fifo_count == 0) && load_accept_ready &&
-                            !replay_pending && !same_line_pending && !probe_checking_r;
-    wire direct_read_start = read_accept && can_direct_start;
-
-    // Load Req FIFO 入队：新请求被 accept 且不能直连启动
-    wire req_fifo_push = read_accept && !direct_read_start;
+    // Load Req FIFO 入队：所有 accepted 读请求均存入 req_fifo 建立 registered ownership boundary
+    wire req_fifo_push = read_accept;
 
     wire [INDEX_WID-1:0] incoming_index =
         data_addr[INDEX_WID+OFFSET_WID-1:OFFSET_WID];
@@ -603,17 +623,10 @@ module DCache (
             req_ren_r        <= req_fifo_ren[req_fifo_head];
             req_rcacheable_r <= req_fifo_cacheable[req_fifo_head];
             req_slot_r       <= req_fifo_slot[req_fifo_head];
-        end else if (direct_read_start) begin
-            req_raddr_r      <= data_addr;
-            req_ren_r        <= data_ren;
-            req_rcacheable_r <= data_cacheable;
-            req_slot_r       <= ord_slot_alloc;  // slot allocated same cycle
         end
     end
 
     // Ord slot allocation: when read_accept fires, allocate the next free slot.
-    // direct_read_start consumes ord_slot_alloc immediately (req_slot_r captures it).
-    // For FIFO push cases, the slot must be captured into the FIFO entry.
     wire [1:0] next_ord_slot = ord_slot_alloc + 1'b1;
     always @(posedge cpu_clk or negedge cpu_rstn) begin
         if (!cpu_rstn) begin
@@ -642,12 +655,10 @@ module DCache (
                 req_fifo_ren[req_fifo_tail]       <= data_ren;
                 req_fifo_cacheable[req_fifo_tail] <= data_cacheable;
                 req_fifo_slot[req_fifo_tail]      <= ord_slot_alloc;
-                req_fifo_tail                     <= (LOAD_REQ_FIFO_DEPTH == 1) ?
-                                                     1'b0 : req_fifo_tail + 1'b1;
+                req_fifo_tail                     <= req_fifo_tail + 1'b1;
             end
             if (req_fifo_pop) begin
-                req_fifo_head <= (LOAD_REQ_FIFO_DEPTH == 1) ?
-                                 1'b0 : req_fifo_head + 1'b1;
+                req_fifo_head <= req_fifo_head + 1'b1;
             end
             req_fifo_count <= req_fifo_count + {1'b0, req_fifo_push} - {1'b0, req_fifo_pop};
         end
@@ -694,9 +705,6 @@ module DCache (
                 end else if (req_fifo_start) begin
                     if (req_fifo_head_uncached) r_nstat = R_UNC_REQ;
                     else                        r_nstat = R_TAG_CHK;
-                end else if (direct_read_start) begin
-                    if (incoming_r_uncached) r_nstat = R_UNC_REQ;
-                    else                     r_nstat = R_TAG_CHK;
                 end else r_nstat = R_IDLE;
             end
             
@@ -705,9 +713,6 @@ module DCache (
                     if (replay_pending) begin
                         if (replay_r_uncached) r_nstat = R_UNC_REQ;
                         else                   r_nstat = R_TAG_CHK;
-                    end else if (direct_read_start) begin
-                        if (incoming_r_uncached) r_nstat = R_UNC_REQ;
-                        else                     r_nstat = R_TAG_CHK;
                     end else if (req_fifo_start) begin
                         if (req_fifo_head_uncached) r_nstat = R_UNC_REQ;
                         else                        r_nstat = R_TAG_CHK;
@@ -721,7 +726,7 @@ module DCache (
 
             R_RD_MEM:   r_nstat = (dev_rrdy && dev_widle) ? R_REFILL : R_RD_MEM;
             R_REFILL:   r_nstat = (dev_rvalid && recv_cnt == LINE_LAST_WORD) ?
-                                  ((direct_read_start || req_fifo_start) ? R_TAG_CHK : R_IDLE) : R_REFILL;
+                                  (req_fifo_start ? R_TAG_CHK : R_IDLE) : R_REFILL;
             
             R_UNC_REQ:  r_nstat = dev_rvalid ? (replay_pending ? R_TAG_CHK : R_IDLE) :
                                    ((dev_rrdy && dev_widle) ? R_UNC_WAIT : R_UNC_REQ);
@@ -811,12 +816,15 @@ module DCache (
             replay_rcacheable_r     <= 1'b0;
             replay_slot_r           <= 2'd0;
             refill_word_valid_mask  <= 8'h0;
-            same_line_pending       <= 1'b0;
-            same_line_p_word        <= 3'b0;
-            same_line_p_addr        <= 32'h0;
-            same_line_p_ren         <= 4'h0;
-            same_line_p_cacheable   <= 1'b0;
-            same_line_p_slot        <= 2'd0;
+            same_wait_valid         <= {ORD_DEPTH{1'b0}};
+            same_wait_word[0]       <= 3'b0;
+            same_wait_word[1]       <= 3'b0;
+            same_wait_word[2]       <= 3'b0;
+            same_wait_word[3]       <= 3'b0;
+            same_wait_addr[0]       <= 32'h0;
+            same_wait_addr[1]       <= 32'h0;
+            same_wait_addr[2]       <= 32'h0;
+            same_wait_addr[3]       <= 32'h0;
         end else begin
             if ((r_state == R_TAG_CHK) && !r_hit && !mshr_valid) begin
                 refill_way_r           <= miss_way;
@@ -842,7 +850,7 @@ module DCache (
                 refill_word_valid_mask[arriving_word_index] <= 1'b1;
             end
 
-            if (hur_probe_can_launch && (req_fifo_start || direct_read_start)) begin
+            if (hur_probe_can_launch && req_fifo_start) begin
                 probe_checking_r <= 1'b1;
             end else begin
                 probe_checking_r <= 1'b0;
@@ -852,12 +860,9 @@ module DCache (
                 if (same_refill_line) begin
                     if (word_available_now) begin
                     end else begin
-                        same_line_pending     <= 1'b1;
-                        same_line_p_word      <= probe_word_index;
-                        same_line_p_addr      <= req_raddr_r;
-                        same_line_p_ren       <= req_ren_r;
-                        same_line_p_cacheable <= req_rcacheable_r;
-                        same_line_p_slot      <= req_slot_r;
+                        same_wait_valid[req_slot_r] <= 1'b1;
+                        same_wait_word[req_slot_r]  <= probe_word_index;
+                        same_wait_addr[req_slot_r]  <= req_raddr_r;
                     end
                 end else if (!r_hit) begin
                     replay_pending      <= 1'b1;
@@ -869,18 +874,16 @@ module DCache (
                 end
             end
 
-            if (same_line_pending) begin
-                if (r_state == R_REFILL && dev_rvalid && (arriving_word_index == same_line_p_word)) begin
-                    same_line_pending <= 1'b0;
-                end else if ((r_state != R_RD_MEM) && (r_state != R_REFILL)) begin
-                    same_line_pending   <= 1'b0;
-                    replay_pending      <= 1'b1;
-                    replay_raddr_r      <= same_line_p_addr;
-                    replay_ren_r        <= same_line_p_ren;
-                    replay_rcacheable_r <= same_line_p_cacheable;
-                    replay_slot_r       <= same_line_p_slot;
-                end
-            end
+            if (same_wait_beat_match[0]) same_wait_valid[0] <= 1'b0;
+            if (same_wait_beat_match[1]) same_wait_valid[1] <= 1'b0;
+            if (same_wait_beat_match[2]) same_wait_valid[2] <= 1'b0;
+            if (same_wait_beat_match[3]) same_wait_valid[3] <= 1'b0;
+
+            // A physical ORD slot may be released and reallocated in one
+            // cycle.  Clear stale waiter ownership before a new request uses
+            // that slot; a later probe result will establish fresh metadata.
+            if (read_accept)
+                same_wait_valid[ord_slot_alloc] <= 1'b0;
 
             if (replay_pending && (r_state == R_IDLE)) begin
                 replay_pending <= 1'b0;
@@ -933,18 +936,16 @@ module DCache (
         same_line_imm_final_rdata = forward_from_store_fifo(same_line_imm_rdata, req_raddr_r, head_ptr, store_fifo_count);
     end
 
-    reg [31:0] same_line_target_beat_raw_rdata;
+    reg [31:0] same_wait_final_rdata [0:ORD_DEPTH-1];
+    integer same_wait_data_idx;
     always @(*) begin
-        if (dev_rvalid && (arriving_word_index == same_line_p_word)) begin
-            same_line_target_beat_raw_rdata = dev_rdata;
-        end else begin
-            same_line_target_beat_raw_rdata = select_line_word(refill_commit_data, same_line_p_word);
+        for (same_wait_data_idx = 0; same_wait_data_idx < ORD_DEPTH;
+             same_wait_data_idx = same_wait_data_idx + 1) begin
+            same_wait_final_rdata[same_wait_data_idx] =
+                forward_from_store_fifo(dev_rdata,
+                                        same_wait_addr[same_wait_data_idx],
+                                        head_ptr, store_fifo_count);
         end
-    end
-
-    reg [31:0] same_line_target_beat_final_rdata;
-    always @(*) begin
-        same_line_target_beat_final_rdata = forward_from_store_fifo(same_line_target_beat_raw_rdata, same_line_p_addr, head_ptr, store_fifo_count);
     end
 
     // =========================================================
@@ -953,8 +954,7 @@ module DCache (
     // A slot is reserved at the input handshake, not at completion.  A
     // younger hit may therefore become ready while the head miss is waiting,
     // but only the ready head is exposed to the untagged LSU response port.
-    wire ord_aux_event = same_line_target_beat_fire ||
-                         hur_same_line_imm_hit || hur_probe_hit ||
+    wire ord_aux_event = hur_same_line_imm_hit || hur_probe_hit ||
                          hit_r ||
                          (((r_state == R_UNC_REQ) || (r_state == R_UNC_WAIT)) &&
                           dev_rvalid);
@@ -964,10 +964,7 @@ module DCache (
     always @(*) begin
         ord_aux_slot = req_slot_r;
         ord_aux_data = final_rdata;
-        if (same_line_target_beat_fire) begin
-            ord_aux_slot = same_line_p_slot;
-            ord_aux_data = same_line_target_beat_final_rdata;
-        end else if (hur_same_line_imm_hit) begin
+        if (hur_same_line_imm_hit) begin
             ord_aux_slot = req_slot_r;
             ord_aux_data = same_line_imm_final_rdata;
         end else if (hur_probe_hit || hit_r) begin
@@ -980,15 +977,18 @@ module DCache (
         end
     end
 
-    wire ord_write_event = refill_word_valid || ord_aux_event;
+    wire ord_write_event = refill_word_valid || ord_aux_event ||
+                           (|same_wait_beat_match);
     wire ord_refill_completes_head = refill_word_valid &&
                                      (mshr_slot_id == ord_head);
     wire ord_aux_completes_head = ord_aux_event &&
                                   (ord_aux_slot == ord_head);
+    wire ord_waiter_completes_head = same_wait_beat_match[ord_head];
     wire ord_complete_head_now = (ord_count > 3'd0) &&
                                  ord_valid[ord_head] &&
                                  !ord_ready[ord_head] &&
                                  (ord_refill_completes_head ||
+                                  ord_waiter_completes_head ||
                                   ord_aux_completes_head);
     wire ord_emit = ord_ready_release || ord_complete_head_now;
 
@@ -1017,6 +1017,8 @@ module DCache (
                     data_rdata <= ord_data[ord_head];
                 else if (ord_refill_completes_head)
                     data_rdata <= dev_rdata;
+                else if (ord_waiter_completes_head)
+                    data_rdata <= same_wait_final_rdata[ord_head];
                 else
                     data_rdata <= ord_aux_data;
                 ord_valid[ord_head] <= 1'b0;
@@ -1047,6 +1049,26 @@ module DCache (
                     ord_data[ord_aux_slot]  <= ord_aux_data;
                 end
             end
+            if (same_wait_beat_match[0] &&
+                !(ord_complete_head_now && (ord_head == 2'd0))) begin
+                ord_ready[0] <= 1'b1;
+                ord_data[0]  <= same_wait_final_rdata[0];
+            end
+            if (same_wait_beat_match[1] &&
+                !(ord_complete_head_now && (ord_head == 2'd1))) begin
+                ord_ready[1] <= 1'b1;
+                ord_data[1]  <= same_wait_final_rdata[1];
+            end
+            if (same_wait_beat_match[2] &&
+                !(ord_complete_head_now && (ord_head == 2'd2))) begin
+                ord_ready[2] <= 1'b1;
+                ord_data[2]  <= same_wait_final_rdata[2];
+            end
+            if (same_wait_beat_match[3] &&
+                !(ord_complete_head_now && (ord_head == 2'd3))) begin
+                ord_ready[3] <= 1'b1;
+                ord_data[3]  <= same_wait_final_rdata[3];
+            end
 
             ord_count <= ord_count + {2'b0, read_accept} -
                          {2'b0, ord_emit};
@@ -1059,7 +1081,7 @@ module DCache (
         response_owner = RESP_NONE;
 
         if (refill_word_valid)                    response_owner = RESP_REFILL_CRITICAL;
-        else if (same_line_target_beat_fire)       response_owner = RESP_HUR_SAME_TARGET_BEAT;
+        else if (|same_wait_beat_match)             response_owner = RESP_HUR_SAME_TARGET_BEAT;
         else if (hur_same_line_imm_hit)            response_owner = RESP_HUR_SAME_IMMEDIATE;
         else if (hur_probe_hit)                    response_owner = RESP_HUR_DIFFERENT_LINE;
         else if (hit_r)                            response_owner = RESP_NORMAL_HIT;
@@ -1135,10 +1157,6 @@ module DCache (
             array_read_owner = ARRAY_OWNER_REPLAY;
             array_read_index = replay_raddr_r[INDEX_WID+OFFSET_WID-1 : OFFSET_WID];
             array_read_word  = replay_raddr_r[OFFSET_WID-1:2];
-        end else if (direct_read_start) begin
-            array_read_owner = ARRAY_OWNER_LOAD_DIRECT;
-            array_read_index = incoming_index;
-            array_read_word  = data_addr[OFFSET_WID-1:2];
         end else if (req_fifo_start) begin
             array_read_owner = ARRAY_OWNER_LOAD_SKID;
             array_read_index = req_fifo_addr[req_fifo_head][INDEX_WID+OFFSET_WID-1 : OFFSET_WID];
@@ -1585,7 +1603,7 @@ module DCache (
                          (req_fifo_count == 0) &&
                          (ord_count == 0) &&
                          !replay_pending &&
-                         !same_line_pending &&
+                         !same_wait_any &&
                          !probe_checking_r &&
                          !mshr_valid;
 
@@ -1617,13 +1635,35 @@ module DCache (
             ord_release_cnt              <= 64'd0;
             ord_full_block_cnt           <= 64'd0;
             ord_max_occupancy            <= 3'd0;
+            stream_conf                  <= 2'd0;
+            last_miss_line               <= 27'd0;
+            last_miss_valid              <= 1'b0;
+            pf_a2_active                 <= 1'b0;
+            pf_a2_line                   <= 27'd0;
+            pf_a2_timestamp              <= 32'd0;
+            interval_demand_miss_cnt     <= 64'd0;
+            interval_would_launch_cnt    <= 64'd0;
+            interval_would_useful_cnt    <= 64'd0;
+            interval_would_wrong_line_cnt<= 64'd0;
+            interval_would_cross_4k_cnt   <= 64'd0;
+            interval_would_uncached_cnt   <= 64'd0;
+            interval_useful_cycles_sum   <= 64'd0;
+            interval_wrong_cycles_sum    <= 64'd0;
+            interval_word_offset_cnt[0]  <= 64'd0;
+            interval_word_offset_cnt[1]  <= 64'd0;
+            interval_word_offset_cnt[2]  <= 64'd0;
+            interval_word_offset_cnt[3]  <= 64'd0;
+            interval_word_offset_cnt[4]  <= 64'd0;
+            interval_word_offset_cnt[5]  <= 64'd0;
+            interval_word_offset_cnt[6]  <= 64'd0;
+            interval_word_offset_cnt[7]  <= 64'd0;
         end else begin
             hur_cycle_count <= hur_cycle_count + 64'd1;
 
             if (req_fifo_count > req_fifo_max_occ)
                 req_fifo_max_occ <= req_fifo_count;
 
-            if (req_fifo_push && (!load_accept_ready || replay_pending || same_line_pending || probe_checking_r))
+            if (req_fifo_push && (!load_accept_ready || replay_pending || probe_checking_r))
                 engine_busy_enqueue <= engine_busy_enqueue + 64'd1;
 
             if ((|data_ren) && !req_fifo_can_accept && !maint_active)
@@ -1643,27 +1683,107 @@ module DCache (
                          hum_secondary_miss_cnt, hum_same_set_conflict_cnt,
                          ord_buffered_completion_cnt, ord_release_cnt,
                          ord_full_block_cnt, ord_max_occupancy);
+                $display("[DCACHE-PF-A2-INTERVAL] cycles=%0d-%0d misses=%0d launches=%0d useful=%0d wrong_line=%0d cross_4k=%0d uncached=%0d useful_rate=%0d%% avg_useful_lat=%0d avg_wrong_lat=%0d word_offsets=[%0d,%0d,%0d,%0d,%0d,%0d,%0d,%0d]",
+                         hur_cycle_count - 64'd100000, hur_cycle_count,
+                         interval_demand_miss_cnt,
+                         interval_would_launch_cnt,
+                         interval_would_useful_cnt,
+                         interval_would_wrong_line_cnt,
+                         interval_would_cross_4k_cnt,
+                         interval_would_uncached_cnt,
+                         (interval_would_launch_cnt > 0) ? (interval_would_useful_cnt * 64'd100 / interval_would_launch_cnt) : 64'd0,
+                         (interval_would_useful_cnt > 0) ? (interval_useful_cycles_sum / interval_would_useful_cnt) : 64'd0,
+                         (interval_would_wrong_line_cnt > 0) ? (interval_wrong_cycles_sum / interval_would_wrong_line_cnt) : 64'd0,
+                         interval_word_offset_cnt[0], interval_word_offset_cnt[1], interval_word_offset_cnt[2], interval_word_offset_cnt[3],
+                         interval_word_offset_cnt[4], interval_word_offset_cnt[5], interval_word_offset_cnt[6], interval_word_offset_cnt[7]);
+
+                // Reset interval counters per 100k cycles
+                interval_demand_miss_cnt     <= 64'd0;
+                interval_would_launch_cnt    <= 64'd0;
+                interval_would_useful_cnt    <= 64'd0;
+                interval_would_wrong_line_cnt<= 64'd0;
+                interval_would_cross_4k_cnt   <= 64'd0;
+                interval_would_uncached_cnt   <= 64'd0;
+                interval_useful_cycles_sum   <= 64'd0;
+                interval_wrong_cycles_sum    <= 64'd0;
+                interval_word_offset_cnt[0]  <= 64'd0;
+                interval_word_offset_cnt[1]  <= 64'd0;
+                interval_word_offset_cnt[2]  <= 64'd0;
+                interval_word_offset_cnt[3]  <= 64'd0;
+                interval_word_offset_cnt[4]  <= 64'd0;
+                interval_word_offset_cnt[5]  <= 64'd0;
+                interval_word_offset_cnt[6]  <= 64'd0;
+                interval_word_offset_cnt[7]  <= 64'd0;
             end
 
-            if (hur_probe_can_launch && (req_fifo_start || direct_read_start))
+            // Phase A2 Observational Model Tracking Logic
+            if ((r_state == R_TAG_CHK) && !r_hit && !r_uncached && !mshr_valid) begin
+                interval_demand_miss_cnt <= interval_demand_miss_cnt + 64'd1;
+
+                // Track demand word offset distribution
+                interval_word_offset_cnt[req_raddr_r[4:2]] <= interval_word_offset_cnt[req_raddr_r[4:2]] + 64'd1;
+
+                // Evaluate sequential miss stream
+                if (last_miss_valid && (req_raddr_r[31:5] == last_miss_line + 27'd1)) begin
+                    if (stream_conf < 2'd3)
+                        stream_conf <= stream_conf + 2'd1;
+                end else begin
+                    if (stream_conf > 2'd0)
+                        stream_conf <= stream_conf - 2'd1;
+                end
+                last_miss_line  <= req_raddr_r[31:5];
+                last_miss_valid <= 1'b1;
+
+                // Evaluate previous would_launch candidate against current demand miss
+                if (pf_a2_active) begin
+                    if (req_raddr_r[31:5] == pf_a2_line) begin
+                        interval_would_useful_cnt <= interval_would_useful_cnt + 64'd1;
+                        interval_useful_cycles_sum <= interval_useful_cycles_sum + (hur_cycle_count[31:0] - pf_a2_timestamp);
+                    end else begin
+                        interval_would_wrong_line_cnt <= interval_would_wrong_line_cnt + 64'd1;
+                        interval_wrong_cycles_sum <= interval_wrong_cycles_sum + (hur_cycle_count[31:0] - pf_a2_timestamp);
+                    end
+                    pf_a2_active <= 1'b0;
+                end
+
+                // Evaluate candidate for current miss
+                if (!a2_same_4k)
+                    interval_would_cross_4k_cnt <= interval_would_cross_4k_cnt + 64'd1;
+                if (a2_uncached)
+                    interval_would_uncached_cnt <= interval_would_uncached_cnt + 64'd1;
+
+                // Would Launch only if confidence counter >= 2 and candidate passes filters
+                if (a2_cand_pass && (stream_conf >= 2'd2)) begin
+                    interval_would_launch_cnt <= interval_would_launch_cnt + 64'd1;
+                    pf_a2_active    <= 1'b1;
+                    pf_a2_line      <= a2_next_addr[31:5];
+                    pf_a2_timestamp <= hur_cycle_count[31:0];
+                end
+            end
+
+            if (hur_probe_can_launch && req_fifo_start)
                 hur_probe_launch_cnt <= hur_probe_launch_cnt + 64'd1;
             if (hur_probe_hit)
                 hur_probe_hit_cnt <= hur_probe_hit_cnt + 64'd1;
             if (hur_probe_result && !same_refill_line && !r_hit)
                 hur_probe_replay_cnt <= hur_probe_replay_cnt + 64'd1;
-            if (same_refill_line && (req_fifo_start || direct_read_start))
+            if (same_refill_line && req_fifo_start)
                 hur_same_line_block_cnt <= hur_same_line_block_cnt + 64'd1;
             if (hur_probe_result && same_refill_line)
                 hur_same_line_probe_cnt <= hur_same_line_probe_cnt + 64'd1;
             if (hur_same_line_imm_hit)
                 hur_same_line_buffer_hit_cnt <= hur_same_line_buffer_hit_cnt + 64'd1;
-            if (same_line_pending) begin
+            if (same_wait_any) begin
                 hur_same_line_wait_cycles_cnt <= hur_same_line_wait_cycles_cnt + 64'd1;
                 if (r_state != R_REFILL)
                     hur_same_line_replay_cnt <= hur_same_line_replay_cnt + 64'd1;
             end
-            if (same_line_pending && (r_state == R_REFILL && dev_rvalid && (arriving_word_index == same_line_p_word)))
-                hur_same_line_buffer_wait_cnt <= hur_same_line_buffer_wait_cnt + 64'd1;
+            if (|same_wait_beat_match)
+                hur_same_line_buffer_wait_cnt <= hur_same_line_buffer_wait_cnt +
+                    {63'd0, same_wait_beat_match[0]} +
+                    {63'd0, same_wait_beat_match[1]} +
+                    {63'd0, same_wait_beat_match[2]} +
+                    {63'd0, same_wait_beat_match[3]};
 
             if ((r_state == R_TAG_CHK) && !r_hit && !mshr_valid)
                 mshr_alloc_cnt <= mshr_alloc_cnt + 64'd1;
@@ -1673,7 +1793,7 @@ module DCache (
                 mshr_active_cycles_cnt <= mshr_active_cycles_cnt + 64'd1;
             if (mshr_valid && !mshr_critical_done)
                 mshr_critical_wait_cycles_cnt <= mshr_critical_wait_cycles_cnt + 64'd1;
-            if (hur_probe_can_launch && (req_fifo_start || direct_read_start) &&
+            if (hur_probe_can_launch && req_fifo_start &&
                 !mshr_critical_done)
                 hum_precritical_probe_cnt <= hum_precritical_probe_cnt + 64'd1;
             if ((hur_probe_hit || hur_same_line_imm_hit) &&
@@ -1759,8 +1879,32 @@ module DCache (
 
             if (maint_valid && maint_ready &&
                 ((ord_count != 0) || mshr_valid || (req_fifo_count != 0) ||
-                 replay_pending || same_line_pending || probe_checking_r))
+                 replay_pending || same_wait_any || probe_checking_r))
                 $fatal(1, "[DCACHE-ASSERT] Maintenance overtook an accepted Load!");
+
+            if (hur_probe_result && same_refill_line && !word_available_now &&
+                (!ord_valid[req_slot_r] || ord_ready[req_slot_r]))
+                $fatal(1, "[DCACHE-ASSERT] Same-line waiter targets an invalid ORD slot!");
+
+            if (hur_probe_result && same_refill_line && !word_available_now &&
+                same_wait_valid[req_slot_r])
+                $fatal(1, "[DCACHE-ASSERT] Same-line request allocated a waiter twice!");
+
+            if ((same_wait_valid[0] && (!ord_valid[0] || ord_ready[0])) ||
+                (same_wait_valid[1] && (!ord_valid[1] || ord_ready[1])) ||
+                (same_wait_valid[2] && (!ord_valid[2] || ord_ready[2])) ||
+                (same_wait_valid[3] && (!ord_valid[3] || ord_ready[3])))
+                $fatal(1, "[DCACHE-ASSERT] Same-line waiter lost ORD ownership!");
+
+            if (refill_commit && (|(same_wait_valid & ~same_wait_beat_match)))
+                $fatal(1, "[DCACHE-ASSERT] Refill completed with unresolved same-line waiters!");
+
+            if (ord_aux_event && same_wait_beat_match[ord_aux_slot])
+                $fatal(1, "[DCACHE-ASSERT] Two completion sources target one ORD slot!");
+
+            // Structural boundary assertions: array_read_owner must NEVER be LOAD_DIRECT
+            if (array_read_owner == ARRAY_OWNER_LOAD_DIRECT)
+                $fatal(1, "[DCACHE-ASSERT] Critical path boundary violation: array_read_owner is ARRAY_OWNER_LOAD_DIRECT!");
         end
     end
 `endif

@@ -44,6 +44,25 @@ module OooBackend (
     output completion_t                  store_data_complete0,
     output completion_t                  store_data_complete1,
 
+    // Store Reservation Interface
+    output logic                         reserve0_valid,
+    input  logic                         reserve0_ready,
+    output uop_id_t                      reserve0_uop_id,
+    output logic [31:0]                  reserve0_pc,
+    output logic [3:0]                   reserve0_store_mask,
+    output logic                         reserve0_src1_ready,
+    output logic [31:0]                  reserve0_src1_value,
+    output uop_id_t                      reserve0_src1_id,
+
+    output logic                         reserve1_valid,
+    input  logic                         reserve1_ready,
+    output uop_id_t                      reserve1_uop_id,
+    output logic [31:0]                  reserve1_pc,
+    output logic [3:0]                   reserve1_store_mask,
+    output logic                         reserve1_src1_ready,
+    output logic [31:0]                  reserve1_src1_value,
+    output uop_id_t                      reserve1_src1_id,
+
     output logic [`ROB_TAG_W:0]          perf_rob_occupancy,
     output logic [3:0]                   perf_issue_occupancy,
     output logic                         perf_rob_block,
@@ -80,6 +99,8 @@ module OooBackend (
     wire rob_query_done [0:3];
     wire [31:0] rob_query_value [0:3];
     wire completion_t complete [0:1];
+    completion_t scheduler_complete0;
+    completion_t scheduler_system_complete;
     wire issue_uop_t alloc_uop [0:1];
     wire commit_t commit_internal [0:1];
     reg system_inflight;
@@ -88,6 +109,18 @@ module OooBackend (
     assign decode_uop[1] = decode_uop1;
     assign alloc_uop[0] = dispatch[0].uop;
     assign alloc_uop[1] = dispatch[1].uop;
+
+    // Keep ordinary lane-0 wakeup independent of the system-completion
+    // arbitration used by the ROB.  The system packet is routed separately
+    // and registered locally at the DispatchQueue boundary.
+    always_comb begin
+        scheduler_complete0 = main_complete;
+        scheduler_complete0.valid = main_complete.valid &&
+                                    rob_live_mask[main_complete.uop_id.rob_tag];
+        scheduler_system_complete = complete[0];
+        scheduler_system_complete.valid = complete[0].valid &&
+                                          system_complete.valid;
+    end
 
     always @(posedge clk or negedge rstn) begin
         if (!rstn)
@@ -148,8 +181,9 @@ module OooBackend (
         .dispatch1_src0_id    (dispatch[1].src0_id),
         .dispatch1_src1_ready (dispatch[1].src1_ready),
         .dispatch1_src1_id    (dispatch[1].src1_id),
-        .complete0            (complete[0]),
+        .complete0            (scheduler_complete0),
         .complete1            (complete[1]),
+        .system_complete      (scheduler_system_complete),
         .commit0              (commit_internal[0]),
         .commit1              (commit_internal[1]),
         .rob_head_valid       (rob_head_valid),
@@ -169,6 +203,22 @@ module OooBackend (
         .issue1_fire          (issue1_fire),
         .issue1               (issue1),
         .occupancy            (scheduler_occupancy),
+        .reserve0_valid       (reserve0_valid),
+        .reserve0_ready       (reserve0_ready),
+        .reserve0_uop_id      (reserve0_uop_id),
+        .reserve0_pc          (reserve0_pc),
+        .reserve0_store_mask  (reserve0_store_mask),
+        .reserve0_src1_ready  (reserve0_src1_ready),
+        .reserve0_src1_value  (reserve0_src1_value),
+        .reserve0_src1_id     (reserve0_src1_id),
+        .reserve1_valid       (reserve1_valid),
+        .reserve1_ready       (reserve1_ready),
+        .reserve1_uop_id      (reserve1_uop_id),
+        .reserve1_pc          (reserve1_pc),
+        .reserve1_store_mask  (reserve1_store_mask),
+        .reserve1_src1_ready  (reserve1_src1_ready),
+        .reserve1_src1_value  (reserve1_src1_value),
+        .reserve1_src1_id     (reserve1_src1_id),
         .perf_true_source_wait(perf_true_source_wait),
         .perf_source_wait_dep_load(perf_source_wait_dep_load),
         .perf_source_wait_dep_muldiv(perf_source_wait_dep_muldiv),

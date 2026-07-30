@@ -323,14 +323,36 @@ module MyCpu (
     wire rob_head_valid;
     uop_id_t rob_head_id;
 
-    LoadStoreUnit u_load_store_unit (
+    wire reserve0_valid;
+    wire reserve0_ready;
+    uop_id_t reserve0_uop_id;
+    wire [31:0] reserve0_pc;
+    wire [3:0] reserve0_store_mask;
+    wire reserve0_src1_ready;
+    wire [31:0] reserve0_src1_value;
+    uop_id_t reserve0_src1_id;
+
+    wire reserve1_valid;
+    wire reserve1_ready;
+    uop_id_t reserve1_uop_id;
+    wire [31:0] reserve1_pc;
+    wire [3:0] reserve1_store_mask;
+    wire reserve1_src1_ready;
+    wire [31:0] reserve1_src1_value;
+    uop_id_t reserve1_src1_id;
+
+    LoadStoreUnit #(
+        .DECOUPLED_STORE_RESERVATION(1'b1)
+    ) u_load_store_unit (
         .cpu_rstn       (cpu_rstn),
         .cpu_clk        (cpu_clk),
         .flush          (pipeline_flush),
         .branch_flush   (recovery_event.branch_flush),
         .recover_valid  (recover_valid),
         .system_flush   (recovery_event.system_flush),
-        .recover_id     (recover_id),
+        // LQ/SQ use the recovery id only for branch-younger filtering.
+        // A system flush is handled independently and never consults it.
+        .recover_id     (branch_recover_id),
         .rob_head_valid (rob_head_valid),
         .rob_head_id    (rob_head_id),
         .execute_result (execute_result),
@@ -361,7 +383,23 @@ module MyCpu (
          .store_line_alloc_valid(store_line_alloc_valid),
          .store_line_alloc_addr(store_line_alloc_addr),
          .store_line_alloc_data(store_line_alloc_data),
-         .store_line_alloc_word_mask(store_line_alloc_word_mask)
+         .store_line_alloc_word_mask(store_line_alloc_word_mask),
+        .reserve0_valid      (reserve0_valid),
+        .reserve0_ready      (reserve0_ready),
+        .reserve0_uop_id     (reserve0_uop_id),
+        .reserve0_pc         (reserve0_pc),
+        .reserve0_store_mask (reserve0_store_mask),
+        .reserve0_src1_ready (reserve0_src1_ready),
+        .reserve0_src1_value (reserve0_src1_value),
+        .reserve0_src1_id    (reserve0_src1_id),
+        .reserve1_valid      (reserve1_valid),
+        .reserve1_ready      (reserve1_ready),
+        .reserve1_uop_id     (reserve1_uop_id),
+        .reserve1_pc         (reserve1_pc),
+        .reserve1_store_mask (reserve1_store_mask),
+        .reserve1_src1_ready (reserve1_src1_ready),
+        .reserve1_src1_value (reserve1_src1_value),
+        .reserve1_src1_id    (reserve1_src1_id)
     );
 
     // Lane1's held execution packet is either an ALU/MDU operation or a
@@ -409,6 +447,22 @@ module MyCpu (
         .commit1             (commit1),
         .store_data_complete0(store_data_complete0),
         .store_data_complete1(store_data_complete1),
+        .reserve0_valid      (reserve0_valid),
+        .reserve0_ready      (reserve0_ready),
+        .reserve0_uop_id     (reserve0_uop_id),
+        .reserve0_pc         (reserve0_pc),
+        .reserve0_store_mask (reserve0_store_mask),
+        .reserve0_src1_ready (reserve0_src1_ready),
+        .reserve0_src1_value (reserve0_src1_value),
+        .reserve0_src1_id    (reserve0_src1_id),
+        .reserve1_valid      (reserve1_valid),
+        .reserve1_ready      (reserve1_ready),
+        .reserve1_uop_id     (reserve1_uop_id),
+        .reserve1_pc         (reserve1_pc),
+        .reserve1_store_mask (reserve1_store_mask),
+        .reserve1_src1_ready (reserve1_src1_ready),
+        .reserve1_src1_value (reserve1_src1_value),
+        .reserve1_src1_id    (reserve1_src1_id),
         .perf_rob_occupancy  (perf_rob_occupancy),
         .perf_issue_occupancy(perf_issue_occupancy),
         .perf_rob_block      (perf_rob_block),
@@ -861,7 +915,7 @@ module MyCpu (
 
     // Accepted store request.  mem_pc remains owned by LoadStoreUnit.
     wire [31:0] debug_wdata_pc   = u_load_store_unit.mem_pc;
-    wire [ 3:0] debug_wdata_we   = daccess_wen;
+    wire [ 3:0] debug_wdata_we   = dcache_rsp.wready ? daccess_wen : 4'b0;
     wire [31:0] debug_wdata_addr = daccess_addr;
     wire [31:0] debug_wdata      = daccess_wdata;
 
@@ -959,12 +1013,12 @@ module MyCpu (
                                  s, u_load_store_unit.u_store_queue.entries[s].pc,
                                  u_load_store_unit.u_store_queue.entries[s].uop_id.epoch,
                                  u_load_store_unit.u_store_queue.entries[s].uop_id.rob_tag,
-                                 u_load_store_unit.u_store_queue.entries[s].store_data_ready,
-                                 u_load_store_unit.u_store_queue.entries[s].store_data_src_id.epoch,
-                                 u_load_store_unit.u_store_queue.entries[s].store_data_src_id.rob_tag,
+                                 u_load_store_unit.u_store_queue.store_data_ready[s],
+                                 u_load_store_unit.u_store_queue.store_data_src_id[s].epoch,
+                                 u_load_store_unit.u_store_queue.store_data_src_id[s].rob_tag,
                                  u_load_store_unit.u_store_queue.committed[s],
                                  u_load_store_unit.u_store_queue.entries[s].address,
-                                 u_load_store_unit.u_store_queue.entries[s].store_data);
+                                 u_load_store_unit.u_store_queue.raw_store_data[s]);
                     end
                 end
                 $display("----------------------------------------------------------");

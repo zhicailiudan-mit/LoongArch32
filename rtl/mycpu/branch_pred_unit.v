@@ -131,12 +131,12 @@ module BranchPredUnit (
     // ------------------------------------------------------------
     // IF阶段预测
     // ------------------------------------------------------------
-    // if_pc selects the next request while ifetch_inst belongs to an older
-    // returning request, so that instruction cannot qualify this lookup.
-    // Conditional entries use BTFNT from the decoded immediate sign captured
-    // at resolution; other branch/jump classes retain their existing policy.
+    // Conditional entries use hybrid BTFNT + 2-bit dynamic saturating counter:
+    // Backward branches default to Taken unless history is strongly Not-Taken (2'b00);
+    // Forward branches default to Not-Taken unless history learns Taken (history[1] == 1).
     wire conditional_pred_taken = entry_conditional[index] &
-                                  entry_backward[index];
+                                  (entry_backward[index] ? (history[index] != 2'b00) :
+                                                           history[index][1]);
     wire nonconditional_pred_taken = !entry_conditional[index] &
                                      (hit_call | history[index][1]);
     wire ras_pred_taken = hit_ret & !ras_empty;
@@ -150,7 +150,8 @@ module BranchPredUnit (
     // the same BTB state but performs no speculative RAS operation.
     wire lane1_supported = hit1 && !entry_call[index1] && !entry_ret[index1];
     wire lane1_conditional_taken = entry_conditional[index1] &
-                                   entry_backward[index1];
+                                   (entry_backward[index1] ? (history[index1] != 2'b00) :
+                                                             history[index1][1]);
     wire lane1_direct_taken = !entry_conditional[index1] &
                               history[index1][1];
     wire pred1_taken = lane1_supported &

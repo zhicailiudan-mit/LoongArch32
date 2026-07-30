@@ -95,6 +95,10 @@ module LsuArbiter (
     logic mmio_fire;
     logic load_forward_fire;
     logic store_fire;
+    logic load_request_intent;
+    logic mmio_request_intent;
+    logic store_request_intent;
+    logic foreground_store_candidate;
     logic background_store_candidate;
     logic background_store_fire;
     logic turnaround_fire;
@@ -125,7 +129,45 @@ module LsuArbiter (
     logic mmio_allowed;
     logic cacheable_load_allowed;
 
+    // Registered DCache request ownership boundary.  Request selection is
+    // performed without looking at DCache ready; only this registered packet
+    // participates in the external handshake on the following cycle.  This
+    // prevents ROB-head/MMIO permission and queue arbitration from reaching
+    // the DCache array-read address/control cone in one combinational path.
+    typedef enum logic [1:0] {
+        REQ_NONE  = 2'd0,
+        REQ_LOAD  = 2'd1,
+        REQ_MMIO  = 2'd2,
+        REQ_STORE = 2'd3
+    } request_kind_t;
+
+    logic            request_valid_q;
+    request_kind_t   request_kind_q;
+    memory_request_t request_payload_q;
+    lsu_entry_t      request_entry_q;
+    logic            request_background_store_q;
+
+    memory_request_t load_intent_payload;
+    memory_request_t store_intent_payload;
+
+    logic request_dcache_fire;
+    logic request_load_fire;
+    logic request_mmio_fire;
+    logic request_store_fire;
+
     always_comb begin
+        // Ready-independent request payloads.  These signals terminate at the
+        // request register below; they never drive DCache directly.
+        load_intent_payload = '0;
+        load_intent_payload.ren = make_load_ren(load_entry.load_ext_op,
+                                                load_entry.address[1:0]);
+        load_intent_payload.addr = load_entry.address;
+
+        store_intent_payload = '0;
+        store_intent_payload.addr = store_entry.address;
+        store_intent_payload.wen = store_entry.store_wen;
+        store_intent_payload.wdata = store_entry.store_data;
+
         // Effective killed flags during flush or marked killed bit
         owner_effective_killed = 1'b0;
         if (owner_count > 3'd0) begin
@@ -173,41 +215,73 @@ module LsuArbiter (
         load_turnaround_eligible = (owner_count > 3'd0) && dcache_rsp.valid && !flush &&
                                    !owner_effective_killed;
 
-        load_turnaround_suppressed = load_turnaround_eligible && (comp_count == 3'd0) &&
-                                     !direct_completion.valid && load_valid &&
-                                     !load_forward_valid && cacheable_load_allowed &&
-                                     dcache_rsp.rready && (force_store && store_valid);
-
-        turnaround_fire = load_turnaround_eligible && (comp_count == 3'd0) &&
-                          !direct_completion.valid && load_valid &&
-                          !load_forward_valid && cacheable_load_allowed &&
-                          dcache_rsp.rready && !(force_store && store_valid);
-
-        load_fire = !flush && load_valid && cacheable_load_allowed && dcache_rsp.rready &&
-                    !((owner_count == 3'd0) && force_store && store_valid && dcache_rsp.wready);
-
-        mmio_fire = !flush && load_valid && mmio_allowed && dcache_rsp.rready;
-
         // Store-to-Load forwarding fire (does not enter DCache owner FIFO)
         // Highest priority for CQ push port belongs to DCache response (!dcache_rsp.valid required)
         forward_slot_available = !dcache_rsp.valid &&
                                  ((!direct_completion.valid && (comp_count == 0 || comp_will_pop)) ||
                                   (direct_completion.valid && (comp_count < 3'd4) && (total_credits_used < 4'd4)));
-        load_forward_fire = !flush && load_valid && load_forward_valid && load_memory_allowed &&
+        foreground_store_candidate = !flush && store_valid &&
+                                     (store_state == S_IDLE) &&
+                                     (owner_count == 3'd0) && !mmio_active;
+
+        // A background Store may be selected only in a genuinely quiet load
+        // window.  Selection itself is independent of wready.
+        background_store_candidate = !flush && store_valid &&
+                                     (store_state == S_IDLE) &&
+                                     (owner_count > 3'd0) && !dcache_rsp.valid &&
+                                     (comp_count == 3'd0) && !direct_completion.valid;
+
+        // Intent arbitration is ready-independent.  A forced Store owns the
+        // next request slot; otherwise a locally-forwarded Load wins without
+        // consuming the DCache slot, followed by MMIO/cacheable Load and then
+        // an ordinary/background Store.
+        load_forward_fire = !request_valid_q && !flush && load_valid &&
+                            load_forward_valid && load_memory_allowed &&
                             forward_slot_available &&
-                            !((owner_count == 3'd0) && force_store && store_valid && dcache_rsp.wready);
+                            !(force_store && foreground_store_candidate);
 
-        // Ordinary Store fire
-        store_fire = !flush && (store_state == S_IDLE) && (owner_count == 3'd0) && !mmio_active &&
-                     !load_fire && !mmio_fire && !load_forward_fire &&
-                     store_valid && dcache_rsp.wready;
+        mmio_request_intent = !request_valid_q && !load_forward_fire &&
+                              load_valid && mmio_allowed &&
+                              !(force_store && foreground_store_candidate);
 
-        // Background Store candidate (when cacheable Loads are in-flight during quiet cycles)
-        background_store_candidate = !flush && (owner_count > 3'd0) && !dcache_rsp.valid &&
-                                     (comp_count == 3'd0) && !direct_completion.valid &&
-                                     !load_fire && !mmio_fire && !load_forward_fire &&
-                                     store_valid && (store_state == S_IDLE);
-        background_store_fire = background_store_candidate && dcache_rsp.wready;
+        load_request_intent = !request_valid_q && !load_forward_fire &&
+                              !mmio_request_intent && load_valid &&
+                              cacheable_load_allowed &&
+                              !(force_store && foreground_store_candidate);
+
+        store_request_intent = !request_valid_q &&
+                               ((force_store && foreground_store_candidate) ||
+                                (!load_forward_fire && !mmio_request_intent &&
+                                 !load_request_intent &&
+                                 (foreground_store_candidate ||
+                                  background_store_candidate)));
+
+        // Only the registered request packet observes DCache ready.
+        request_load_fire  = !flush && request_valid_q &&
+                             (request_kind_q == REQ_LOAD) && dcache_rsp.rready;
+        request_mmio_fire  = !flush && request_valid_q &&
+                             (request_kind_q == REQ_MMIO) && dcache_rsp.rready;
+        request_store_fire = !flush && request_valid_q &&
+                             (request_kind_q == REQ_STORE) && dcache_rsp.wready;
+        request_dcache_fire = request_load_fire || request_mmio_fire ||
+                              request_store_fire;
+
+        load_fire = request_load_fire;
+        mmio_fire = request_mmio_fire;
+        store_fire = request_store_fire;
+        background_store_fire = request_store_fire &&
+                                request_background_store_q;
+
+        load_turnaround_suppressed = load_turnaround_eligible &&
+                                     (comp_count == 3'd0) &&
+                                     !direct_completion.valid &&
+                                     request_valid_q &&
+                                     (request_kind_q == REQ_LOAD) &&
+                                     !dcache_rsp.rready;
+
+        turnaround_fire = load_turnaround_eligible &&
+                          (comp_count == 3'd0) &&
+                          !direct_completion.valid && load_fire;
 
         // Performance indicators
         perf_dcache_wait = (owner_count > 3'd0) || (store_state == S_WAIT_STORE) || mmio_active;
@@ -216,26 +290,18 @@ module LsuArbiter (
 
         // Control outputs
         load_issue = load_fire || mmio_fire || load_forward_fire;
-        store_pop = (store_fire && dcache_rsp.wposted) || (store_state == S_WAIT_STORE && dcache_rsp.wresp) || background_store_fire;
+        store_pop = (store_fire && dcache_rsp.wposted) ||
+                    (store_state == S_WAIT_STORE && dcache_rsp.wresp);
 
-        // DCache Request multiplexing
-        dcache_req = '0;
-        if (store_valid && (store_state == S_IDLE)) begin
-            dcache_req.addr = store_entry.address;
-        end
-
-        if (store_line_alloc_valid)
-            dcache_req.addr = store_line_alloc_addr;
-
-        if (load_fire || mmio_fire) begin
-            dcache_req.ren  = make_load_ren(load_entry.load_ext_op, load_entry.address[1:0]);
-            dcache_req.addr = load_entry.address;
-        end else if (store_fire || background_store_fire) begin
-            dcache_req.addr  = store_entry.address;
-            dcache_req.wen   = store_entry.store_wen;
-            dcache_req.wdata = store_entry.store_data;
-        end else if (background_store_candidate) begin
-            dcache_req.addr  = store_entry.address;
+        // The external DCache sees only registered payload.  A flush cancels
+        // the packet before it can handshake: request_*_fire is also blocked
+        // by flush, so exposing valid pins here would let DCache accept a
+        // request which the LSU did not record.  Mask only the valid strobes;
+        // keep flush out of the registered address/write-data datapaths.
+        dcache_req = request_valid_q ? request_payload_q : '0;
+        if (flush) begin
+            dcache_req.ren = `RAM_WE_N;
+            dcache_req.wen = `RAM_WE_N;
         end
 
         // ---------------------------------------------------------------------
@@ -419,6 +485,52 @@ module LsuArbiter (
     logic [1:0] optr;
     logic [1:0] cptr;
 
+    // One-entry non-fall-through request stage.  Its contents remain stable
+    // until DCache accepts the request.  Flush cancels an unaccepted request;
+    // the surviving queue entry can then be selected again after recovery.
+    always_ff @(posedge clk or negedge rstn) begin
+        if (!rstn) begin
+            request_valid_q            <= 1'b0;
+            request_kind_q             <= REQ_NONE;
+            request_payload_q          <= '0;
+            request_entry_q            <= '0;
+            request_background_store_q <= 1'b0;
+        end else if (flush) begin
+            request_valid_q            <= 1'b0;
+            request_kind_q             <= REQ_NONE;
+            request_payload_q          <= '0;
+            request_entry_q            <= '0;
+            request_background_store_q <= 1'b0;
+        end else if (request_dcache_fire) begin
+            request_valid_q            <= 1'b0;
+            request_kind_q             <= REQ_NONE;
+            request_payload_q          <= '0;
+            request_entry_q            <= '0;
+            request_background_store_q <= 1'b0;
+        end else if (!request_valid_q) begin
+            if (mmio_request_intent) begin
+                request_valid_q            <= 1'b1;
+                request_kind_q             <= REQ_MMIO;
+                request_payload_q          <= load_intent_payload;
+                request_entry_q            <= load_entry;
+                request_background_store_q <= 1'b0;
+            end else if (load_request_intent) begin
+                request_valid_q            <= 1'b1;
+                request_kind_q             <= REQ_LOAD;
+                request_payload_q          <= load_intent_payload;
+                request_entry_q            <= load_entry;
+                request_background_store_q <= 1'b0;
+            end else if (store_request_intent) begin
+                request_valid_q            <= 1'b1;
+                request_kind_q             <= REQ_STORE;
+                request_payload_q          <= store_intent_payload;
+                request_entry_q            <= store_entry;
+                request_background_store_q <= background_store_candidate &&
+                                              !foreground_store_candidate;
+            end
+        end
+    end
+
     always_ff @(posedge clk or negedge rstn) begin
         if (!rstn) begin
             owner_head  <= 2'b0;
@@ -493,7 +605,7 @@ module LsuArbiter (
             // Store State Machine
             if (store_fire && !dcache_rsp.wposted) begin
                 store_state <= S_WAIT_STORE;
-                store_active_entry <= store_entry;
+                store_active_entry <= request_entry_q;
             end else if (store_state == S_WAIT_STORE && dcache_rsp.wresp) begin
                 store_state <= S_IDLE;
             end
@@ -502,8 +614,8 @@ module LsuArbiter (
             if (owner_pop_do) begin
                 owner_head <= owner_head + 2'd1;
             end
-            if (load_fire && !load_is_mmio) begin
-                owner_fifo[owner_tail].entry  <= load_entry;
+            if (load_fire) begin
+                owner_fifo[owner_tail].entry  <= request_entry_q;
                 owner_fifo[owner_tail].killed <= 1'b0;
                 owner_fifo[owner_tail].is_mmio <= 1'b0;
 `ifndef SYNTHESIS
@@ -512,7 +624,8 @@ module LsuArbiter (
 `endif
                 owner_tail <= owner_tail + 2'd1;
             end
-            owner_count <= owner_count + ((load_fire && !load_is_mmio) ? 3'd1 : 3'd0) - (owner_pop_do ? 3'd1 : 3'd0);
+            owner_count <= owner_count + (load_fire ? 3'd1 : 3'd0) -
+                           (owner_pop_do ? 3'd1 : 3'd0);
 
             // Completion Queue Pushes & Pops
             if (comp_pop_do) begin
@@ -531,7 +644,7 @@ module LsuArbiter (
             // MMIO Owner Tracking
             if (mmio_fire) begin
                 mmio_active <= 1'b1;
-                mmio_owner.entry  <= load_entry;
+                mmio_owner.entry  <= request_entry_q;
                 mmio_owner.killed <= 1'b0;
                 mmio_owner.is_mmio <= 1'b1;
             end else if (dcache_rsp.valid && mmio_active) begin
@@ -615,7 +728,7 @@ module LsuArbiter (
     logic [2:0] cq_push;
     logic [2:0] cq_pop;
 
-    assign owner_alloc = (load_fire && !load_is_mmio) ? 3'd1 : 3'd0;
+    assign owner_alloc = load_fire ? 3'd1 : 3'd0;
     assign owner_resp  = owner_pop_do ? 3'd1 : 3'd0;
     assign cq_push     = comp_push_do ? 3'd1 : 3'd0;
     assign cq_pop      = comp_pop_do ? 3'd1 : 3'd0;
@@ -647,7 +760,7 @@ module LsuArbiter (
                 $fatal(1, "[ASSERT-LSU-2A] reserved_next exceeded 4!");
 
             // 3. Mutual exclusion between load_forward_fire and cacheable load_fire
-            if (load_forward_fire && load_fire && !load_is_mmio)
+            if (load_forward_fire && load_fire)
                 $fatal(1, "[ASSERT-LSU-2A] load_forward_fire and load_fire active simultaneously!");
 
             // 4. DCache response requires active owner
@@ -655,7 +768,7 @@ module LsuArbiter (
                 $fatal(1, "[ASSERT-LSU-2A] DCache response arrived while owner FIFO is empty!");
 
             // 5. One load fire pushes exactly 1 owner
-            if (load_fire && !load_is_mmio) begin
+            if (load_fire) begin
                 if (owner_count == 3'd4 && !owner_pop_do)
                     $fatal(1, "[ASSERT-LSU-2A] Load fired while owner FIFO full without pop!");
             end
@@ -669,6 +782,20 @@ module LsuArbiter (
             // 7. Load and Store cannot simultaneously drive DCache request
             if ((|dcache_req.ren) && (|dcache_req.wen))
                 $fatal(1, "[ASSERT-LSU-2A] DCache request collision: ren and wen active simultaneously!");
+
+            // The DCache-facing protocol is driven exclusively by the
+            // registered request kind and payload.
+            if (!request_valid_q && ((|dcache_req.ren) || (|dcache_req.wen)))
+                $fatal(1, "[ASSERT-LSU-REQ] request pins active without a registered request!");
+            if (request_valid_q && request_kind_q == REQ_NONE)
+                $fatal(1, "[ASSERT-LSU-REQ] valid request has no owner kind!");
+            if (!flush && request_valid_q &&
+                ((request_kind_q == REQ_LOAD) || (request_kind_q == REQ_MMIO)) &&
+                (!(|dcache_req.ren) || (|dcache_req.wen)))
+                $fatal(1, "[ASSERT-LSU-REQ] malformed registered Load request!");
+            if (!flush && request_valid_q && request_kind_q == REQ_STORE &&
+                (!(|dcache_req.wen) || (|dcache_req.ren)))
+                $fatal(1, "[ASSERT-LSU-REQ] malformed registered Store request!");
 
             // 8. MMIO and ordinary owner FIFO cannot be in-flight together
             if (mmio_active && owner_count > 3'd0)

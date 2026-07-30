@@ -1,5 +1,5 @@
 param(
-    [ValidateSet('rob16', 'rob16_ext', 'dispatch_queue4', 'rat32', 'rat32_ext', 'lsu', 'lsu_ext', 'lsu_forward', 'dcache', 'privilege', 'decoder')]
+    [ValidateSet('rob16', 'rob16_ext', 'dispatch_queue4', 'rat32', 'rat32_ext', 'lsu', 'lsu_ext', 'lsu_forward', 'store_queue_decoupled', 'dcache', 'privilege', 'decoder')]
     [string]$Test = 'rob16',
     [int]$Seed = 1,
     [int]$Cycles = 1000,
@@ -103,6 +103,14 @@ try {
                 (Join-Path $rtl 'lsu_arbiter.sv'),
                 (Join-Path $rtl 'load_data_aligner.sv'),
                 (Join-Path $rtl 'load_store_unit.sv'),
+                $tb
+            )
+        }
+        'store_queue_decoupled' {
+            $top = 'tb_store_queue_decoupled'
+            $sources = @(
+                $package,
+                (Join-Path $rtl 'store_queue.sv'),
                 $tb
             )
         }
