@@ -244,6 +244,7 @@ module DCache (
     reg [63:0] ord_release_cnt;
     reg [63:0] ord_full_block_cnt;
     reg [ 2:0] ord_max_occupancy;
+`endif
 
 `ifdef ENABLE_DCACHE_NEXTLINE_PREFETCH
     reg [1:0]  pf_confidence;         // 2-bit saturating stream confidence counter (0..3), threshold >= 2
@@ -263,6 +264,7 @@ module DCache (
     reg        req_is_prefetch_r;
     reg        mshr_is_prefetch;
 
+`ifndef SYNTHESIS
     reg [63:0] pf_candidate_cnt;
     reg [63:0] pf_pending_overwrite_cnt;
     reg [63:0] pf_launch_cnt;
