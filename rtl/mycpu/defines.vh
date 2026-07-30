@@ -4,6 +4,7 @@
 `define ENABLE_ICACHE
 `define ENABLE_DCACHE
 `define ENABLE_BPU
+`define ENABLE_DCACHE_NEXTLINE_PREFETCH
 
 // The out-of-order backend can retire two architectural register writes per
 // cycle.  Enable the matching two-wide simulation checker by default.  Comment
