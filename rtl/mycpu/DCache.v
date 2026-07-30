@@ -256,18 +256,16 @@ module DCache (
 
     reg        pf_pending_valid;
     reg [26:0] pf_pending_line;
-
-    reg        req_is_prefetch_r;
-    reg        mshr_is_prefetch;
 `else
     wire [1:0]  pf_confidence = 2'd0;
     wire        pf_last_demand_valid = 1'b0;
     wire [26:0] pf_last_demand_line = 27'd0;
     wire        pf_pending_valid = 1'b0;
     wire [26:0] pf_pending_line = 27'd0;
-    wire        req_is_prefetch_r = 1'b0;
-    wire        mshr_is_prefetch = 1'b0;
 `endif
+
+    reg        req_is_prefetch_r;
+    reg        mshr_is_prefetch;
 
     reg [63:0] pf_candidate_cnt;
     reg [63:0] pf_pending_overwrite_cnt;
@@ -731,9 +729,7 @@ module DCache (
             req_ren_r         <= 4'h0;
             req_rcacheable_r  <= 1'b0;
             req_slot_r        <= 2'd0;
-`ifdef ENABLE_DCACHE_NEXTLINE_PREFETCH
             req_is_prefetch_r <= 1'b0;
-`endif
         end else if (pf_launch) begin
             req_raddr_r       <= {pf_pending_line, 5'b0};
             req_ren_r         <= 4'hf;
@@ -944,9 +940,7 @@ module DCache (
             mshr_valid              <= 1'b0;
             mshr_slot_id            <= 2'd0;
             mshr_critical_done      <= 1'b0;
-`ifdef ENABLE_DCACHE_NEXTLINE_PREFETCH
             mshr_is_prefetch        <= 1'b0;
-`endif
             probe_checking_r        <= 1'b0;
             replay_pending          <= 1'b0;
             replay_raddr_r          <= 32'h0;
@@ -973,9 +967,7 @@ module DCache (
                 mshr_valid             <= 1'b1;
                 mshr_slot_id           <= req_slot_r;
                 mshr_critical_done     <= 1'b0;
-`ifdef ENABLE_DCACHE_NEXTLINE_PREFETCH
-                mshr_is_prefetch        <= req_is_prefetch_r;
-`endif
+                mshr_is_prefetch       <= req_is_prefetch_r;
             end
 
             if (refill_commit) begin
