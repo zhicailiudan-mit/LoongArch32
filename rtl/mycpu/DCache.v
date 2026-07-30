@@ -245,6 +245,48 @@ module DCache (
     reg [63:0] ord_full_block_cnt;
     reg [ 2:0] ord_max_occupancy;
 
+`ifndef ENABLE_DCACHE_NEXTLINE_PREFETCH
+`define ENABLE_DCACHE_NEXTLINE_PREFETCH
+`endif
+
+`ifdef ENABLE_DCACHE_NEXTLINE_PREFETCH
+    reg [1:0]  pf_confidence;         // 2-bit saturating stream confidence counter (0..3), threshold >= 2
+    reg        pf_last_demand_valid;
+    reg [26:0] pf_last_demand_line;
+
+    reg        pf_pending_valid;
+    reg [26:0] pf_pending_line;
+
+    reg        req_is_prefetch_r;
+    reg        mshr_is_prefetch;
+`else
+    wire [1:0]  pf_confidence = 2'd0;
+    wire        pf_last_demand_valid = 1'b0;
+    wire [26:0] pf_last_demand_line = 27'd0;
+    wire        pf_pending_valid = 1'b0;
+    wire [26:0] pf_pending_line = 27'd0;
+    wire        req_is_prefetch_r = 1'b0;
+    wire        mshr_is_prefetch = 1'b0;
+`endif
+
+    reg [63:0] pf_candidate_cnt;
+    reg [63:0] pf_pending_overwrite_cnt;
+    reg [63:0] pf_launch_cnt;
+    reg [63:0] pf_tag_hit_redundant_cnt;
+    reg [63:0] pf_fill_complete_cnt;
+    reg [63:0] pf_useful_hit_cnt;
+    reg [63:0] pf_useless_evict_cnt;
+    reg [63:0] pf_demand_merge_imm_cnt;
+    reg [63:0] pf_demand_merge_wait_cnt;
+    reg [63:0] pf_blocked_demand_cnt;
+    reg [63:0] pf_blocked_store_cnt;
+    reg [63:0] pf_blocked_mshr_cnt;
+    reg [63:0] pf_cross_4k_cnt;
+    reg [63:0] pf_uncached_filtered_cnt;
+
+    reg [`CACHE_BLK_NUM-1:0] pf_line_way0;
+    reg [`CACHE_BLK_NUM-1:0] pf_line_way1;
+
     // Phase A2: 2-bit Confidence Stream Detector Observational Model
     reg [1:0]  stream_conf;           // 2-bit saturating counter (0..3), threshold >= 2
     reg [26:0] last_miss_line;
@@ -361,7 +403,7 @@ module DCache (
     wire miss_way = (!valid_bit0 || !line_enabled0[r_cache_index]) ? 1'b0 :
                     ((!valid_bit1 || !line_enabled1[r_cache_index]) ? 1'b1 :
                      replace_way[r_cache_index]);
-    wire hit_r = (r_state == R_TAG_CHK) && r_hit;
+    wire hit_r = (r_state == R_TAG_CHK) && r_hit && !req_is_prefetch_r;
     wire hit_w = (w_state == W_TAG_CHK) && w_hit;
 
     // Parameterized ordered Load Request FIFO.  Depth 1 is the measured
@@ -603,26 +645,115 @@ module DCache (
     // Load Req FIFO 入队：所有 accepted 读请求均存入 req_fifo 建立 registered ownership boundary
     wire req_fifo_push = read_accept;
 
+    wire cache_idle = (r_state == R_IDLE) &&
+                      (w_state == W_IDLE) &&
+                      (req_fifo_count == 2'd0) &&
+                      !read_accept &&
+                      !(|data_ren) &&
+                      (ord_count == 3'd0) &&
+                      (store_fifo_count == 3'd0) &&
+                      !replay_pending &&
+                      !same_wait_any &&
+                      !probe_checking_r &&
+                      !mshr_valid &&
+                      !maint_active &&
+                      !maint_valid;
+
+`ifdef ENABLE_DCACHE_NEXTLINE_PREFETCH
+    wire pf_launch = pf_pending_valid && cache_idle;
+`else
+    wire pf_launch = 1'b0;
+`endif
+
+    wire demand_observe = read_accept && !incoming_r_uncached;
+    wire [26:0] curr_demand_line = data_addr[31:5];
+    wire [26:0] next_demand_line = curr_demand_line + 27'd1;
+    wire [31:0] next_line_addr   = {next_demand_line, 5'b0};
+    wire [31:0] curr_line_addr   = {curr_demand_line, 5'b0};
+    wire        cand_same_4k     = (curr_line_addr[31:12] == next_line_addr[31:12]);
+    wire        cand_uncached    = is_uncached_request(next_line_addr, 1'b1);
+    wire        cand_pass        = cand_same_4k && !cand_uncached;
+
+    reg [1:0] pf_confidence_next;
+    always @(*) begin
+        pf_confidence_next = pf_confidence;
+        if (demand_observe) begin
+            if (pf_last_demand_valid) begin
+                if (curr_demand_line == pf_last_demand_line + 27'd1) begin
+                    pf_confidence_next = (pf_confidence == 2'd3) ? 2'd3 : (pf_confidence + 2'd1);
+                end else if (curr_demand_line != pf_last_demand_line) begin
+                    pf_confidence_next = (pf_confidence == 2'd0) ? 2'd0 : (pf_confidence - 2'd1);
+                end
+            end else begin
+                pf_confidence_next = 2'd0;
+            end
+        end
+    end
+
+`ifdef ENABLE_DCACHE_NEXTLINE_PREFETCH
+    always @(posedge cpu_clk or negedge cpu_rstn) begin
+        if (!cpu_rstn) begin
+            pf_confidence        <= 2'd0;
+            pf_last_demand_valid <= 1'b0;
+            pf_last_demand_line  <= 27'd0;
+            pf_pending_valid     <= 1'b0;
+            pf_pending_line      <= 27'd0;
+        end else begin
+            if (demand_observe) begin
+                pf_confidence        <= pf_confidence_next;
+                pf_last_demand_valid <= 1'b1;
+                pf_last_demand_line  <= curr_demand_line;
+
+                if (cand_pass && (pf_confidence_next >= 2'd2)) begin
+                    pf_pending_valid <= 1'b1;
+                    pf_pending_line  <= next_demand_line;
+                end else if (curr_demand_line == pf_pending_line) begin
+                    pf_pending_valid <= 1'b0;
+                end
+            end
+
+            if (pf_launch) begin
+                pf_pending_valid <= 1'b0;
+            end else if ((r_state == R_TAG_CHK) && r_hit && req_is_prefetch_r) begin
+                pf_pending_valid <= 1'b0;
+            end
+        end
+    end
+`endif
+
     wire [INDEX_WID-1:0] incoming_index =
         data_addr[INDEX_WID+OFFSET_WID-1:OFFSET_WID];
 
     // Load req_r* 寄存器更新 (including ord slot propagation)
     always @(posedge cpu_clk or negedge cpu_rstn) begin
         if (!cpu_rstn) begin
-            req_raddr_r      <= 32'h0;
-            req_ren_r        <= 4'h0;
-            req_rcacheable_r <= 1'b0;
-            req_slot_r       <= 2'd0;
+            req_raddr_r       <= 32'h0;
+            req_ren_r         <= 4'h0;
+            req_rcacheable_r  <= 1'b0;
+            req_slot_r        <= 2'd0;
+`ifdef ENABLE_DCACHE_NEXTLINE_PREFETCH
+            req_is_prefetch_r <= 1'b0;
+`endif
+        end else if (pf_launch) begin
+            req_raddr_r       <= {pf_pending_line, 5'b0};
+            req_ren_r         <= 4'hf;
+            req_rcacheable_r  <= 1'b1;
+            req_slot_r        <= 2'd0;
+            req_is_prefetch_r <= 1'b1;
         end else if (replay_pending && (r_state == R_REFILL || r_state == R_IDLE)) begin
-            req_raddr_r      <= replay_raddr_r;
-            req_ren_r        <= replay_ren_r;
-            req_rcacheable_r <= replay_rcacheable_r;
-            req_slot_r       <= replay_slot_r;
+            req_raddr_r       <= replay_raddr_r;
+            req_ren_r         <= replay_ren_r;
+            req_rcacheable_r  <= replay_rcacheable_r;
+            req_slot_r        <= replay_slot_r;
+            req_is_prefetch_r <= 1'b0;
         end else if (req_fifo_start) begin
-            req_raddr_r      <= req_fifo_addr[req_fifo_head];
-            req_ren_r        <= req_fifo_ren[req_fifo_head];
-            req_rcacheable_r <= req_fifo_cacheable[req_fifo_head];
-            req_slot_r       <= req_fifo_slot[req_fifo_head];
+            req_raddr_r       <= req_fifo_addr[req_fifo_head];
+            req_ren_r         <= req_fifo_ren[req_fifo_head];
+            req_rcacheable_r  <= req_fifo_cacheable[req_fifo_head];
+            req_slot_r        <= req_fifo_slot[req_fifo_head];
+            req_is_prefetch_r <= 1'b0;
+        end else if ((r_state == R_TAG_CHK) && r_hit && req_is_prefetch_r) begin
+            req_is_prefetch_r <= 1'b0;
         end
     end
 
@@ -705,12 +836,16 @@ module DCache (
                 end else if (req_fifo_start) begin
                     if (req_fifo_head_uncached) r_nstat = R_UNC_REQ;
                     else                        r_nstat = R_TAG_CHK;
+                end else if (pf_launch) begin
+                    r_nstat = R_TAG_CHK;
                 end else r_nstat = R_IDLE;
             end
             
             R_TAG_CHK: begin
                 if (r_hit) begin
-                    if (replay_pending) begin
+                    if (req_is_prefetch_r) begin
+                        r_nstat = R_IDLE;
+                    end else if (replay_pending) begin
                         if (replay_r_uncached) r_nstat = R_UNC_REQ;
                         else                   r_nstat = R_TAG_CHK;
                     end else if (req_fifo_start) begin
@@ -809,6 +944,9 @@ module DCache (
             mshr_valid              <= 1'b0;
             mshr_slot_id            <= 2'd0;
             mshr_critical_done      <= 1'b0;
+`ifdef ENABLE_DCACHE_NEXTLINE_PREFETCH
+            mshr_is_prefetch        <= 1'b0;
+`endif
             probe_checking_r        <= 1'b0;
             replay_pending          <= 1'b0;
             replay_raddr_r          <= 32'h0;
@@ -835,11 +973,17 @@ module DCache (
                 mshr_valid             <= 1'b1;
                 mshr_slot_id           <= req_slot_r;
                 mshr_critical_done     <= 1'b0;
+`ifdef ENABLE_DCACHE_NEXTLINE_PREFETCH
+                mshr_is_prefetch        <= req_is_prefetch_r;
+`endif
             end
 
             if (refill_commit) begin
                 mshr_valid         <= 1'b0;
                 mshr_critical_done <= 1'b0;
+`ifdef ENABLE_DCACHE_NEXTLINE_PREFETCH
+                mshr_is_prefetch   <= 1'b0;
+`endif
             end
 
             if (refill_word_valid) begin
@@ -977,9 +1121,9 @@ module DCache (
         end
     end
 
-    wire ord_write_event = refill_word_valid || ord_aux_event ||
+    wire ord_write_event = (refill_word_valid && !mshr_is_prefetch) || ord_aux_event ||
                            (|same_wait_beat_match);
-    wire ord_refill_completes_head = refill_word_valid &&
+    wire ord_refill_completes_head = refill_word_valid && !mshr_is_prefetch &&
                                      (mshr_slot_id == ord_head);
     wire ord_aux_completes_head = ord_aux_event &&
                                   (ord_aux_slot == ord_head);
@@ -1035,7 +1179,7 @@ module DCache (
             // Refill critical data and one independent completion may land
             // together.  They belong to distinct accepted requests and are
             // written into distinct slots; an assertion below enforces this.
-            if (refill_word_valid) begin
+            if (refill_word_valid && !mshr_is_prefetch) begin
                 if (!(ord_complete_head_now &&
                       (mshr_slot_id == ord_head))) begin
                     ord_ready[mshr_slot_id] <= 1'b1;
@@ -1080,7 +1224,7 @@ module DCache (
     always @(*) begin
         response_owner = RESP_NONE;
 
-        if (refill_word_valid)                    response_owner = RESP_REFILL_CRITICAL;
+        if (refill_word_valid && !mshr_is_prefetch) response_owner = RESP_REFILL_CRITICAL;
         else if (|same_wait_beat_match)             response_owner = RESP_HUR_SAME_TARGET_BEAT;
         else if (hur_same_line_imm_hit)            response_owner = RESP_HUR_SAME_IMMEDIATE;
         else if (hur_probe_hit)                    response_owner = RESP_HUR_DIFFERENT_LINE;
@@ -1844,19 +1988,19 @@ module DCache (
                 !(ord_ready_release && (ord_slot_alloc == ord_head)))
                 $fatal(1, "[DCACHE-ASSERT] Allocated an occupied response-order slot!");
 
-            if (refill_word_valid && !ord_valid[mshr_slot_id])
+            if (refill_word_valid && !mshr_is_prefetch && !ord_valid[mshr_slot_id])
                 $fatal(1, "[DCACHE-ASSERT] Refill critical response targets an unallocated slot!");
 
             if (ord_aux_event && !ord_valid[ord_aux_slot])
                 $fatal(1, "[DCACHE-ASSERT] Load completion targets an unallocated slot!");
 
-            if (refill_word_valid && ord_ready[mshr_slot_id])
+            if (refill_word_valid && !mshr_is_prefetch && ord_ready[mshr_slot_id])
                 $fatal(1, "[DCACHE-ASSERT] Refill response filled a slot twice!");
 
             if (ord_aux_event && ord_ready[ord_aux_slot])
                 $fatal(1, "[DCACHE-ASSERT] Load response filled a slot twice!");
 
-            if (refill_word_valid && ord_aux_event &&
+            if (refill_word_valid && !mshr_is_prefetch && ord_aux_event &&
                 (mshr_slot_id == ord_aux_slot))
                 $fatal(1, "[DCACHE-ASSERT] Two completion sources target the same slot!");
 
@@ -1864,11 +2008,11 @@ module DCache (
                 $fatal(1, "[DCACHE-ASSERT] Attempted to overwrite the active MSHR!");
 
             if ((r_state == R_TAG_CHK) && !r_hit && !mshr_valid &&
-                !ord_valid[req_slot_r])
+                !ord_valid[req_slot_r] && !req_is_prefetch_r)
                 $fatal(1, "[DCACHE-ASSERT] MSHR allocation has no response-order owner!");
 
             if (mshr_valid && !mshr_critical_done &&
-                !ord_valid[mshr_slot_id])
+                !ord_valid[mshr_slot_id] && !mshr_is_prefetch)
                 $fatal(1, "[DCACHE-ASSERT] Pending critical word lost its response-order owner!");
 
             if (refill_word_valid && !mshr_valid)

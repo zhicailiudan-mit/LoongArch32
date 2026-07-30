@@ -1,5 +1,5 @@
 param(
-    [ValidateSet('rob16', 'rob16_ext', 'dispatch_queue4', 'rat32', 'rat32_ext', 'lsu', 'lsu_ext', 'lsu_forward', 'store_queue_decoupled', 'dcache', 'privilege', 'decoder')]
+    [ValidateSet('rob16', 'rob16_ext', 'dispatch_queue4', 'rat32', 'rat32_ext', 'lsu', 'lsu_ext', 'lsu_forward', 'store_queue_decoupled', 'dcache', 'dcache_nextline_prefetch', 'privilege', 'decoder')]
     [string]$Test = 'rob16',
     [int]$Seed = 1,
     [int]$Cycles = 1000,
@@ -116,6 +116,14 @@ try {
         }
         'dcache' {
             $top = 'tb_dcache'
+            $ipRoot = Join-Path $root 'rtl\xilinx_ip\blk_mem_gen_0'
+            $ipModel = Join-Path $ipRoot 'simulation\blk_mem_gen_v8_4.v'
+            $ipWrapper = Join-Path $ipRoot 'sim\blk_mem_gen_0.v'
+            $sources = @($ipModel, $ipWrapper, (Join-Path $rtl 'DCache.v'), $tb)
+        }
+        'dcache_nextline_prefetch' {
+            $top = 'tb_dcache_nextline_prefetch'
+            $tb = Join-Path $unit 'tb_dcache_nextline_prefetch.sv'
             $ipRoot = Join-Path $root 'rtl\xilinx_ip\blk_mem_gen_0'
             $ipModel = Join-Path $ipRoot 'simulation\blk_mem_gen_v8_4.v'
             $ipWrapper = Join-Path $ipRoot 'sim\blk_mem_gen_0.v'
