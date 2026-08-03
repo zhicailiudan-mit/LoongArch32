@@ -58,6 +58,7 @@ module RenameDispatch (
     wire lane1_resources_ready;
     wire dispatch0_fire;
     wire dispatch1_fire;
+    wire lane0_query_alloc_valid;
 
     assign source_used[0] = renamed_uop[0].src0.used;
     assign source_used[1] = renamed_uop[0].src1.used;
@@ -103,6 +104,11 @@ module RenameDispatch (
                             !redirect_valid;
     assign dispatch1_fire = rn_valid[1] && dispatch0_fire &&
                             lane1_resources_ready;
+    // The registered rename bundle already owns both uops.  Use that stable
+    // presence to describe the potential lane0->lane1 dependency; actual RAT
+    // mutation remains qualified by dispatch[0].valid below.
+    assign lane0_query_alloc_valid = rn_valid[0] && rn_valid[1] &&
+                                     !redirect_valid;
     assign rename_pop_count = dispatch1_fire ? 2'd2 :
                               dispatch0_fire ? 2'd1 : 2'd0;
 
@@ -146,6 +152,7 @@ module RenameDispatch (
         .clk             (clk),
         .rstn            (rstn),
         .alloc_valid     (dispatch[0].valid),
+        .query_alloc_valid(lane0_query_alloc_valid),
         .alloc_rf_we     (renamed_uop[0].reg_write),
         .alloc_rd        (renamed_uop[0].arch_rd),
         .alloc_tag       (rob_alloc_id[0].rob_tag),

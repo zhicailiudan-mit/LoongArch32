@@ -4,13 +4,10 @@ import cpu_types_pkg::*;
 
 module StoreQueue #(
     parameter integer DEPTH = 4,
-    // A registered release boundary keeps the StoreQueue's oldest-entry
-    // selection out of the same-cycle StoreBuffer ready/accept path.  The
-    // parameter is retained for small standalone tests which still need the
-    // historical fall-through behavior; the CPU build uses the registered
-    // mode so the queue scales as an elastic producer rather than a
-    // combinational FIFO.
-    parameter bit REGISTERED_RELEASE = 1'b1
+    // Retained for source compatibility with older focused testbenches.  The
+    // release path below always uses the narrow registered owner token; the
+    // old full-packet delayed-release mode is intentionally not selectable.
+    parameter bit REGISTERED_RELEASE = 1'b0
 ) (
     input logic clk, input logic rstn,
     input logic flush,
@@ -134,19 +131,19 @@ module StoreQueue #(
     uop_id_t addr_update1_q_data_src_id;
 
     logic [COUNT_W-1:0] count;
-    // Registered, capped free-slot credit.  Three credits cover the two-entry
-    // DQ token FIFO plus the one-entry handoff into the Scheduler FIFO while
-    // keeping the two-bit interface.  Scheduler uses this state to
-    // admit a Store before the SQ ready/oldest comparator is evaluated; the
-    // combinational SQ ready path therefore cannot return into DQ selection.
-    logic [1:0] reserve_credit_q;
-    logic [INDEX_W-1:0] oldest_sel;
-    logic oldest_found;
-    logic release_pending_q;
-    lsu_entry_t release_pending_entry_q;
+    // Registered release ownership is only an array index plus valid bit.
+    // Full uop-id/age selection terminates at this narrow register; wide
+    // metadata/data CEs use the registered owner on the release edge.
+    logic release_owner_valid_q;
+    logic [INDEX_W-1:0] release_owner_sel_q;
+    logic release_owner_next_valid;
+    logic [INDEX_W-1:0] release_owner_next_sel;
+
+    // The externally visible capped free-slot credit and ready signals account
+    // for an actual same-cycle release below.
     logic release_candidate_valid;
     lsu_entry_t release_candidate_entry;
-    integer i, j, q, byte_i;
+    integer i, j, q, byte_i, owner_scan;
     integer flush_dst;
 
     function automatic [3:0] compute_store_wen(input [3:0] raw_mask, input [1:0] off);
@@ -289,45 +286,6 @@ module StoreQueue #(
         end
     endfunction
 
-    // The live StoreQueue is four entries deep.  Select its oldest entry with
-    // a balanced tournament instead of the serial scan below.  The comparator
-    // polarity matches the original scan: when the left entry is younger,
-    // the right entry wins as the older one.
-    function automatic [2:0] pick_oldest4(
-        input logic [3:0] mask,
-        input uop_id_t id0, input uop_id_t id1,
-        input uop_id_t id2, input uop_id_t id3
-    );
-        logic valid01, valid23;
-        logic [1:0] sel01, sel23;
-        uop_id_t win01, win23;
-        begin
-            valid01 = mask[0] | mask[1];
-            valid23 = mask[2] | mask[3];
-            if (mask[0] && (!mask[1] || uop_is_younger(id1, id0))) begin
-                sel01 = 2'd0;
-                win01 = id0;
-            end else begin
-                sel01 = 2'd1;
-                win01 = id1;
-            end
-            if (mask[2] && (!mask[3] || uop_is_younger(id3, id2))) begin
-                sel23 = 2'd2;
-                win23 = id2;
-            end else begin
-                sel23 = 2'd3;
-                win23 = id3;
-            end
-
-            if (!valid01 && !valid23)
-                pick_oldest4 = 3'b000;
-            else if (valid01 && (!valid23 || uop_is_younger(win23, win01)))
-                pick_oldest4 = {1'b1, sel01};
-            else
-                pick_oldest4 = {1'b1, sel23};
-        end
-    endfunction
-
 `ifndef SYNTHESIS
     localparam integer RELEASE_HISTORY_DEPTH = 16;
     logic release_history_valid [0:RELEASE_HISTORY_DEPTH-1];
@@ -336,7 +294,8 @@ module StoreQueue #(
     logic [63:0] release_history_serial [0:RELEASE_HISTORY_DEPTH-1];
     logic [63:0] entry_serial [0:DEPTH-1];
     logic [63:0] next_alloc_serial;
-    wire [63:0] release_serial = oldest_found ? entry_serial[oldest_sel] : 64'd0;
+    wire [63:0] release_serial = release_owner_valid_q ?
+                                  entry_serial[release_owner_sel_q] : 64'd0;
 `endif
 
     // Effective reservation signals combining new decoupled interface and legacy accept
@@ -419,14 +378,11 @@ module StoreQueue #(
                          ((commit0.valid && uop_id_equal(r1_uop_id, commit0.uop_id)) ||
                           (commit1.valid && uop_id_equal(r1_uop_id, commit1.uop_id)));
 
-    // In registered-release mode the StoreQueue removes an entry only after
-    // the already-registered release packet is accepted by the StoreBuffer.
-    // Consequently the oldest-entry comparator is never in the same-cycle
-    // ready/accept/compaction cone.  The legacy mode keeps the old behavior
-    // for focused unit tests.
-    wire release_do = !flush && release_fire &&
-                      (REGISTERED_RELEASE ? release_pending_q :
-                       release_candidate_valid);
+    // The owner token is already registered when the StoreBuffer handshake
+    // reaches this edge.  The wide compaction/write path therefore sees only
+    // this narrow selector, while release remains a direct same-cycle
+    // valid/ready transaction for the selected entry.
+    wire release_do = !flush && release_candidate_valid && release_fire;
 
     // Account for same-cycle release when computing free slots.  Without this,
     // a steady-state SQ at DEPTH sees free_slots==0 for one cycle each time it
@@ -435,63 +391,19 @@ module StoreQueue #(
     // blocking branches from issuing → ROB cannot commit → SQ entries stay
     // uncommitted → SQ never drains → deadlock.
     //
-    // Combinational-loop safety: release_do depends on release_fire (input from
-    // LSU/SB, driven by release_valid && buffer_ready) and oldest_found /
-    // committed / data_ready (all registered SQ state).  None of these depend on
-    // free_slots or reserve*_ready, so the path is strictly feed-forward:
-    //   release_do → free_slots → reserve*_ready → Scheduler → DQ.
+    // Combinational-loop safety: release_do depends on release_fire (the
+    // downstream handshake input) and the registered owner/state only.  The
+    // release output does not depend on reserve*_ready; reserve admission may
+    // consume the released physical slot only when that handshake is real.
     wire [COUNT_W:0] free_slots = (DEPTH - count) + {{COUNT_W{1'b0}}, release_do};
-    // Do not expose the same-cycle release through the reservation interface.
-    // `release_do` is driven by the StoreBuffer handshake and its oldest-entry
-    // uop-id comparisons.  Feeding it into reserve_credit/reserve*_ready lets
-    // that completion cone return through Scheduler and the DispatchQueue in
-    // the same cycle.  The queue state is updated at this edge, so the next
-    // cycle sees the freed slot without any correctness loss; the only change
-    // is a conservative one-cycle bubble when a full SQ releases an entry.
-    // Keep free_slots for the internal compact/append update, where the
-    // same-cycle release is required to place a newly accepted reservation in
-    // the vacated physical slot.
-    wire [COUNT_W:0] reserve_visible_slots = DEPTH - count;
-    wire [COUNT_W:0] reserve_free_after = (DEPTH - count) +
-                                           {{COUNT_W{1'b0}}, release_do} -
-                                           {{COUNT_W{1'b0}}, r0_do} -
-                                           {{COUNT_W{1'b0}}, r1_do};
-    wire [1:0] reserve_credit_next =
-        (reserve_free_after >= 3) ? 2'd3 : reserve_free_after[1:0];
-
-    generate
-        if (DEPTH == 4) begin : GEN_OLDEST4
-            wire [3:0] oldest_mask4 = {
-                (entries[3].valid && (3 < count)),
-                (entries[2].valid && (2 < count)),
-                (entries[1].valid && (1 < count)),
-                (entries[0].valid && (0 < count))
-            };
-            wire [2:0] oldest_pick4 = pick_oldest4(
-                oldest_mask4,
-                entries[0].uop_id, entries[1].uop_id,
-                entries[2].uop_id, entries[3].uop_id);
-            always_comb begin
-                oldest_found = oldest_pick4[2];
-                oldest_sel = oldest_pick4[INDEX_W-1:0];
-            end
-        end else begin : GEN_OLDEST_GENERIC
-            always_comb begin
-                oldest_found = 1'b0;
-                oldest_sel = '0;
-                for (i = 0; i < DEPTH; i = i + 1) begin
-                    if ((i < count) && entries[i].valid &&
-                        (!oldest_found || uop_is_younger(entries[oldest_sel].uop_id,
-                                                         entries[i].uop_id))) begin
-                        oldest_found = 1'b1;
-                        oldest_sel = i[INDEX_W-1:0];
-                    end
-                end
-            end
-        end
-    endgenerate
-
-    assign reserve_credit = flush ? 2'd0 : reserve_credit_q;
+    // Preserve same-cycle release+reserve credit.  The registered owner keeps
+    // the age/full-uop selection out of this wide ready/CE cone, and the
+    // reserve handshake still requires release_do when the queue was full.
+    wire [COUNT_W:0] reserve_visible_slots = free_slots;
+    wire [COUNT_W:0] reserve_credit_slots = free_slots;
+    assign reserve_credit = flush ? 2'd0 :
+                            ((reserve_credit_slots >= 3) ?
+                             2'd3 : reserve_credit_slots[1:0]);
 
     // Combinational address-update acknowledgement searches both existing entries
     // and current-cycle accepted reservation intents.
@@ -523,52 +435,31 @@ module StoreQueue #(
         end
     end
 
-    // Build the current oldest release packet once.  In the CPU build this is
-    // captured into release_pending_entry_q and presented to StoreBuffer on
-    // the following cycle; no downstream ready signal can feed back into the
-    // metadata update path.
+    // Build the release packet from the registered narrow owner.  The owner is
+    // held while the StoreBuffer stalls, so this payload remains stable without
+    // registering the wide packet or delaying release completion.
     always_comb begin
-        release_candidate_valid = !flush && oldest_found &&
-                                  entries[oldest_sel].valid &&
-                                  !entries[oldest_sel].unaligned &&
-                                  committed[oldest_sel] &&
-                                  entries[oldest_sel].addr_ready &&
-                                  store_data_ready[oldest_sel];
+        release_candidate_valid = !flush && release_owner_valid_q &&
+                                  (release_owner_sel_q < count) &&
+                                  entries[release_owner_sel_q].valid &&
+                                  !entries[release_owner_sel_q].unaligned &&
+                                  committed[release_owner_sel_q] &&
+                                  entries[release_owner_sel_q].addr_ready &&
+                                  store_data_ready[release_owner_sel_q];
         release_candidate_entry = '0;
         if (release_candidate_valid) begin
             release_candidate_entry.valid = 1'b1;
-            release_candidate_entry.uop_id = entries[oldest_sel].uop_id;
-            release_candidate_entry.pc = entries[oldest_sel].pc;
-            release_candidate_entry.address = entries[oldest_sel].address;
-            release_candidate_entry.store_wen = entries[oldest_sel].store_wen;
+            release_candidate_entry.uop_id = entries[release_owner_sel_q].uop_id;
+            release_candidate_entry.pc = entries[release_owner_sel_q].pc;
+            release_candidate_entry.address = entries[release_owner_sel_q].address;
+            release_candidate_entry.store_wen = entries[release_owner_sel_q].store_wen;
             release_candidate_entry.store_data = compute_aligned_data(
-                raw_store_data[oldest_sel], entries[oldest_sel].raw_mask,
-                entries[oldest_sel].address[1:0]);
+                raw_store_data[release_owner_sel_q],
+                entries[release_owner_sel_q].raw_mask,
+                entries[release_owner_sel_q].address[1:0]);
             release_candidate_entry.store_data_ready = 1'b1;
-            release_candidate_entry.store_data_src_id = store_data_src_id[oldest_sel];
-        end
-    end
-
-    // Explicit producer-side release register.  It is intentionally a
-    // one-entry elastic boundary: a slow StoreBuffer holds the packet here,
-    // while the StoreQueue state remains untouched until the packet's actual
-    // acceptance.  This makes release completion exactly one pop and removes
-    // the old StoreQueue -> StoreBuffer -> StoreQueue combinational loop.
-    always_ff @(posedge clk or negedge rstn) begin
-        if (!rstn || flush) begin
-            release_pending_q <= 1'b0;
-            release_pending_entry_q <= '0;
-        end else if (REGISTERED_RELEASE) begin
-            if (release_do) begin
-                release_pending_q <= 1'b0;
-                release_pending_entry_q <= '0;
-            end else if (!release_pending_q && release_candidate_valid) begin
-                release_pending_q <= 1'b1;
-                release_pending_entry_q <= release_candidate_entry;
-            end
-        end else begin
-            release_pending_q <= 1'b0;
-            release_pending_entry_q <= '0;
+            release_candidate_entry.store_data_src_id =
+                store_data_src_id[release_owner_sel_q];
         end
     end
 
@@ -591,15 +482,9 @@ module StoreQueue #(
         end
 
         release_entry = '0;
-        if (REGISTERED_RELEASE) begin
-            release_valid = !flush && release_pending_q;
-            if (release_valid)
-                release_entry = release_pending_entry_q;
-        end else begin
-            release_valid = release_candidate_valid;
-            if (release_valid)
-                release_entry = release_candidate_entry;
-        end
+        release_valid = release_candidate_valid;
+        if (release_valid)
+            release_entry = release_candidate_entry;
 
         valid_vec = '0;
         addr_ready_vec = '0;
@@ -622,6 +507,84 @@ module StoreQueue #(
             store_data_flat[i*32 +: 32] = compute_aligned_data(raw_store_data[i], entries[i].raw_mask, entries[i].address[1:0]);
             for (byte_i = 0; byte_i < 4; byte_i = byte_i + 1)
                 store_byte_uop_id_flat[(i*4 + byte_i)*`UOP_ID_W +: `UOP_ID_W] = entries[i].uop_id;
+        end
+    end
+
+    // Form the owner for the queue contents visible after this edge.  Age
+    // comparison is used here for architectural ordering, but its result only
+    // drives the narrow owner register.  Existing entries are remapped across
+    // a release, and newly accepted reservations are included so a release
+    // followed by a reserve can present the next owner on the very next cycle.
+    always_comb begin : release_owner_next_logic
+        logic candidate_valid;
+        uop_id_t candidate_id;
+        logic [INDEX_W-1:0] candidate_sel;
+        logic [INDEX_W-1:0] mapped_sel;
+        logic [COUNT_W-1:0] new_base;
+        logic [INDEX_W-1:0] new_sel;
+
+        candidate_valid = 1'b0;
+        candidate_id = '0;
+        candidate_sel = '0;
+        mapped_sel = '0;
+        new_base = count - (release_do ? 1'b1 : 1'b0);
+        new_sel = '0;
+
+        if (!flush) begin
+            // A valid but stalled release owns the queue entry until the
+            // downstream handshake; do not let same-cycle reservations retag
+            // the ready/valid payload.
+            if (release_candidate_valid && !release_fire) begin
+                candidate_valid = 1'b1;
+                candidate_id = entries[release_owner_sel_q].uop_id;
+                candidate_sel = release_owner_sel_q;
+            end else begin
+                for (owner_scan = 0; owner_scan < DEPTH; owner_scan = owner_scan + 1) begin
+                    if ((owner_scan < count) && entries[owner_scan].valid &&
+                        !(release_do && release_owner_valid_q &&
+                          (owner_scan == release_owner_sel_q))) begin
+                        mapped_sel = owner_scan;
+                        if (release_do && (owner_scan > release_owner_sel_q))
+                            mapped_sel = owner_scan - 1'b1;
+                        if (!candidate_valid ||
+                            uop_is_younger(candidate_id, entries[owner_scan].uop_id)) begin
+                            candidate_valid = 1'b1;
+                            candidate_id = entries[owner_scan].uop_id;
+                            candidate_sel = mapped_sel;
+                        end
+                    end
+                end
+
+                if (r0_do) begin
+                    new_sel = new_base + ((r1_do && r1_older) ? 1 : 0);
+                    if (!candidate_valid || uop_is_younger(candidate_id, r0_uop_id)) begin
+                        candidate_valid = 1'b1;
+                        candidate_id = r0_uop_id;
+                        candidate_sel = new_sel;
+                    end
+                end
+                if (r1_do) begin
+                    new_sel = new_base + ((r0_do && !r1_older) ? 1 : 0);
+                    if (!candidate_valid || uop_is_younger(candidate_id, r1_uop_id)) begin
+                        candidate_valid = 1'b1;
+                        candidate_id = r1_uop_id;
+                        candidate_sel = new_sel;
+                    end
+                end
+            end
+        end
+
+        release_owner_next_valid = candidate_valid;
+        release_owner_next_sel = candidate_sel;
+    end
+
+    always_ff @(posedge clk or negedge rstn) begin
+        if (!rstn || flush) begin
+            release_owner_valid_q <= 1'b0;
+            release_owner_sel_q <= '0;
+        end else begin
+            release_owner_valid_q <= release_owner_next_valid;
+            release_owner_sel_q <= release_owner_next_sel;
         end
     end
 
@@ -718,7 +681,6 @@ module StoreQueue #(
     always_ff @(posedge clk or negedge rstn) begin
         if (!rstn) begin
             count <= '0;
-            reserve_credit_q <= (DEPTH >= 3) ? 2'd3 : ((DEPTH == 2) ? 2'd2 : 2'd1);
             for (q = 0; q < DEPTH; q = q + 1) begin
                 entries[q] <= '0;
                 store_data_ready[q] <= 1'b0;
@@ -781,12 +743,6 @@ module StoreQueue #(
 `endif
             end
             count <= flush_dst;
-            // Credit is the number of free SQ slots after recovery, not the
-            // number of retained entries.  Using flush_dst here inverted the
-            // admission window: an empty post-flush SQ received zero credit
-            // while a nearly-full SQ could over-admit Stores.
-            reserve_credit_q <= ((DEPTH - flush_dst) >= 3) ?
-                                2'd3 : (DEPTH - flush_dst);
         end else begin
             // 1. Commit state for existing entries.  Payload/data/address are
             // updated atomically in the release/no-release branches below.
@@ -802,12 +758,12 @@ module StoreQueue #(
             if (release_do) begin
 `ifndef SYNTHESIS
 `ifdef LSU_VERBOSE_TRACE
-                $display("[%t] SQ RELEASE: PC=0x%8h, addr=0x%8h, uop_id=%d, count=%d", $time, entries[oldest_sel].pc, entries[oldest_sel].address, entries[oldest_sel].uop_id, count);
+                $display("[%t] SQ RELEASE: PC=0x%8h, addr=0x%8h, uop_id=%d, count=%d", $time, entries[release_owner_sel_q].pc, entries[release_owner_sel_q].address, entries[release_owner_sel_q].uop_id, count);
 `endif
 `endif
                 for (j = 0; j < DEPTH-1; j = j + 1) begin
-                    if ((j < oldest_sel) && (j < count)) begin
-                        // Entries physically before the selected oldest do not
+                    if ((j < release_owner_sel_q) && (j < count)) begin
+                        // Entries physically before the selected owner do not
                         // shift, but must still consume one-cycle address/data
                         // wakeups while another Store is released.
                         entries[j] <= update_sq_metadata(
@@ -828,7 +784,7 @@ module StoreQueue #(
                             addr_update1_q_valid, addr_update1_q_uop_id, addr_update1_q_data_ready, addr_update1_q_data_value,
                             complete0, complete1,
                             commit_data_wakeup0_q, commit_data_wakeup1_q);
-                    end else if ((j >= oldest_sel) && (j < count-1)) begin
+                    end else if ((j >= release_owner_sel_q) && (j < count-1)) begin
                         entries[j] <= update_sq_metadata(
                             entries[j+1],
                             addr_update0_q_valid, addr_update0_q_uop_id,
@@ -854,7 +810,7 @@ module StoreQueue #(
 `ifndef SYNTHESIS
                         entry_serial[j] <= entry_serial[j+1];
 `endif
-                    end else if (j >= oldest_sel) begin
+                    end else if (j >= release_owner_sel_q) begin
                         entries[j] <= '0;
                         store_data_ready[j] <= 1'b0;
                         raw_store_data[j] <= 32'h0;
@@ -957,7 +913,6 @@ module StoreQueue #(
                 end
             end
             count <= count - release_do + r0_do + r1_do;
-            reserve_credit_q <= reserve_credit_next;
         end
 
     end

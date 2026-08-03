@@ -140,7 +140,6 @@ module LoadStoreUnit #(
     logic [1:0] load_fwd_fifo_count_q;
     logic       load_fwd_fifo_push;
     logic       load_fwd_fifo_pop;
-    logic       load_fwd_fifo_dup;
     integer     load_fwd_fifo_i;
     integer     load_fwd_recover_i;
     integer     load_fwd_recover_count;
@@ -278,6 +277,7 @@ module LoadStoreUnit #(
     forward_candidate_t tree_winner_p [0:3];
     lsu_entry_t load_order_head_q;
     logic load_order_head_valid_q;
+    logic [2:0] load_order_idx_q;
     logic [3:0] load_order_ren_q;
     logic order_unresolved_q;
     logic [3:0] load_forward_mask_p;
@@ -599,12 +599,16 @@ module LoadStoreUnit #(
     assign load_head_valid = selected_lq_found;
 
     uop_id_t load_pop_uop_id;
+    logic load_pop_owner_valid_q;
+    uop_id_t load_pop_owner_id_q;
+    logic lq_pop_match_valid;
+    logic [2:0] lq_pop_match_idx;
+    logic [2:0] selected_lq_idx_after_pop;
 
     // The elastic forwarding FIFO is the only LoadQueue ownership transfer.
-    // Mark exactly the entry selected above when its complete order/forwarding
-    // payload enters that FIFO.  load_issue belongs to the FIFO *head*, which
-    // can be a different Load from selected_lq_idx; using load_issue here can
-    // therefore mark the next Load issued without ever giving it an owner.
+    // Mark exactly the registered snapshot when its complete order/forwarding
+    // payload enters that FIFO.  The index is captured with the full snapshot;
+    // a same-cycle LQ pop is adjusted inside LoadQueue before the mark lands.
     logic load_queue_issue_mark;
     always_comb begin
         load_queue_issue_mark = load_fwd_fifo_push;
@@ -619,12 +623,26 @@ module LoadStoreUnit #(
         .accept_ready(load_ready), .head_valid(),
         .accept1_valid(load1_raw), .accept1_entry(load1_entry),
         .accept1_ready(load1_ready),
-        .head_entry(), .issue_mark(load_queue_issue_mark), .issue_idx(selected_lq_idx), .pop(load_pop),
-        .pop_uop_id(load_pop_uop_id),
+        .head_entry(), .issue_mark(load_queue_issue_mark), .issue_idx(load_order_idx_q),
+        .pop(load_pop_owner_valid_q), .pop_uop_id(load_pop_owner_id_q),
+        .pop_match_valid(lq_pop_match_valid), .pop_match_idx(lq_pop_match_idx),
         .unissued_vec(lq_unissued_vec), .entries_flat(lq_entries),
         .valid_vec(load_valid_vec), .addr_flat(load_addr_flat),
         .occupancy(lq_occupancy)
     );
+
+    // The pop owner is registered at the arbiter boundary.  If it removes an
+    // older entry on the same edge that a new order snapshot is captured, the
+    // selected index is one slot lower in the post-pop queue.  Track only this
+    // narrow index; the wide FIFO payload never feeds the queue views or the
+    // issue-mark path.
+    always_comb begin
+        selected_lq_idx_after_pop = selected_lq_idx;
+        if (load_pop_owner_valid_q && lq_pop_match_valid &&
+            (lq_pop_match_idx < selected_lq_idx)) begin
+            selected_lq_idx_after_pop = selected_lq_idx - 3'd1;
+        end
+    end
 
     // Keep the functional/performance checkpoint on the original same-cycle
     // StoreQueue release.  The registered release boundary is a separate
@@ -704,10 +722,17 @@ module LoadStoreUnit #(
     // drives the load_l1 enable in the same cycle.  The snapshot contains the
     // full Load identity and byte enables so the second half cannot mix a
     // forwarding result with a different queue entry.
+    //
+    // The snapshot is a pending transfer until the forwarding FIFO accepts it.
+    // load_issue/load_pop describe the FIFO head and a physical response, not
+    // this pending snapshot, so neither may invalidate it.  While it waits,
+    // registered pop owners can compact older LQ entries; adjust the narrow
+    // index so the later issue mark still selects the same Load.
     always_ff @(posedge cpu_clk or negedge cpu_rstn) begin
         if (!cpu_rstn) begin
             load_order_head_q       <= '0;
             load_order_head_valid_q <= 1'b0;
+            load_order_idx_q        <= 3'd0;
             load_order_ren_q        <= 4'b0;
             order_unresolved_q      <= 1'b0;
             for (forward_q = 0; forward_q < 4; forward_q = forward_q + 1) begin
@@ -720,9 +745,10 @@ module LoadStoreUnit #(
                 tree_stg1_q[forward_q][6] <= '0;
                 tree_stg1_q[forward_q][7] <= '0;
             end
-        end else if (flush) begin
+        end else if (system_flush || flush) begin
             load_order_head_q       <= '0;
             load_order_head_valid_q <= 1'b0;
+            load_order_idx_q        <= 3'd0;
             load_order_ren_q        <= 4'b0;
             order_unresolved_q      <= 1'b0;
             for (forward_q = 0; forward_q < 4; forward_q = forward_q + 1) begin
@@ -735,12 +761,12 @@ module LoadStoreUnit #(
                 tree_stg1_q[forward_q][6] <= '0;
                 tree_stg1_q[forward_q][7] <= '0;
             end
-        end else if (load_fwd_fifo_push || load_issue || load_pop) begin
-            // The snapshot is consumed/invalidated by the current LSU event.
-            // Without this fence, an owned Load can remain visible to the
-            // forwarding tree after the FIFO has already taken ownership.
+        end else if (load_fwd_fifo_push) begin
+            // FIFO push is the ownership transfer.  Clear the snapshot only
+            // after its payload and issue mark have been accepted together.
             load_order_head_q       <= '0;
             load_order_head_valid_q <= 1'b0;
+            load_order_idx_q        <= 3'd0;
             load_order_ren_q        <= 4'b0;
             order_unresolved_q      <= 1'b0;
             for (forward_q = 0; forward_q < 4; forward_q = forward_q + 1) begin
@@ -754,8 +780,13 @@ module LoadStoreUnit #(
                 tree_stg1_q[forward_q][7] <= '0;
             end
         end else begin
+            // Refresh the pending candidate until FIFO push transfers
+            // ownership.  This resamples Store address/data readiness and the
+            // forwarding tree, while the post-pop index still names the
+            // pre-pop selected Load in the compacted LoadQueue view.
             load_order_head_q       <= load_head;
             load_order_head_valid_q <= load_head_valid;
+            load_order_idx_q        <= selected_lq_idx_after_pop;
             load_order_ren_q        <= load_ren;
             // The exact address/byte overlap is represented by the registered
             // forwarding candidates below.  Keep only the separate unsafe
@@ -826,7 +857,8 @@ module LoadStoreUnit #(
     // decision in the same cycle.  This two-entry ready/valid boundary keeps
     // the selected Load and its byte data stable until the arbiter accepts it.
     always_comb begin
-        load_l1_valid = (load_fwd_fifo_count_q != 2'd0) && !flush;
+        load_l1_valid = (load_fwd_fifo_count_q != 2'd0) &&
+                        !flush && !system_flush;
         load_l1_entry = '0;
         load_l1_blocked = 1'b0;
         load_l1_forward_valid = 1'b0;
@@ -838,21 +870,13 @@ module LoadStoreUnit #(
             load_l1_forward_data = load_fwd_fifo_data_q[load_fwd_fifo_head_q];
         end
 
-        load_fwd_fifo_dup = 1'b0;
-        if ((load_fwd_fifo_count_q != 2'd0) &&
-            uop_id_equal(load_order_head_q.uop_id,
-                         load_fwd_fifo_entry_q[load_fwd_fifo_head_q].uop_id))
-            load_fwd_fifo_dup = 1'b1;
-        if ((load_fwd_fifo_count_q == 2'd2) &&
-            uop_id_equal(load_order_head_q.uop_id,
-                         load_fwd_fifo_entry_q[load_fwd_fifo_head_q ^ 1'b1].uop_id))
-            load_fwd_fifo_dup = 1'b1;
-
-        load_fwd_fifo_pop = load_l1_valid && load_issue && !flush;
-        load_fwd_fifo_push = !flush && load_order_head_valid_q &&
+        load_fwd_fifo_pop = load_l1_valid && load_issue &&
+                            !flush && !system_flush;
+        load_fwd_fifo_push = !flush && !system_flush &&
+                             load_order_head_valid_q &&
                              (!load_order_blocked_p || load_forward_valid_p) &&
                              ((load_fwd_fifo_count_q < 2'd2) ||
-                              load_fwd_fifo_pop) && !load_fwd_fifo_dup;
+                              load_fwd_fifo_pop);
 
         load_fwd_recover_count = 0;
         load_fwd_recover_entry0 = '0;
@@ -1004,6 +1028,35 @@ module LoadStoreUnit #(
         .perf_dcache_backpressure(perf_dcache_backpressure)
     );
 
+    // A physical response/forward completion transfers LoadQueue-pop
+    // ownership into this narrow registered packet.  LoadQueue compaction is
+    // deliberately one boundary later, so arbiter/MMIO/response selection and
+    // the full owner identity cannot feed its issued/entry D inputs directly.
+    // The register sustains one pop per cycle; branch recovery may capture a
+    // surviving response, while a system flush discards all LQ ownership.
+    always_ff @(posedge cpu_clk or negedge cpu_rstn) begin
+        if (!cpu_rstn) begin
+            load_pop_owner_valid_q <= 1'b0;
+            load_pop_owner_id_q <= '0;
+        end else if (system_flush || (flush && !recover_valid)) begin
+            load_pop_owner_valid_q <= 1'b0;
+            load_pop_owner_id_q <= '0;
+        end else if (flush && recover_valid) begin
+            // A branch flush may coincide with a physical response.  Keep
+            // only the surviving owner; the arbiter already suppresses killed
+            // owners, but the age check makes this boundary self-contained.
+            load_pop_owner_valid_q <= load_pop &&
+                                      !uop_is_younger(load_pop_uop_id,
+                                                     recover_id);
+            if (load_pop && !uop_is_younger(load_pop_uop_id, recover_id))
+                load_pop_owner_id_q <= load_pop_uop_id;
+        end else begin
+            load_pop_owner_valid_q <= load_pop;
+            if (load_pop)
+                load_pop_owner_id_q <= load_pop_uop_id;
+        end
+    end
+
     LoadDataAligner u_load_data_aligner (
         .ram_ext_op(arb_completion_entry.load_ext_op),
         .byte_offset(arb_completion_entry.address[1:0]),
@@ -1063,6 +1116,16 @@ module LoadStoreUnit #(
             $error("flushed LSU operation generated a main completion");
         if (cpu_rstn && flush && direct1_completion.valid)
             $error("flushed LSU operation generated a lane1 completion");
+        if (cpu_rstn && load_fwd_fifo_push &&
+            (load_fwd_fifo_count_q != 2'd0) &&
+            uop_id_equal(load_order_head_q.uop_id,
+                         load_fwd_fifo_entry_q[load_fwd_fifo_head_q].uop_id))
+            $fatal(1, "Load forwarding ownership duplicated FIFO head");
+        if (cpu_rstn && load_fwd_fifo_push &&
+            (load_fwd_fifo_count_q == 2'd2) &&
+            uop_id_equal(load_order_head_q.uop_id,
+                         load_fwd_fifo_entry_q[load_fwd_fifo_head_q ^ 1'b1].uop_id))
+            $fatal(1, "Load forwarding ownership duplicated FIFO tail");
     end
 `endif
 `ifndef SYNTHESIS

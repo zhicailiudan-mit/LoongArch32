@@ -7,6 +7,7 @@ module RegAliasTable (
     input  wire                  rstn,
 
     input  wire                  alloc_valid,
+    input  wire                  query_alloc_valid,
     input  wire                  alloc_rf_we,
     input  wire [4:0]            alloc_rd,
     input  wire [`ROB_TAG_W-1:0] alloc_tag,
@@ -178,9 +179,12 @@ module RegAliasTable (
     assign query_pending1 = (query_rs1 != 5'h0) && query_map1_owned;
     assign query_tag1 = view_map_tag[query_rs1];
     assign query_epoch1 = view_map_epoch[query_rs1];
-    wire lane0_writes_rs2 = alloc_valid && alloc_rf_we &&
+    // Same-bundle lane0->lane1 dependency discovery is a query intent, not a
+    // RAT ownership transfer.  Keeping it separate from alloc_valid prevents
+    // ROB free/retire feedback from entering the lane1 source-query cone.
+    wire lane0_writes_rs2 = query_alloc_valid && alloc_rf_we &&
                              (alloc_rd != 5'h0) && (alloc_rd == query_rs2);
-    wire lane0_writes_rs3 = alloc_valid && alloc_rf_we &&
+    wire lane0_writes_rs3 = query_alloc_valid && alloc_rf_we &&
                             (alloc_rd != 5'h0) && (alloc_rd == query_rs3);
     assign query_pending2 = (query_rs2 != 5'h0) &&
                             (lane0_writes_rs2 || query_map2_owned);

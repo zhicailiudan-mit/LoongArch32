@@ -2,7 +2,10 @@
 `include "defines.vh"
 import cpu_types_pkg::*;
 
-module LoadQueue #(parameter integer DEPTH = 4) (
+module LoadQueue #(
+    parameter integer DEPTH = 4,
+    parameter integer INDEX_W = (DEPTH > 1) ? $clog2(DEPTH) : 1
+) (
     input  logic clk, input logic rstn,
     input  logic flush,
     input  logic recover_valid, input logic system_flush,
@@ -14,9 +17,11 @@ module LoadQueue #(parameter integer DEPTH = 4) (
     output logic head_valid, output lsu_entry_t head_entry,
     input logic issue_mark, input logic pop,
     input uop_id_t pop_uop_id,
+    output logic pop_match_valid,
+    output logic [INDEX_W-1:0] pop_match_idx,
     output logic [DEPTH-1:0] unissued_vec,
     output lsu_entry_t entries_flat [0:DEPTH-1],
-    input  logic [$clog2(DEPTH>1?$clog2(DEPTH):1):0] issue_idx,
+    input  logic [INDEX_W-1:0] issue_idx,
     output logic [DEPTH-1:0] valid_vec,
     output logic [DEPTH*32-1:0] addr_flat,
     output logic [$clog2(DEPTH+1)-1:0] occupancy
@@ -31,12 +36,14 @@ module LoadQueue #(parameter integer DEPTH = 4) (
     integer match_search_i;
     integer match_count;
     logic pop_match_found;
-    logic [COUNT_W-1:0] pop_match_idx;
+    logic [INDEX_W-1:0] pop_match_idx_i;
 
     wire pop_do = pop && (count != 0);
+    wire pop_match_do = pop_do && pop_match_found;
+    wire pop_release = pop_match_do && !flush && !system_flush;
     wire accept_do = accept_valid && accept_ready;
     wire accept1_do = accept1_valid && accept1_ready;
-    wire [COUNT_W:0] free_slots = DEPTH - count;
+    wire [COUNT_W:0] free_slots = (DEPTH - count) + pop_release;
     wire both_load_valid = accept_valid && accept1_valid;
     wire accept1_older = both_load_valid &&
                          uop_is_younger(accept_entry.uop_id,
@@ -48,7 +55,7 @@ module LoadQueue #(parameter integer DEPTH = 4) (
     // both in one process creates a zero-delay event loop through the arbiter.
     always @(*) begin
         pop_match_found = 1'b0;
-        pop_match_idx = '0;
+        pop_match_idx_i = '0;
         match_count = 0;
         if (pop_do) begin
             for (match_search_i = 0; match_search_i < DEPTH; match_search_i = match_search_i + 1) begin
@@ -56,20 +63,24 @@ module LoadQueue #(parameter integer DEPTH = 4) (
                     uop_id_equal(entries[match_search_i].uop_id, pop_uop_id)) begin
                     if (!pop_match_found) begin
                         pop_match_found = 1'b1;
-                        pop_match_idx = match_search_i[COUNT_W-1:0];
+                        pop_match_idx_i = match_search_i[INDEX_W-1:0];
                     end
                     match_count = match_count + 1;
                 end
             end
         end
+        pop_match_valid = pop_match_found;
+        pop_match_idx = pop_match_idx_i;
     end
 
-    // Read-only combinational queue views.  This process intentionally has no
-    // dependency on pop, pop_uop_id, issue_mark, or the completion path.
+    // Admission readiness may reuse the slot released by the registered pop
+    // owner.  The queue views below remain independent of pop, pop_uop_id,
+    // issue_mark, and the completion path so they cannot close the arbiter
+    // selection loop.
     always @(*) begin
         accept_ready = 1'b0;
         accept1_ready = 1'b0;
-        if (!flush && (free_slots != 0)) begin
+        if (!flush && !system_flush && (free_slots != 0)) begin
             if (free_slots >= 2) begin
                 accept_ready = 1'b1;
                 accept1_ready = 1'b1;
@@ -82,7 +93,12 @@ module LoadQueue #(parameter integer DEPTH = 4) (
                 accept_ready = 1'b1;
             end
         end
-        head_valid = !flush && (count != 0) && !issued[0];
+    end
+
+    // Read-only combinational queue views.  They intentionally have no
+    // dependency on pop, pop_uop_id, issue_mark, or the completion path.
+    always @(*) begin
+        head_valid = !flush && !system_flush && (count != 0) && !issued[0];
         head_entry = '0;
         if (count != 0) head_entry = entries[0];
         valid_vec = '0;
@@ -90,8 +106,8 @@ module LoadQueue #(parameter integer DEPTH = 4) (
         addr_flat = '0;
         occupancy = count;
         for (i = 0; i < DEPTH; i = i + 1) begin
-            valid_vec[i] = !flush && (i < count);
-            unissued_vec[i] = !flush && (i < count) && !issued[i];
+            valid_vec[i] = !flush && !system_flush && (i < count);
+            unissued_vec[i] = !flush && !system_flush && (i < count) && !issued[i];
             entries_flat[i] = entries[i];
             addr_flat[i*32 +: 32] = entries[i].address;
         end
@@ -104,10 +120,10 @@ module LoadQueue #(parameter integer DEPTH = 4) (
                 entries[q] <= '0;
                 issued[q] <= 1'b0;
             end
-        end else if (flush) begin
+        end else if (system_flush || flush) begin
             flush_dst = 0;
             for (q = 0; q < DEPTH; q = q + 1) begin
-                if (!(pop_do && pop_match_found && (q == pop_match_idx)) &&
+                if (!(pop_match_do && (q == pop_match_idx_i)) &&
                     !system_flush && recover_valid && (q < count) &&
                     !uop_is_younger(entries[q].uop_id, recover_id)) begin
                     entries[flush_dst] <= entries[q];
@@ -123,9 +139,9 @@ module LoadQueue #(parameter integer DEPTH = 4) (
             end
             count <= flush_dst;
         end else begin
-            if (pop_do && pop_match_found) begin
+            if (pop_match_do) begin
                 for (q = 0; q < DEPTH-1; q = q + 1) begin
-                    if (q >= pop_match_idx && q < count-1) begin
+                    if (q >= pop_match_idx_i && q < count-1) begin
                         entries[q] <= entries[q+1];
                         issued[q] <= issued[q+1];
                     end else if (q >= count-1) begin
@@ -155,7 +171,7 @@ module LoadQueue #(parameter integer DEPTH = 4) (
                         issued[count-1 + accept_do] <= 1'b0;
                     end
                 end
-            end else if (!pop_do) begin
+            end else if (!pop_match_do) begin
                 if (accept1_do && accept_do && accept1_older) begin
                     entries[count] <= accept1_entry;
                     entries[count].valid <= 1'b1;
@@ -177,13 +193,13 @@ module LoadQueue #(parameter integer DEPTH = 4) (
                 end
             end
 
-            count <= count - (pop_do && pop_match_found) + accept_do + accept1_do;
+            count <= count - pop_match_do + accept_do + accept1_do;
 
             if (issue_mark) begin
-                if (pop_do && pop_match_found) begin
-                    if (issue_idx > pop_match_idx) begin
+                if (pop_match_do) begin
+                    if (issue_idx > pop_match_idx_i) begin
                         issued[issue_idx - 1] <= 1'b1;
-                    end else if (issue_idx < pop_match_idx) begin
+                    end else if (issue_idx < pop_match_idx_i) begin
                         issued[issue_idx] <= 1'b1;
                     end
                 end else begin
@@ -195,7 +211,7 @@ module LoadQueue #(parameter integer DEPTH = 4) (
 
 `ifndef SYNTHESIS
     always @(posedge clk) begin
-        if (rstn && !flush) begin
+        if (rstn && !flush && !system_flush) begin
             if (pop) begin
                 if (count == 0)
                     $fatal(1, "LoadQueue pop while queue is empty!");

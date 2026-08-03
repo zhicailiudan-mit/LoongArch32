@@ -140,8 +140,13 @@ module DispatchQueue #(
     reg fast_hold_store_grant_q;
     reg [2:0] main_rr_ptr;
     reg [2:0] fast_rr_ptr;
+    // Ownership-transfer pulses are registered separately so candidate type,
+    // grant and pick logic terminate here instead of reaching either RR FF.
+    reg main_ownership_transfer_q;
+    reg fast_ownership_transfer_q;
     reg [DQ_DEPTH-1:0] older_branch_pending_q;
     reg [DQ_DEPTH-1:0] older_store_pending_q;
+    reg older_store_any_q;
     // Issue ownership is transferred in two explicit stages.  The hold
     // registers are the select-index stage; once a held slot is copied into
     // the payload register, the DQ slot is released and the payload belongs
@@ -512,7 +517,6 @@ module DispatchQueue #(
     // exists, all resident Loads wait one extra cycle; Stores/ALU/branches are
     // unaffected.  This cannot allow a younger Load to pass an older Store,
     // and the mask is refreshed from the same registered ordering state.
-    wire older_store_any_q = |older_store_pending_q;
     wire [DQ_DEPTH-1:0] branch_pending_for_select =
         REGISTERED_ORDER_SELECT ? older_branch_pending_q : older_branch_pending;
     wire [DQ_DEPTH-1:0] store_pending_for_select =
@@ -610,6 +614,8 @@ module DispatchQueue #(
             for (store_old = 0; store_old < DQ_DEPTH; store_old = store_old + 1) begin
                 if (valid[store_old] && is_ld_st[store_old] &&
                     (ram_we[store_old] != `RAM_WE_N) &&
+                    valid[store_q] && is_ld_st[store_q] &&
+                    (ram_we[store_q] == `RAM_WE_N) &&
                     seq_is_older(alloc_seq[store_old], alloc_seq[store_q]))
                     older_store_pending[store_q] = 1'b1;
             end
@@ -850,7 +856,6 @@ module DispatchQueue #(
         alloc_seq[0], alloc_seq[1], alloc_seq[2], alloc_seq[3],
         alloc_seq[4], alloc_seq[5], alloc_seq[6], alloc_seq[7]);
     wire [3:0] rr_main_pick = pick_round_robin8(main_candidate, main_rr_ptr);
-    wire [3:0] rr_lane0_pick = pick_round_robin8(lane0_candidate, main_rr_ptr);
     wire use_resource_pair = RESOURCE_AWARE_PAIRING && !ROUND_ROBIN_SELECT &&
                              !main_hold_valid &&
                              oldest_main_pick[3] &&
@@ -871,65 +876,27 @@ module DispatchQueue #(
          !fast_pending_onehot[main_hold_sel]) : main_pick[3];
     assign issue_sel = main_hold_valid ? main_hold_sel : main_pick[2:0];
 
-    // Compute all fast-lane exclusion cases in parallel.  The main selector
-    // chooses only the final small mux; it no longer feeds another complete
-    // priority/age scan.
+    // Lane1 selects independently from lane0's live candidate/pick result.
+    // It consumes only lane0's registered select ownership.  If both lanes
+    // capture the same previously-unowned slot on one edge, the registered
+    // index comparison below gives ownership to lane0 and makes lane1 retry;
+    // no wide payload or slot state crosses that conflict boundary.
     wire [DQ_DEPTH-1:0] fast_candidate = valid & slot_ready & ~barrier_blocked &
         slot_fast_eligible & ~store_select_block & ~main_hold_onehot &
         ~issue_pending_onehot & ~fast_pending_onehot;
-    // If lane0 is transferring its held entry and refilling the select stage
-    // in the same edge, reserve that next lane0 slot from lane1 as well.
-    wire [DQ_DEPTH-1:0] fast_select_candidate = fast_candidate &
-        ~(main_refill_valid ?
-          ({{(DQ_DEPTH-1){1'b0}}, 1'b1} << main_refill_pick[2:0]) :
-          {DQ_DEPTH{1'b0}});
-    wire [3:0] fast_pick_any = pick_oldest8(fast_select_candidate, alloc_seq[0], alloc_seq[1], alloc_seq[2], alloc_seq[3], alloc_seq[4], alloc_seq[5], alloc_seq[6], alloc_seq[7]);
-    wire [3:0] fast_pick_no0 = pick_oldest8(fast_select_candidate & 8'b11111110, alloc_seq[0], alloc_seq[1], alloc_seq[2], alloc_seq[3], alloc_seq[4], alloc_seq[5], alloc_seq[6], alloc_seq[7]);
-    wire [3:0] fast_pick_no1 = pick_oldest8(fast_select_candidate & 8'b11111101, alloc_seq[0], alloc_seq[1], alloc_seq[2], alloc_seq[3], alloc_seq[4], alloc_seq[5], alloc_seq[6], alloc_seq[7]);
-    wire [3:0] fast_pick_no2 = pick_oldest8(fast_select_candidate & 8'b11111011, alloc_seq[0], alloc_seq[1], alloc_seq[2], alloc_seq[3], alloc_seq[4], alloc_seq[5], alloc_seq[6], alloc_seq[7]);
-    wire [3:0] fast_pick_no3 = pick_oldest8(fast_select_candidate & 8'b11110111, alloc_seq[0], alloc_seq[1], alloc_seq[2], alloc_seq[3], alloc_seq[4], alloc_seq[5], alloc_seq[6], alloc_seq[7]);
-    wire [3:0] fast_pick_no4 = pick_oldest8(fast_select_candidate & 8'b11101111, alloc_seq[0], alloc_seq[1], alloc_seq[2], alloc_seq[3], alloc_seq[4], alloc_seq[5], alloc_seq[6], alloc_seq[7]);
-    wire [3:0] fast_pick_no5 = pick_oldest8(fast_select_candidate & 8'b11011111, alloc_seq[0], alloc_seq[1], alloc_seq[2], alloc_seq[3], alloc_seq[4], alloc_seq[5], alloc_seq[6], alloc_seq[7]);
-    wire [3:0] fast_pick_no6 = pick_oldest8(fast_select_candidate & 8'b10111111, alloc_seq[0], alloc_seq[1], alloc_seq[2], alloc_seq[3], alloc_seq[4], alloc_seq[5], alloc_seq[6], alloc_seq[7]);
-    wire [3:0] fast_pick_no7 = pick_oldest8(fast_select_candidate & 8'b01111111, alloc_seq[0], alloc_seq[1], alloc_seq[2], alloc_seq[3], alloc_seq[4], alloc_seq[5], alloc_seq[6], alloc_seq[7]);
-    // In the round-robin timing configuration lane1 selects independently.
-    // A same-slot result is suppressed at the valid boundary instead of
-    // feeding lane0's current selector back through the whole lane1 tree.
-    wire [DQ_DEPTH-1:0] fast_rr_mask = ROUND_ROBIN_SELECT ? fast_select_candidate :
-        (fast_select_candidate &
-         ~(issue_found ? ({{(DQ_DEPTH-1){1'b0}}, 1'b1} << issue_sel) :
-                         {DQ_DEPTH{1'b0}}));
-    wire [3:0] rr_fast_pick = pick_round_robin8(fast_rr_mask, fast_rr_ptr);
-    wire fast_rr_collision = issue_found && rr_fast_pick[3] &&
-                             (rr_fast_pick[2:0] == issue_sel);
-
-    reg [3:0] fast_pick;
-    always @(*) begin
-        // Never present the same entry on both output lanes.  The old logic
-        // allowed lane1 to select the lane0 entry when lane0 was stalled;
-        // lane1 could then consume it and make lane0 valid/payload change
-        // without a lane0 handshake.
-        if (ROUND_ROBIN_SELECT) begin
-            fast_pick = rr_fast_pick;
-        end else if (!issue_found) begin
-            fast_pick = fast_pick_any;
-        end else begin
-            case (issue_sel)
-                3'd0: fast_pick = fast_pick_no0;
-                3'd1: fast_pick = fast_pick_no1;
-                3'd2: fast_pick = fast_pick_no2;
-                3'd3: fast_pick = fast_pick_no3;
-                3'd4: fast_pick = fast_pick_no4;
-                3'd5: fast_pick = fast_pick_no5;
-                3'd6: fast_pick = fast_pick_no6;
-                default: fast_pick = fast_pick_no7;
-            endcase
-        end
-    end
+    wire [3:0] oldest_fast_pick = pick_oldest8(
+        fast_candidate,
+        alloc_seq[0], alloc_seq[1], alloc_seq[2], alloc_seq[3],
+        alloc_seq[4], alloc_seq[5], alloc_seq[6], alloc_seq[7]);
+    wire [3:0] rr_fast_pick = pick_round_robin8(fast_candidate, fast_rr_ptr);
+    wire [3:0] fast_pick = ROUND_ROBIN_SELECT ? rr_fast_pick :
+                                               oldest_fast_pick;
+    wire registered_select_collision = main_hold_valid && fast_hold_valid &&
+                                       (main_hold_sel == fast_hold_sel);
     assign fast_issue_found = fast_hold_valid ?
         (valid[fast_hold_sel] && !issue_pending_onehot[fast_hold_sel] &&
-         !fast_pending_onehot[fast_hold_sel]) :
-        (fast_pick[3] && !(ROUND_ROBIN_SELECT && fast_rr_collision));
+         !fast_pending_onehot[fast_hold_sel] &&
+         !registered_select_collision) : fast_pick[3];
     assign fast_issue_sel = fast_hold_valid ? fast_hold_sel : fast_pick[2:0];
     always @(*) begin
         enq_sel = 3'h0;
@@ -1171,6 +1138,105 @@ module DispatchQueue #(
     wire enq1_order_branch_blocked = enq1_is_br_jmp &&
         (enq_has_older_branch || (enq_fire && enq_is_br_jmp));
 
+    // Build the exact next registered Store-order mask.  It describes only
+    // live Loads which still have an older Store in the DQ.  The next-state
+    // view accounts for payload clears, recovery survivors, system flush, and
+    // both same-edge enqueue slots before the scalar reduction is registered.
+    // The selector consumes only that scalar register; the eight age bits and
+    // their reduction therefore terminate here instead of continuing through
+    // candidate/hold selection.
+    reg [DQ_DEPTH-1:0] older_store_pending_refresh;
+    reg [DQ_DEPTH-1:0] store_order_next_valid;
+    reg [DQ_DEPTH-1:0] store_order_next_is_load;
+    reg [DQ_DEPTH-1:0] store_order_next_is_store;
+    reg [DQ_SEQ_W-1:0] store_order_next_seq [0:DQ_DEPTH-1];
+    wire older_store_any_refresh = |older_store_pending_refresh;
+    integer store_next_q;
+    integer store_next_old;
+    always @(*) begin
+        older_store_pending_refresh = {DQ_DEPTH{1'b0}};
+        store_order_next_valid = valid;
+        store_order_next_is_load = {DQ_DEPTH{1'b0}};
+        store_order_next_is_store = {DQ_DEPTH{1'b0}};
+        for (store_next_q = 0; store_next_q < DQ_DEPTH;
+             store_next_q = store_next_q + 1) begin
+            store_order_next_seq[store_next_q] = alloc_seq[store_next_q];
+            store_order_next_is_load[store_next_q] =
+                valid[store_next_q] && is_ld_st[store_next_q] &&
+                (ram_we[store_next_q] == `RAM_WE_N);
+            store_order_next_is_store[store_next_q] =
+                valid[store_next_q] && is_ld_st[store_next_q] &&
+                (ram_we[store_next_q] != `RAM_WE_N);
+        end
+
+        if (flush || system_flush) begin
+            store_order_next_valid = {DQ_DEPTH{1'b0}};
+            store_order_next_is_load = {DQ_DEPTH{1'b0}};
+            store_order_next_is_store = {DQ_DEPTH{1'b0}};
+            if (flush && recover_valid && !system_flush) begin
+                for (store_next_q = 0; store_next_q < DQ_DEPTH;
+                     store_next_q = store_next_q + 1) begin
+                    if (valid[store_next_q] &&
+                        !uop_is_younger(uop_id[store_next_q], recover_id)) begin
+                        store_order_next_valid[store_next_q] = 1'b1;
+                        store_order_next_is_load[store_next_q] =
+                            is_ld_st[store_next_q] &&
+                            (ram_we[store_next_q] == `RAM_WE_N);
+                        store_order_next_is_store[store_next_q] =
+                            is_ld_st[store_next_q] &&
+                            (ram_we[store_next_q] != `RAM_WE_N);
+                    end
+                end
+            end
+        end else begin
+            store_order_next_valid = valid & ~state_clear_vec;
+            store_order_next_is_load = store_order_next_is_load &
+                                        ~state_clear_vec;
+            store_order_next_is_store = store_order_next_is_store &
+                                         ~state_clear_vec;
+            if (enq_fire) begin
+                store_order_next_valid[enq_sel] = 1'b1;
+                store_order_next_is_load[enq_sel] = enq_is_load;
+                store_order_next_is_store[enq_sel] = enq_is_store;
+                store_order_next_seq[enq_sel] = next_alloc_seq;
+            end
+            if (enq1_fire) begin
+                store_order_next_valid[enq1_sel] = 1'b1;
+                store_order_next_is_load[enq1_sel] = enq1_is_load;
+                store_order_next_is_store[enq1_sel] = enq1_is_store;
+                store_order_next_seq[enq1_sel] =
+                    next_alloc_seq + enq_fire;
+            end
+        end
+
+        for (store_next_q = 0; store_next_q < DQ_DEPTH;
+             store_next_q = store_next_q + 1) begin
+            for (store_next_old = 0; store_next_old < DQ_DEPTH;
+                 store_next_old = store_next_old + 1) begin
+                if (store_order_next_valid[store_next_q] &&
+                    store_order_next_is_load[store_next_q] &&
+                    store_order_next_valid[store_next_old] &&
+                    store_order_next_is_store[store_next_old] &&
+                    seq_is_older(store_order_next_seq[store_next_old],
+                                 store_order_next_seq[store_next_q]))
+                    older_store_pending_refresh[store_next_q] = 1'b1;
+            end
+        end
+
+        // Preserve the existing conservative admission rule for a Load
+        // accepted on the same edge as a resident Store leaves the DQ.  The
+        // overrides are applied before the registered scalar is reduced, so
+        // the mask and older_store_any_q cannot disagree.
+        if (!flush && !system_flush) begin
+            if (enq_fire)
+                older_store_pending_refresh[enq_sel] =
+                    enq_order_store_blocked;
+            if (enq1_fire)
+                older_store_pending_refresh[enq1_sel] =
+                    enq1_order_store_blocked;
+        end
+    end
+
     assign enq_ready[0] = free_found;
     assign enq_ready[1] = free_found && second_free_found;
     assign issue_valid[0] = issue_payload_valid_q && !flush && !system_flush;
@@ -1330,16 +1396,8 @@ module DispatchQueue #(
         issue_selected_payload[1].pred.perf_btb_hit = perf_btb_hit[fast_issue_sel];
     end
 
-    // main_select_capture can create a new lane0 index owner in the same edge
-    // that lane1 consumes and refills its current owner.  Reserve that new
-    // lane0 slot here as well; otherwise both hold registers can own the same
-    // DQ entry after the edge and the uop may be issued twice.
-    wire [DQ_DEPTH-1:0] main_new_hold_onehot = main_select_capture ?
-        ({{(DQ_DEPTH-1){1'b0}}, 1'b1} << main_pick[2:0]) :
-        {DQ_DEPTH{1'b0}};
-    wire [DQ_DEPTH-1:0] fast_refill_candidate = fast_select_candidate &
-                                                 ~fast_hold_onehot &
-                                                 ~main_new_hold_onehot;
+    wire [DQ_DEPTH-1:0] fast_refill_candidate = fast_candidate &
+                                                 ~fast_hold_onehot;
     assign fast_refill_pick = ROUND_ROBIN_SELECT ?
         pick_round_robin8(fast_refill_candidate, fast_rr_ptr) :
         pick_oldest8(fast_refill_candidate,
@@ -1615,8 +1673,11 @@ module DispatchQueue #(
             fast_hold_store_grant_q <= 1'b0;
             main_rr_ptr <= 3'h0;
             fast_rr_ptr <= 3'h0;
+            main_ownership_transfer_q <= 1'b0;
+            fast_ownership_transfer_q <= 1'b0;
             older_branch_pending_q <= {DQ_DEPTH{1'b0}};
             older_store_pending_q <= {DQ_DEPTH{1'b0}};
+            older_store_any_q <= 1'b0;
             issue_pending_valid <= 1'b0;
             issue_pending_sel <= 3'h0;
             fast_pending_valid <= 1'b0;
@@ -1689,10 +1750,14 @@ module DispatchQueue #(
             barrier_release_reg <= 1'b0;
             main_rr_ptr <= 3'h0;
             fast_rr_ptr <= 3'h0;
-            // Recompute ordering conservatively on the first post-flush
-            // cycle; a false positive only costs one issue cycle.
+            main_ownership_transfer_q <= 1'b0;
+            fast_ownership_transfer_q <= 1'b0;
+            // Branch recovery keeps only the surviving age relations; a
+            // system flush leaves no DQ Store/Load relation.  The registered
+            // Store scalar is therefore exact at the recovery edge as well.
             older_branch_pending_q <= {DQ_DEPTH{1'b1}};
-            older_store_pending_q <= {DQ_DEPTH{1'b1}};
+            older_store_pending_q <= older_store_pending_refresh;
+            older_store_any_q <= older_store_any_refresh;
             // Preserve a selected index only when its DQ slot survives the
             // recovery.  Payload ownership is handled by the separate
             // payload-stage register above.
@@ -1736,6 +1801,13 @@ module DispatchQueue #(
             if (system_flush)
                 next_alloc_seq <= {DQ_SEQ_W{1'b0}};
         end else begin
+            // Record only the narrow ownership event.  RR state consumes this
+            // registered pulse on the following edge, which cuts candidate,
+            // Store-age and selected-index feedback from the pointer D cone.
+            main_ownership_transfer_q <= main_select_capture ||
+                                         main_refill_valid;
+            fast_ownership_transfer_q <= fast_select_capture ||
+                                         fast_refill_valid;
             // Sample the privilege/system release response.  The registered
             // value is consumed on the next edge, keeping release off the
             // same-cycle issue/selection cone.
@@ -1767,7 +1839,15 @@ module DispatchQueue #(
             end else if (main_store_grant_set) begin
                 main_hold_store_grant_q <= 1'b1;
             end
-            if (fast_payload_capture) begin
+            if (registered_select_collision) begin
+                // Both proposals were registered before either lane could see
+                // the other's new ownership.  Lane0 wins; lane1 retries from
+                // the next registered candidate evaluation.  The slot remains
+                // live until lane0 captures its payload.
+                fast_hold_valid <= 1'b0;
+                fast_hold_sel <= 3'h0;
+                fast_hold_store_grant_q <= 1'b0;
+            end else if (fast_payload_capture) begin
                 fast_hold_store_grant_q <= 1'b0;
                 if (fast_refill_valid) begin
                     fast_hold_valid <= 1'b1;
@@ -1794,19 +1874,19 @@ module DispatchQueue #(
                 issue_pending_valid <= 1'b0;
                 fast_pending_valid <= 1'b0;
             end else begin
-                if (main_select_capture)
-                    main_rr_ptr <= main_pick[2:0] + 3'd1;
-                else if (main_refill_valid)
-                    main_rr_ptr <= main_refill_pick[2:0] + 3'd1;
-                if (fast_select_capture)
-                    fast_rr_ptr <= fast_pick[2:0] + 3'd1;
-                else if (fast_refill_valid)
-                    fast_rr_ptr <= fast_refill_pick[2:0] + 3'd1;
+                // Fairness state advances only when ownership is registered.
+                // The D input depends solely on the pointer's old value and a
+                // narrow transfer enable, never on the selected slot index.
+                if (main_ownership_transfer_q)
+                    main_rr_ptr <= main_rr_ptr + 3'd1;
+                if (fast_ownership_transfer_q && !registered_select_collision)
+                    fast_rr_ptr <= fast_rr_ptr + 3'd1;
             end
 
             if (REGISTERED_ORDER_SELECT) begin
                 older_branch_pending_q <= older_branch_pending;
-                older_store_pending_q <= older_store_pending;
+                older_store_pending_q <= older_store_pending_refresh;
+                older_store_any_q <= older_store_any_refresh;
             end
 
             if (wakeup0_valid || wakeup1_valid || system_wakeup_valid ||
@@ -1961,17 +2041,13 @@ module DispatchQueue #(
     end
 
 `ifndef SYNTHESIS
-    // The two select-index stages are exclusive owners of live DQ slots.
-    // Keep this close to the state update so future refill optimizations
-    // cannot silently reintroduce duplicate ownership.
+    // An independently selected same-slot proposal is legal for one registered
+    // arbitration cycle, but it must never cross lane1's payload boundary.
     always @(posedge clk) begin
         if (rstn && !flush && !system_flush &&
-            main_hold_valid && fast_hold_valid &&
-            (main_hold_sel == fast_hold_sel)) begin
+            registered_select_collision && fast_payload_capture)
             $fatal(1,
-                   "DispatchQueue duplicate select ownership: slot=%0d",
-                   main_hold_sel);
-        end
+                   "DispatchQueue registered select collision reached lane1 payload");
         if (rstn && !flush && !system_flush) begin
             if (store_reserved_count > 3'd2)
                 $fatal(1,
