@@ -272,6 +272,68 @@ module DispatchQueue #(
     wire [31:0] wakeup1_value = complete1_value;
     wire wakeup1_rf_we = complete1_rf_we;
 
+    typedef struct packed {
+        logic        valid;
+        logic        reg_write;
+        uop_id_t     uop_id;
+        logic [31:0] value;
+    } data_wakeup_t;
+
+    data_wakeup_t complete_data_q [0:1];
+
+    always_ff @(posedge clk or negedge rstn) begin
+        if (!rstn) begin
+            complete_data_q[0] <= '0;
+            complete_data_q[1] <= '0;
+        end else if (
+            system_flush ||
+            (flush && !recover_valid)
+        ) begin
+            complete_data_q[0] <= '0;
+            complete_data_q[1] <= '0;
+        end else begin
+            complete_data_q[0].valid <=
+                complete[0].valid &&
+                complete[0].reg_write &&
+                !(
+                    recover_valid &&
+                    uop_is_younger(
+                        complete[0].uop_id,
+                        recover_id
+                    )
+                );
+
+            complete_data_q[0].reg_write <=
+                complete[0].reg_write;
+
+            complete_data_q[0].uop_id <=
+                complete[0].uop_id;
+
+            complete_data_q[0].value <=
+                complete[0].value;
+
+            complete_data_q[1].valid <=
+                complete[1].valid &&
+                complete[1].reg_write &&
+                !(
+                    recover_valid &&
+                    uop_is_younger(
+                        complete[1].uop_id,
+                        recover_id
+                    )
+                );
+
+            complete_data_q[1].reg_write <=
+                complete[1].reg_write;
+
+            complete_data_q[1].uop_id <=
+                complete[1].uop_id;
+
+            complete_data_q[1].value <=
+                complete[1].value;
+        end
+    end
+
     completion_t system_wakeup_q;
 
     always_ff @(posedge clk or negedge rstn) begin
@@ -508,10 +570,16 @@ module DispatchQueue #(
     wire [DQ_DEPTH-1:0] complete0_src1_match;
     wire [DQ_DEPTH-1:0] complete1_src0_match;
     wire [DQ_DEPTH-1:0] complete1_src1_match;
+    wire [DQ_DEPTH-1:0] data0_src0_match;
+    wire [DQ_DEPTH-1:0] data0_src1_match;
+    wire [DQ_DEPTH-1:0] data1_src0_match;
+    wire [DQ_DEPTH-1:0] data1_src1_match;
     wire [DQ_DEPTH-1:0] system_src0_match;
     wire [DQ_DEPTH-1:0] system_src1_match;
     wire [DQ_DEPTH-1:0] src0_ready_eff;
     wire [DQ_DEPTH-1:0] src1_ready_eff;
+    wire [DQ_DEPTH-1:0] src0_data_ready_eff;
+    wire [DQ_DEPTH-1:0] src1_data_ready_eff;
     wire [DQ_DEPTH-1:0] src0_select_ready;
     wire [DQ_DEPTH-1:0] src1_select_ready;
     wire [31:0] src0_value_eff [0:DQ_DEPTH-1];
@@ -712,6 +780,50 @@ module DispatchQueue #(
                 !src1_ready[q] &&
                 uop_id_equal(wakeup1_id, src1_id[q]);
 
+            assign data0_src0_match[q] =
+                complete_data_q[0].valid &&
+                valid[q] &&
+                rR1_re[q] &&
+                (rR1[q] != 5'h0) &&
+                !src0_ready[q] &&
+                uop_id_equal(
+                    complete_data_q[0].uop_id,
+                    src0_id[q]
+                );
+
+            assign data0_src1_match[q] =
+                complete_data_q[0].valid &&
+                valid[q] &&
+                rR2_re[q] &&
+                (rR2[q] != 5'h0) &&
+                !src1_ready[q] &&
+                uop_id_equal(
+                    complete_data_q[0].uop_id,
+                    src1_id[q]
+                );
+
+            assign data1_src0_match[q] =
+                complete_data_q[1].valid &&
+                valid[q] &&
+                rR1_re[q] &&
+                (rR1[q] != 5'h0) &&
+                !src0_ready[q] &&
+                uop_id_equal(
+                    complete_data_q[1].uop_id,
+                    src0_id[q]
+                );
+
+            assign data1_src1_match[q] =
+                complete_data_q[1].valid &&
+                valid[q] &&
+                rR2_re[q] &&
+                (rR2[q] != 5'h0) &&
+                !src1_ready[q] &&
+                uop_id_equal(
+                    complete_data_q[1].uop_id,
+                    src1_id[q]
+                );
+
             assign system_src0_match[q] =
                 system_wakeup_valid &&
                 system_wakeup_rf_we &&
@@ -785,66 +897,73 @@ module DispatchQueue #(
                 wake2_src1_vec[q] ||
                 wake3_src1_vec[q];
 
+            /*
+             * The current-cycle completion tag must not make an operand look
+             * ready before complete_data_q carries its value: after uop_id
+             * wrap-around a stale match could otherwise overwrite an already
+             * ready operand.  Only registered sources (complete_data_q,
+             * system/commit wakeups and rD) contribute.
+             */
             assign src0_ready_eff[q] =
-                src0_ready[q] ||
-                (
-                    SAME_CYCLE_COMPLETION_BYPASS &&
-                    (
-                        complete0_src0_match[q] ||
-                        complete1_src0_match[q]
-                    )
-                ) ||
-                wake0_src0_vec[q] ||
-                wake1_src0_vec[q] ||
-                wake2_src0_vec[q] ||
-                wake3_src0_vec[q];
+                src0_data_ready_eff[q];
 
             assign src1_ready_eff[q] =
-                src1_ready[q] ||
-                (
-                    SAME_CYCLE_COMPLETION_BYPASS &&
-                    (
-                        complete0_src1_match[q] ||
-                        complete1_src1_match[q]
-                    )
-                ) ||
-                wake0_src1_vec[q] ||
-                wake1_src1_vec[q] ||
-                wake2_src1_vec[q] ||
-                wake3_src1_vec[q];
+                src1_data_ready_eff[q];
 
             assign src0_value_eff[q] =
-                (
-                    SAME_CYCLE_COMPLETION_BYPASS &&
-                    complete0_src0_match[q]
-                ) ? complete_value :
-                (
-                    SAME_CYCLE_COMPLETION_BYPASS &&
-                    complete1_src0_match[q]
-                ) ? complete1_value :
-                wake0_src0_vec[q] ? wakeup0_value :
-                wake1_src0_vec[q] ? wakeup1_value :
-                wake2_src0_vec[q] ? commit_value :
-                wake3_src0_vec[q] ? commit1_value :
+                data0_src0_match[q]
+                    ? complete_data_q[0].value :
+                data1_src0_match[q]
+                    ? complete_data_q[1].value :
+                system_src0_match[q]
+                    ? system_wakeup_value :
+                wake2_src0_vec[q]
+                    ? commit_value :
+                wake3_src0_vec[q]
+                    ? commit1_value :
                 rD1[q];
 
             assign src1_value_eff[q] =
-                (
-                    SAME_CYCLE_COMPLETION_BYPASS &&
-                    complete0_src1_match[q]
-                ) ? complete_value :
-                (
-                    SAME_CYCLE_COMPLETION_BYPASS &&
-                    complete1_src1_match[q]
-                ) ? complete1_value :
-                wake0_src1_vec[q] ? wakeup0_value :
-                wake1_src1_vec[q] ? wakeup1_value :
-                wake2_src1_vec[q] ? commit_value :
-                wake3_src1_vec[q] ? commit1_value :
+                data0_src1_match[q]
+                    ? complete_data_q[0].value :
+                data1_src1_match[q]
+                    ? complete_data_q[1].value :
+                system_src1_match[q]
+                    ? system_wakeup_value :
+                wake2_src1_vec[q]
+                    ? commit_value :
+                wake3_src1_vec[q]
+                    ? commit1_value :
                 rD2[q];
 
-            assign src0_select_ready[q] = src0_ready[q];
-            assign src1_select_ready[q] = src1_ready[q];
+            assign src0_data_ready_eff[q] =
+                src0_ready[q] ||
+                data0_src0_match[q] ||
+                data1_src0_match[q] ||
+                system_src0_match[q] ||
+                wake2_src0_vec[q] ||
+                wake3_src0_vec[q];
+
+            assign src1_data_ready_eff[q] =
+                src1_ready[q] ||
+                data0_src1_match[q] ||
+                data1_src1_match[q] ||
+                system_src1_match[q] ||
+                wake2_src1_vec[q] ||
+                wake3_src1_vec[q];
+
+            /*
+             * Select only when an operand value is available either in rD or
+             * through one of the registered data-bypass sources.
+             *
+             * complete_data_q is already registered, so this does not
+             * restore the ExecutionLane -> DQ long combinational path.
+             */
+            assign src0_select_ready[q] =
+                src0_data_ready_eff[q];
+
+            assign src1_select_ready[q] =
+                src1_data_ready_eff[q];
 
             assign slot_ready[q] =
                 src0_select_ready[q] &&
@@ -1702,18 +1821,21 @@ module DispatchQueue #(
             uop_id[issue_sel];
         issue_selected_payload[0].pc =
             pc[issue_sel];
+        /*
+         * complete data is registered in complete_data_q.
+         *
+         * src_ready may become visible one cycle before rD1/rD2 are
+         * physically updated, so every instruction type must use the
+         * registered-data bypass view when building the issue payload.
+         */
         issue_selected_payload[0].src0_value =
-            rD1[issue_sel];
+            src0_value_eff[issue_sel];
 
         issue_selected_payload[0].src1_value =
-            main_hold_is_store
-                ? src1_value_eff[issue_sel]
-                : rD2[issue_sel];
+            src1_value_eff[issue_sel];
 
         issue_selected_payload[0].src1_ready =
-            main_hold_is_store
-                ? src1_ready_eff[issue_sel]
-                : src1_ready[issue_sel];
+            src1_data_ready_eff[issue_sel];
 
         issue_selected_payload[0].src1_id =
             src1_id[issue_sel];
@@ -1982,18 +2104,19 @@ module DispatchQueue #(
         issue_selected_payload[1].pc =
             pc[fast_issue_sel];
 
+        /*
+         * The fast lane has the same registered wakeup/data timing as the
+         * main lane.  Do not read stale rD1/rD2 during the one-cycle
+         * complete_data_q capture window.
+         */
         issue_selected_payload[1].src0_value =
-            rD1[fast_issue_sel];
+            src0_value_eff[fast_issue_sel];
 
         issue_selected_payload[1].src1_value =
-            fast_hold_is_store
-                ? src1_value_eff[fast_issue_sel]
-                : rD2[fast_issue_sel];
+            src1_value_eff[fast_issue_sel];
 
         issue_selected_payload[1].src1_ready =
-            fast_hold_is_store
-                ? src1_ready_eff[fast_issue_sel]
-                : src1_ready[fast_issue_sel];
+            src1_data_ready_eff[fast_issue_sel];
 
         issue_selected_payload[1].src1_id =
             src1_id[fast_issue_sel];
@@ -2111,12 +2234,50 @@ module DispatchQueue #(
                 alloc_seq[7]
             );
 
+    wire issue0_payload_is_store =
+        issue_payload_valid_q &&
+        issue_payload_q[0].is_ld_st &&
+        (issue_payload_q[0].store_mask != `RAM_WE_N);
+
+    wire issue0_late_wake0 =
+        issue0_payload_is_store &&
+        !issue_payload_q[0].src1_ready &&
+        complete_data_q[0].valid &&
+        uop_id_equal(
+            complete_data_q[0].uop_id,
+            issue_payload_q[0].src1_id
+        );
+
+    wire issue0_late_wake1 =
+        issue0_payload_is_store &&
+        !issue_payload_q[0].src1_ready &&
+        complete_data_q[1].valid &&
+        uop_id_equal(
+            complete_data_q[1].uop_id,
+            issue_payload_q[0].src1_id
+        );
+
+    wire issue0_late_wake =
+        issue0_late_wake0 ||
+        issue0_late_wake1;
+
+    wire [31:0] issue0_late_wake_value =
+        issue0_late_wake0
+            ? complete_data_q[0].value
+            : complete_data_q[1].value;
+
     always_comb begin
         issue[0] = '0;
         issue[1] = '0;
 
-        if (issue_payload_valid_q && !flush)
+        if (issue_payload_valid_q && !flush) begin
             issue[0] = issue_payload_q[0];
+
+            if (issue0_late_wake) begin
+                issue[0].src1_ready = 1'b1;
+                issue[0].src1_value = issue0_late_wake_value;
+            end
+        end
 
         if (fast_payload_valid_q && !flush)
             issue[1] = issue_payload_q[1];
@@ -2201,13 +2362,13 @@ module DispatchQueue #(
 
     wire c0_enq_s0 =
         uop_id_equal(
-            wakeup0_id,
+            complete_data_q[0].uop_id,
             enq_src0_id
         );
 
     wire c1_enq_s0 =
         uop_id_equal(
-            wakeup1_id,
+            complete_data_q[1].uop_id,
             enq_src0_id
         );
 
@@ -2231,13 +2392,13 @@ module DispatchQueue #(
 
     wire c0_enq_s1 =
         uop_id_equal(
-            wakeup0_id,
+            complete_data_q[0].uop_id,
             enq_src1_id
         );
 
     wire c1_enq_s1 =
         uop_id_equal(
-            wakeup1_id,
+            complete_data_q[1].uop_id,
             enq_src1_id
         );
 
@@ -2261,13 +2422,13 @@ module DispatchQueue #(
 
     wire c0_enq1_s0 =
         uop_id_equal(
-            wakeup0_id,
+            complete_data_q[0].uop_id,
             enq1_src0_id
         );
 
     wire c1_enq1_s0 =
         uop_id_equal(
-            wakeup1_id,
+            complete_data_q[1].uop_id,
             enq1_src0_id
         );
 
@@ -2291,13 +2452,13 @@ module DispatchQueue #(
 
     wire c0_enq1_s1 =
         uop_id_equal(
-            wakeup0_id,
+            complete_data_q[0].uop_id,
             enq1_src1_id
         );
 
     wire c1_enq1_s1 =
         uop_id_equal(
-            wakeup1_id,
+            complete_data_q[1].uop_id,
             enq1_src1_id
         );
 
@@ -2323,13 +2484,13 @@ module DispatchQueue #(
         enq_src0_real &&
         (
             (
-                wakeup0_valid &&
-                wakeup0_rf_we &&
+                complete_data_q[0].valid &&
+                complete_data_q[0].reg_write &&
                 c0_enq_s0
             ) ||
             (
-                wakeup1_valid &&
-                wakeup1_rf_we &&
+                complete_data_q[1].valid &&
+                complete_data_q[1].reg_write &&
                 c1_enq_s0
             ) ||
             (
@@ -2343,13 +2504,13 @@ module DispatchQueue #(
         enq_src1_real &&
         (
             (
-                wakeup0_valid &&
-                wakeup0_rf_we &&
+                complete_data_q[0].valid &&
+                complete_data_q[0].reg_write &&
                 c0_enq_s1
             ) ||
             (
-                wakeup1_valid &&
-                wakeup1_rf_we &&
+                complete_data_q[1].valid &&
+                complete_data_q[1].reg_write &&
                 c1_enq_s1
             ) ||
             (
@@ -2393,13 +2554,13 @@ module DispatchQueue #(
         enq1_src0_real &&
         (
             (
-                wakeup0_valid &&
-                wakeup0_rf_we &&
+                complete_data_q[0].valid &&
+                complete_data_q[0].reg_write &&
                 c0_enq1_s0
             ) ||
             (
-                wakeup1_valid &&
-                wakeup1_rf_we &&
+                complete_data_q[1].valid &&
+                complete_data_q[1].reg_write &&
                 c1_enq1_s0
             ) ||
             (
@@ -2413,13 +2574,13 @@ module DispatchQueue #(
         enq1_src1_real &&
         (
             (
-                wakeup0_valid &&
-                wakeup0_rf_we &&
+                complete_data_q[0].valid &&
+                complete_data_q[0].reg_write &&
                 c0_enq1_s1
             ) ||
             (
-                wakeup1_valid &&
-                wakeup1_rf_we &&
+                complete_data_q[1].valid &&
+                complete_data_q[1].reg_write &&
                 c1_enq1_s1
             ) ||
             (
@@ -2462,16 +2623,16 @@ module DispatchQueue #(
     wire [31:0] enq_src0_bypass_value =
         (
             enq_src0_real &&
-            wakeup0_valid &&
-            wakeup0_rf_we &&
+            complete_data_q[0].valid &&
+            complete_data_q[0].reg_write &&
             c0_enq_s0
-        ) ? wakeup0_value :
+        ) ? complete_data_q[0].value :
         (
             enq_src0_real &&
-            wakeup1_valid &&
-            wakeup1_rf_we &&
+            complete_data_q[1].valid &&
+            complete_data_q[1].reg_write &&
             c1_enq_s0
-        ) ? wakeup1_value :
+        ) ? complete_data_q[1].value :
         (
             enq_src0_real &&
             system_wakeup_valid &&
@@ -2495,16 +2656,16 @@ module DispatchQueue #(
     wire [31:0] enq_src1_bypass_value =
         (
             enq_src1_real &&
-            wakeup0_valid &&
-            wakeup0_rf_we &&
+            complete_data_q[0].valid &&
+            complete_data_q[0].reg_write &&
             c0_enq_s1
-        ) ? wakeup0_value :
+        ) ? complete_data_q[0].value :
         (
             enq_src1_real &&
-            wakeup1_valid &&
-            wakeup1_rf_we &&
+            complete_data_q[1].valid &&
+            complete_data_q[1].reg_write &&
             c1_enq_s1
-        ) ? wakeup1_value :
+        ) ? complete_data_q[1].value :
         (
             enq_src1_real &&
             system_wakeup_valid &&
@@ -2528,16 +2689,16 @@ module DispatchQueue #(
     wire [31:0] enq1_src0_bypass_value =
         (
             enq1_src0_real &&
-            wakeup0_valid &&
-            wakeup0_rf_we &&
+            complete_data_q[0].valid &&
+            complete_data_q[0].reg_write &&
             c0_enq1_s0
-        ) ? wakeup0_value :
+        ) ? complete_data_q[0].value :
         (
             enq1_src0_real &&
-            wakeup1_valid &&
-            wakeup1_rf_we &&
+            complete_data_q[1].valid &&
+            complete_data_q[1].reg_write &&
             c1_enq1_s0
-        ) ? wakeup1_value :
+        ) ? complete_data_q[1].value :
         (
             enq1_src0_real &&
             system_wakeup_valid &&
@@ -2561,16 +2722,16 @@ module DispatchQueue #(
     wire [31:0] enq1_src1_bypass_value =
         (
             enq1_src1_real &&
-            wakeup0_valid &&
-            wakeup0_rf_we &&
+            complete_data_q[0].valid &&
+            complete_data_q[0].reg_write &&
             c0_enq1_s1
-        ) ? wakeup0_value :
+        ) ? complete_data_q[0].value :
         (
             enq1_src1_real &&
-            wakeup1_valid &&
-            wakeup1_rf_we &&
+            complete_data_q[1].valid &&
+            complete_data_q[1].reg_write &&
             c1_enq1_s1
-        ) ? wakeup1_value :
+        ) ? complete_data_q[1].value :
         (
             enq1_src1_real &&
             system_wakeup_valid &&
@@ -2599,38 +2760,34 @@ module DispatchQueue #(
             end
         end else begin
             if (
-                wakeup0_valid ||
-                wakeup1_valid ||
+                complete_data_q[0].valid ||
+                complete_data_q[1].valid ||
                 system_wakeup_valid ||
                 commit_valid ||
                 commit1_valid
             ) begin
                 for (j = 0; j < DQ_DEPTH; j = j + 1) begin
-                    if (wake_src0_vec[j]) begin
-                        if (wake0_src0_vec[j])
-                            rD1[j] <= wakeup0_value;
-                        else if (wake1_src0_vec[j])
-                            rD1[j] <= wakeup1_value;
-                        else if (system_src0_match[j])
-                            rD1[j] <= system_wakeup_value;
-                        else if (wake2_src0_vec[j])
-                            rD1[j] <= commit_value;
-                        else if (wake3_src0_vec[j])
-                            rD1[j] <= commit1_value;
-                    end
+                    if (data0_src0_match[j])
+                        rD1[j] <= complete_data_q[0].value;
+                    else if (data1_src0_match[j])
+                        rD1[j] <= complete_data_q[1].value;
+                    else if (system_src0_match[j])
+                        rD1[j] <= system_wakeup_value;
+                    else if (wake2_src0_vec[j])
+                        rD1[j] <= commit_value;
+                    else if (wake3_src0_vec[j])
+                        rD1[j] <= commit1_value;
 
-                    if (wake_src1_vec[j]) begin
-                        if (wake0_src1_vec[j])
-                            rD2[j] <= wakeup0_value;
-                        else if (wake1_src1_vec[j])
-                            rD2[j] <= wakeup1_value;
-                        else if (system_src1_match[j])
-                            rD2[j] <= system_wakeup_value;
-                        else if (wake2_src1_vec[j])
-                            rD2[j] <= commit_value;
-                        else if (wake3_src1_vec[j])
-                            rD2[j] <= commit1_value;
-                    end
+                    if (data0_src1_match[j])
+                        rD2[j] <= complete_data_q[0].value;
+                    else if (data1_src1_match[j])
+                        rD2[j] <= complete_data_q[1].value;
+                    else if (system_src1_match[j])
+                        rD2[j] <= system_wakeup_value;
+                    else if (wake2_src1_vec[j])
+                        rD2[j] <= commit_value;
+                    else if (wake3_src1_vec[j])
+                        rD2[j] <= commit1_value;
                 end
             end
 
@@ -2710,8 +2867,15 @@ module DispatchQueue #(
                 issue_payload_valid_q <= 1'b1;
                 issue_payload_q[0] <=
                     issue_selected_payload[0];
-            end else if (issue_fire) begin
-                issue_payload_valid_q <= 1'b0;
+            end else begin
+                if (issue0_late_wake) begin
+                    issue_payload_q[0].src1_ready <= 1'b1;
+                    issue_payload_q[0].src1_value <=
+                        issue0_late_wake_value;
+                end
+
+                if (issue_fire)
+                    issue_payload_valid_q <= 1'b0;
             end
 
             if (fast_payload_capture) begin
@@ -2815,10 +2979,22 @@ module DispatchQueue #(
                     recover_count =
                         recover_count + 1;
 
-                    if (wake_src0_vec[i])
+                    if (
+                        data0_src0_match[i] ||
+                        data1_src0_match[i] ||
+                        system_src0_match[i] ||
+                        wake2_src0_vec[i] ||
+                        wake3_src0_vec[i]
+                    )
                         src0_ready[i] <= 1'b1;
 
-                    if (wake_src1_vec[i])
+                    if (
+                        data0_src1_match[i] ||
+                        data1_src1_match[i] ||
+                        system_src1_match[i] ||
+                        wake2_src1_vec[i] ||
+                        wake3_src1_vec[i]
+                    )
                         src1_ready[i] <= 1'b1;
                 end else begin
                     valid[i] <= 1'b0;
@@ -3013,6 +3189,8 @@ module DispatchQueue #(
             end
 
             if (
+                complete_data_q[0].valid ||
+                complete_data_q[1].valid ||
                 wakeup0_valid ||
                 wakeup1_valid ||
                 system_wakeup_valid ||
@@ -3020,10 +3198,22 @@ module DispatchQueue #(
                 commit1_valid
             ) begin
                 for (i = 0; i < DQ_DEPTH; i = i + 1) begin
-                    if (wake_src0_vec[i])
+                    if (
+                        data0_src0_match[i] ||
+                        data1_src0_match[i] ||
+                        system_src0_match[i] ||
+                        wake2_src0_vec[i] ||
+                        wake3_src0_vec[i]
+                    )
                         src0_ready[i] <= 1'b1;
 
-                    if (wake_src1_vec[i])
+                    if (
+                        data0_src1_match[i] ||
+                        data1_src1_match[i] ||
+                        system_src1_match[i] ||
+                        wake2_src1_vec[i] ||
+                        wake3_src1_vec[i]
+                    )
                         src1_ready[i] <= 1'b1;
                 end
             end
