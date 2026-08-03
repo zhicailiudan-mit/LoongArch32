@@ -83,8 +83,11 @@ module cache_wreq_bridge(
     assign bus_we             = bus_write_fire ? bus_request_we : 4'h0;
     assign bus_wdata          = bus_request_data;
 
-    wire wr_peripheral = (bus_request_addr[31:16] == 16'hBFAF) ||
-                         (bus_request_addr[31:16] == 16'hBFD0);
+    wire wr_peripheral =
+        ((bus_request_addr >= 32'h1f00_0000) &&
+         (bus_request_addr <  32'h1f60_0000)) ||
+        (bus_request_addr[31:16] == 16'hBFAF) ||
+        (bus_request_addr[31:16] == 16'hBFD0);
     wire [31:0] wr_word_addr = {2'b00, bus_request_addr[31:2]};
     assign bus_waddr = wr_peripheral ? bus_request_addr : wr_word_addr;
 

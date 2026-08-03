@@ -261,5 +261,6 @@ module ExecutionLane0 (
         execute_result.writeback_value = (issue0_q.result_sel == `WD_ALU) ?
                                           ex_alu_result : 32'h1234_5678;
         execute_result.select_ram      = (issue0_q.load_ext_op != `N_RAM_EXT);
+        execute_result.pred            = issue0_q.pred;
     end
 endmodule

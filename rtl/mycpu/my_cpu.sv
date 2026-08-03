@@ -23,9 +23,11 @@ module MyCpu (
     output wire [3:0]   daccess_ren,
     output wire [31:0]  daccess_addr,
     output wire         daccess_cacheable,
+    output wire [2:0]   daccess_load_tid,
     input  wire         daccess_rready,
     input  wire         daccess_valid,
     input  wire [31:0]  daccess_rdata,
+    input  wire [2:0]   daccess_response_tid,
     output wire [3:0]   daccess_wen,
     output wire [31:0]  daccess_wdata,
     input  wire         daccess_wready,
@@ -183,6 +185,7 @@ module MyCpu (
     assign ifetch_addr = translated_ifetch_addr;
     assign daccess_ren   = dcache_req.ren;
     assign daccess_addr  = translated_daccess_addr;
+    assign daccess_load_tid = dcache_req.load_tid;
     assign daccess_wen   = dcache_req.wen;
     assign daccess_wdata = dcache_req.wdata;
     // Full-line StoreBuffer allocation is disabled in correctness mode.  Keep
@@ -197,6 +200,7 @@ module MyCpu (
         dcache_rsp.rready = daccess_rready;
         dcache_rsp.valid  = daccess_valid;
         dcache_rsp.rdata  = daccess_rdata;
+        dcache_rsp.load_tid = daccess_response_tid;
         dcache_rsp.wready = daccess_wready;
         dcache_rsp.wposted = daccess_wposted;
         dcache_rsp.wresp  = daccess_wresp;
@@ -239,6 +243,7 @@ module MyCpu (
         .ex_real_taken   (execute_result.branch_taken),
         .ex_real_target  (execute_result.branch_target),
         .ex_ras_ptr      (execute_result.ras_ptr),
+        .ex_pred         (execute_result.pred),
         .branch_mispredict(frontend_branch_mispredict),
         .fetch_valid     (fetch_valid),
         .fetch_ready     (fetch_ready),
@@ -341,6 +346,8 @@ module MyCpu (
     wire [31:0] reserve1_src1_value;
     uop_id_t reserve1_src1_id;
 
+    wire [1:0] store_reserve_credit;
+
     LoadStoreUnit #(
         .DECOUPLED_STORE_RESERVATION(1'b1)
     ) u_load_store_unit (
@@ -399,7 +406,8 @@ module MyCpu (
         .reserve1_store_mask (reserve1_store_mask),
         .reserve1_src1_ready (reserve1_src1_ready),
         .reserve1_src1_value (reserve1_src1_value),
-        .reserve1_src1_id    (reserve1_src1_id)
+        .reserve1_src1_id    (reserve1_src1_id),
+        .store_reserve_credit(store_reserve_credit)
     );
 
     // Lane1's held execution packet is either an ALU/MDU operation or a
@@ -463,6 +471,7 @@ module MyCpu (
         .reserve1_src1_ready (reserve1_src1_ready),
         .reserve1_src1_value (reserve1_src1_value),
         .reserve1_src1_id    (reserve1_src1_id),
+        .store_reserve_credit(store_reserve_credit),
         .perf_rob_occupancy  (perf_rob_occupancy),
         .perf_issue_occupancy(perf_issue_occupancy),
         .perf_rob_block      (perf_rob_block),

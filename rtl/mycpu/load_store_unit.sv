@@ -69,12 +69,13 @@ module LoadStoreUnit #(
     input logic [3:0] reserve1_store_mask,
     input logic reserve1_src1_ready,
     input logic [31:0] reserve1_src1_value,
-    input uop_id_t reserve1_src1_id
+    input uop_id_t reserve1_src1_id,
+    output logic [1:0] store_reserve_credit
 );
     localparam integer LQ_DEPTH = 8;
     localparam integer SQ_DEPTH = 4;
     localparam integer SB_DEPTH = 4;
-    localparam integer STORE_SLOTS = SQ_DEPTH + SB_DEPTH;
+    localparam integer STORE_SLOTS = SQ_DEPTH + SB_DEPTH + 2;
 
     lsu_entry_t load_entry, store_entry, load1_entry, store1_entry,
                 store_release_entry;
@@ -126,6 +127,33 @@ module LoadStoreUnit #(
     logic load_l1_blocked;
     logic load_l1_forward_valid;
     logic [31:0] load_l1_forward_data;
+    // Elastic forwarding owner FIFO.  The forwarding tree may finish while
+    // the DCache/request arbiter is still consuming the previous Load; the
+    // payload remains owned here until load_issue transfers it onward.
+    lsu_entry_t load_fwd_fifo_entry_q [0:1];
+    logic       load_fwd_fifo_blocked_q [0:1];
+    logic       load_fwd_fifo_valid_q [0:1];
+    logic       load_fwd_fifo_forward_valid_q [0:1];
+    logic [31:0] load_fwd_fifo_data_q [0:1];
+    logic       load_fwd_fifo_head_q;
+    logic       load_fwd_fifo_tail_q;
+    logic [1:0] load_fwd_fifo_count_q;
+    logic       load_fwd_fifo_push;
+    logic       load_fwd_fifo_pop;
+    logic       load_fwd_fifo_dup;
+    integer     load_fwd_fifo_i;
+    integer     load_fwd_recover_i;
+    integer     load_fwd_recover_count;
+    lsu_entry_t load_fwd_recover_entry0;
+    lsu_entry_t load_fwd_recover_entry1;
+    logic       load_fwd_recover_blocked0;
+    logic       load_fwd_recover_blocked1;
+    logic       load_fwd_recover_valid0;
+    logic       load_fwd_recover_valid1;
+    logic       load_fwd_recover_forward0;
+    logic       load_fwd_recover_forward1;
+    logic [31:0] load_fwd_recover_data0;
+    logic [31:0] load_fwd_recover_data1;
     logic arb_completion_valid;
     lsu_entry_t arb_completion_entry;
     logic [31:0] arb_completion_rdata;
@@ -235,6 +263,30 @@ module LoadStoreUnit #(
     forward_candidate_t tree_stg2 [0:3][0:3];
     forward_candidate_t tree_stg3 [0:3][0:1];
     forward_candidate_t tree_winner [0:3];
+
+    // The byte-wise forwarding tree is intentionally split at the 16-to-8
+    // reduction.  The first half captures a complete snapshot of the selected
+    // Load and the eight stage-1 winners; the second half resolves the final
+    // three reductions and feeds the existing load_l1 register.  Store-to-load
+    // ordering remains conservative: a newly arriving Store is younger than
+    // the snapshotted Load and is therefore not eligible as its forward
+    // source, while an older Store remains in SQ/SB until its physical store
+    // completion.  Flush clears the snapshot before it can issue.
+    forward_candidate_t tree_stg1_q [0:3][0:7];
+    forward_candidate_t tree_stg2_p [0:3][0:3];
+    forward_candidate_t tree_stg3_p [0:3][0:1];
+    forward_candidate_t tree_winner_p [0:3];
+    lsu_entry_t load_order_head_q;
+    logic load_order_head_valid_q;
+    logic [3:0] load_order_ren_q;
+    logic order_unresolved_q;
+    logic [3:0] load_forward_mask_p;
+    logic [31:0] load_forward_data_p;
+    logic load_forward_valid_p;
+    logic load_order_blocked_p;
+    logic load_blocked_candidate_p;
+    integer forward_q;
+    integer forward_p;
 
     always @(*) begin
         load0_raw = execute_result.valid && execute_result.is_ld_st &&
@@ -372,14 +424,25 @@ module LoadStoreUnit #(
                 !uop_is_younger(store_uop_id_flat[order_i*`UOP_ID_W +: `UOP_ID_W],
                                 load_head.uop_id);
 
-        order_valid = {buffer_valid_vec, store_order_valid};
-        order_addr_ready = {{SB_DEPTH{1'b1}}, store_addr_ready_vec};
-        order_store_data_ready = {{SB_DEPTH{1'b1}}, store_data_ready_vec};
-        order_addr_flat = {buffer_addr_flat, store_addr_flat};
-        order_wen_flat = {buffer_wen_flat, store_wen_flat};
-        order_data_flat = {buffer_data_flat, store_data_flat};
-        order_uop_id_flat = {buffer_uop_id_flat, store_uop_id_flat};
-        order_byte_uop_id_flat = {buffer_byte_uop_id_flat, store_byte_uop_id_flat};
+        // Reservation intents have no address yet, but only intents older
+        // than the current Load may block it.  Treating every reservation as
+        // older creates a cycle when SQ is full: an old Load waits for younger
+        // Stores, while those Stores cannot reserve until the Load retires.
+        order_valid = {
+            reserve1_valid && load_head_valid &&
+                !uop_is_younger(reserve1_uop_id, load_head.uop_id),
+            reserve0_valid && load_head_valid &&
+                !uop_is_younger(reserve0_uop_id, load_head.uop_id),
+            buffer_valid_vec,
+            store_order_valid
+        };
+        order_addr_ready = {2'b00, {SB_DEPTH{1'b1}}, store_addr_ready_vec};
+        order_store_data_ready = {2'b00, {SB_DEPTH{1'b1}}, store_data_ready_vec};
+        order_addr_flat = {32'h0, 32'h0, buffer_addr_flat, store_addr_flat};
+        order_wen_flat = {reserve1_store_mask, reserve0_store_mask, buffer_wen_flat, store_wen_flat};
+        order_data_flat = {32'h0, 32'h0, buffer_data_flat, store_data_flat};
+        order_uop_id_flat = {reserve1_uop_id, reserve0_uop_id, buffer_uop_id_flat, store_uop_id_flat};
+        order_byte_uop_id_flat = {{4{reserve1_uop_id}}, {4{reserve0_uop_id}}, buffer_byte_uop_id_flat, store_byte_uop_id_flat};
 
         load_ren = make_load_ren(load_head.load_ext_op, load_head.address[1:0]);
         load_forward_mask = 4'b0;
@@ -537,6 +600,16 @@ module LoadStoreUnit #(
 
     uop_id_t load_pop_uop_id;
 
+    // The elastic forwarding FIFO is the only LoadQueue ownership transfer.
+    // Mark exactly the entry selected above when its complete order/forwarding
+    // payload enters that FIFO.  load_issue belongs to the FIFO *head*, which
+    // can be a different Load from selected_lq_idx; using load_issue here can
+    // therefore mark the next Load issued without ever giving it an owner.
+    logic load_queue_issue_mark;
+    always_comb begin
+        load_queue_issue_mark = load_fwd_fifo_push;
+    end
+
     LoadQueue #(.DEPTH(LQ_DEPTH)) u_load_queue (
         .clk(cpu_clk), .rstn(cpu_rstn),
         .flush(flush),
@@ -546,13 +619,17 @@ module LoadStoreUnit #(
         .accept_ready(load_ready), .head_valid(),
         .accept1_valid(load1_raw), .accept1_entry(load1_entry),
         .accept1_ready(load1_ready),
-        .head_entry(), .issue_mark(load_issue), .issue_idx(selected_lq_idx), .pop(load_pop),
+        .head_entry(), .issue_mark(load_queue_issue_mark), .issue_idx(selected_lq_idx), .pop(load_pop),
         .pop_uop_id(load_pop_uop_id),
         .unissued_vec(lq_unissued_vec), .entries_flat(lq_entries),
         .valid_vec(load_valid_vec), .addr_flat(load_addr_flat),
         .occupancy(lq_occupancy)
     );
 
+    // Keep the functional/performance checkpoint on the original same-cycle
+    // StoreQueue release.  The registered release boundary is a separate
+    // timing experiment: it removes a slot from reserve_credit for one extra
+    // cycle, which turns into IQ no-ready bubbles in the startup Store loop.
     StoreQueue #(.DEPTH(SQ_DEPTH)) u_store_queue (
         .clk(cpu_clk), .rstn(cpu_rstn),
         .flush(flush),
@@ -570,6 +647,7 @@ module LoadStoreUnit #(
         .reserve1_uop_id(reserve1_uop_id), .reserve1_pc(reserve1_pc),
         .reserve1_store_mask(reserve1_store_mask), .reserve1_src1_ready(reserve1_src1_ready),
         .reserve1_src1_value(reserve1_src1_value), .reserve1_src1_id(reserve1_src1_id),
+        .reserve_credit(store_reserve_credit),
         .addr_update0_valid(addr_update0_valid), .addr_update0_ack(addr_update0_ack),
         .addr_update0_uop_id(addr_update0_uop_id), .addr_update0_address(addr_update0_address),
         .addr_update0_store_wen(addr_update0_store_wen), .addr_update0_unalign(addr_update0_unalign),
@@ -621,36 +699,279 @@ module LoadStoreUnit #(
         .blocked(load_blocked)
     );
 
-    // L1 register for the load-order result.  This breaks the combinational
-    // path from SQ/SB byte-age comparison through the DCache ready and
-    // completion network.  A flush kills the stage before it can issue.
+    // Register the first half of the forwarding/order decision.  This is the
+    // LSU-side timing boundary: the LoadQueue/SQ/SB age comparison no longer
+    // drives the load_l1 enable in the same cycle.  The snapshot contains the
+    // full Load identity and byte enables so the second half cannot mix a
+    // forwarding result with a different queue entry.
     always_ff @(posedge cpu_clk or negedge cpu_rstn) begin
         if (!cpu_rstn) begin
-            load_l1_valid <= 1'b0;
-            load_l1_entry <= '0;
-            load_l1_blocked <= 1'b0;
-            load_l1_forward_valid <= 1'b0;
-            load_l1_forward_data <= 32'h0;
-        end else if (flush) begin
-            load_l1_valid <= 1'b0;
-            load_l1_entry <= '0;
-            load_l1_blocked <= 1'b0;
-            load_l1_forward_valid <= 1'b0;
-            load_l1_forward_data <= 32'h0;
-        end else begin
-            if (load_l1_valid && load_issue) begin
-                load_l1_valid <= 1'b0;
-                load_l1_entry <= '0;
-                load_l1_blocked <= 1'b0;
-                load_l1_forward_valid <= 1'b0;
-                load_l1_forward_data <= 32'h0;
-            end else if (!load_l1_valid && load_head_valid && (!load_blocked || load_forward_valid)) begin
-                load_l1_valid <= 1'b1;
-                load_l1_entry <= load_head;
-                load_l1_blocked <= load_blocked;
-                load_l1_forward_valid <= load_forward_valid;
-                load_l1_forward_data <= load_forward_data;
+            load_order_head_q       <= '0;
+            load_order_head_valid_q <= 1'b0;
+            load_order_ren_q        <= 4'b0;
+            order_unresolved_q      <= 1'b0;
+            for (forward_q = 0; forward_q < 4; forward_q = forward_q + 1) begin
+                tree_stg1_q[forward_q][0] <= '0;
+                tree_stg1_q[forward_q][1] <= '0;
+                tree_stg1_q[forward_q][2] <= '0;
+                tree_stg1_q[forward_q][3] <= '0;
+                tree_stg1_q[forward_q][4] <= '0;
+                tree_stg1_q[forward_q][5] <= '0;
+                tree_stg1_q[forward_q][6] <= '0;
+                tree_stg1_q[forward_q][7] <= '0;
             end
+        end else if (flush) begin
+            load_order_head_q       <= '0;
+            load_order_head_valid_q <= 1'b0;
+            load_order_ren_q        <= 4'b0;
+            order_unresolved_q      <= 1'b0;
+            for (forward_q = 0; forward_q < 4; forward_q = forward_q + 1) begin
+                tree_stg1_q[forward_q][0] <= '0;
+                tree_stg1_q[forward_q][1] <= '0;
+                tree_stg1_q[forward_q][2] <= '0;
+                tree_stg1_q[forward_q][3] <= '0;
+                tree_stg1_q[forward_q][4] <= '0;
+                tree_stg1_q[forward_q][5] <= '0;
+                tree_stg1_q[forward_q][6] <= '0;
+                tree_stg1_q[forward_q][7] <= '0;
+            end
+        end else if (load_fwd_fifo_push || load_issue || load_pop) begin
+            // The snapshot is consumed/invalidated by the current LSU event.
+            // Without this fence, an owned Load can remain visible to the
+            // forwarding tree after the FIFO has already taken ownership.
+            load_order_head_q       <= '0;
+            load_order_head_valid_q <= 1'b0;
+            load_order_ren_q        <= 4'b0;
+            order_unresolved_q      <= 1'b0;
+            for (forward_q = 0; forward_q < 4; forward_q = forward_q + 1) begin
+                tree_stg1_q[forward_q][0] <= '0;
+                tree_stg1_q[forward_q][1] <= '0;
+                tree_stg1_q[forward_q][2] <= '0;
+                tree_stg1_q[forward_q][3] <= '0;
+                tree_stg1_q[forward_q][4] <= '0;
+                tree_stg1_q[forward_q][5] <= '0;
+                tree_stg1_q[forward_q][6] <= '0;
+                tree_stg1_q[forward_q][7] <= '0;
+            end
+        end else begin
+            load_order_head_q       <= load_head;
+            load_order_head_valid_q <= load_head_valid;
+            load_order_ren_q        <= load_ren;
+            // The exact address/byte overlap is represented by the registered
+            // forwarding candidates below.  Keep only the separate unsafe
+            // case here: an older Store whose address is not known yet.
+            order_unresolved_q      <= |(order_valid & ~order_addr_ready);
+            for (forward_q = 0; forward_q < 4; forward_q = forward_q + 1) begin
+                tree_stg1_q[forward_q][0] <= tree_stg1[forward_q][0];
+                tree_stg1_q[forward_q][1] <= tree_stg1[forward_q][1];
+                tree_stg1_q[forward_q][2] <= tree_stg1[forward_q][2];
+                tree_stg1_q[forward_q][3] <= tree_stg1[forward_q][3];
+                tree_stg1_q[forward_q][4] <= tree_stg1[forward_q][4];
+                tree_stg1_q[forward_q][5] <= tree_stg1[forward_q][5];
+                tree_stg1_q[forward_q][6] <= tree_stg1[forward_q][6];
+                tree_stg1_q[forward_q][7] <= tree_stg1[forward_q][7];
+            end
+        end
+    end
+
+    // Second half of the registered forwarding tree.  The result is aligned
+    // with load_order_head_q/load_order_ren_q and is consumed by load_l1 on
+    // the following clock edge.
+    always_comb begin
+        load_forward_mask_p = 4'b0;
+        load_forward_data_p = 32'b0;
+        load_forward_valid_p = 1'b0;
+        load_blocked_candidate_p = 1'b0;
+        for (forward_p = 0; forward_p < 4; forward_p = forward_p + 1) begin
+            // Stage 2 (8 to 4) is now downstream of the LSU register.  This
+            // leaves at most one reduction level on the LoadQueue-to-register
+            // path while preserving the exact younger-uop winner rule.
+            tree_stg2_p[forward_p][0] = select_younger(tree_stg1_q[forward_p][0],
+                                                       tree_stg1_q[forward_p][1]);
+            tree_stg2_p[forward_p][1] = select_younger(tree_stg1_q[forward_p][2],
+                                                       tree_stg1_q[forward_p][3]);
+            tree_stg2_p[forward_p][2] = select_younger(tree_stg1_q[forward_p][4],
+                                                       tree_stg1_q[forward_p][5]);
+            tree_stg2_p[forward_p][3] = select_younger(tree_stg1_q[forward_p][6],
+                                                       tree_stg1_q[forward_p][7]);
+            tree_stg3_p[forward_p][0] = select_younger(tree_stg2_p[forward_p][0],
+                                                       tree_stg2_p[forward_p][1]);
+            tree_stg3_p[forward_p][1] = select_younger(tree_stg2_p[forward_p][2],
+                                                       tree_stg2_p[forward_p][3]);
+            tree_winner_p[forward_p] = select_younger(tree_stg3_p[forward_p][0],
+                                                       tree_stg3_p[forward_p][1]);
+            load_forward_mask_p[forward_p] = tree_winner_p[forward_p].valid &&
+                                             tree_winner_p[forward_p].data_ready;
+            load_forward_data_p[forward_p*8 +: 8] = tree_winner_p[forward_p].data;
+
+            // Any registered candidate on a byte selected by this Load means
+            // that a same-word Store still has to be accounted for.  A full
+            // byte cover is subsequently allowed by load_forward_valid_p;
+            // partial cover remains blocked, matching the old checker.
+            if (load_order_ren_q[forward_p]) begin
+                for (integer blocked_i = 0; blocked_i < 8; blocked_i = blocked_i + 1)
+                    if (tree_stg1_q[forward_p][blocked_i].valid)
+                        load_blocked_candidate_p = 1'b1;
+            end
+        end
+        load_order_blocked_p = load_order_head_valid_q &&
+                               (order_unresolved_q || load_blocked_candidate_p);
+        load_forward_valid_p = load_order_head_valid_q &&
+                                ((load_forward_mask_p & load_order_ren_q) ==
+                                 load_order_ren_q);
+    end
+
+    // Elastic forwarding owner FIFO.  The old single load_l1 register was
+    // cleared on load_issue and could not accept another completed forwarding
+    // decision in the same cycle.  This two-entry ready/valid boundary keeps
+    // the selected Load and its byte data stable until the arbiter accepts it.
+    always_comb begin
+        load_l1_valid = (load_fwd_fifo_count_q != 2'd0) && !flush;
+        load_l1_entry = '0;
+        load_l1_blocked = 1'b0;
+        load_l1_forward_valid = 1'b0;
+        load_l1_forward_data = 32'h0;
+        if (load_fwd_fifo_count_q != 2'd0) begin
+            load_l1_entry = load_fwd_fifo_entry_q[load_fwd_fifo_head_q];
+            load_l1_blocked = load_fwd_fifo_blocked_q[load_fwd_fifo_head_q];
+            load_l1_forward_valid = load_fwd_fifo_forward_valid_q[load_fwd_fifo_head_q];
+            load_l1_forward_data = load_fwd_fifo_data_q[load_fwd_fifo_head_q];
+        end
+
+        load_fwd_fifo_dup = 1'b0;
+        if ((load_fwd_fifo_count_q != 2'd0) &&
+            uop_id_equal(load_order_head_q.uop_id,
+                         load_fwd_fifo_entry_q[load_fwd_fifo_head_q].uop_id))
+            load_fwd_fifo_dup = 1'b1;
+        if ((load_fwd_fifo_count_q == 2'd2) &&
+            uop_id_equal(load_order_head_q.uop_id,
+                         load_fwd_fifo_entry_q[load_fwd_fifo_head_q ^ 1'b1].uop_id))
+            load_fwd_fifo_dup = 1'b1;
+
+        load_fwd_fifo_pop = load_l1_valid && load_issue && !flush;
+        load_fwd_fifo_push = !flush && load_order_head_valid_q &&
+                             (!load_order_blocked_p || load_forward_valid_p) &&
+                             ((load_fwd_fifo_count_q < 2'd2) ||
+                              load_fwd_fifo_pop) && !load_fwd_fifo_dup;
+
+        load_fwd_recover_count = 0;
+        load_fwd_recover_entry0 = '0;
+        load_fwd_recover_entry1 = '0;
+        load_fwd_recover_blocked0 = 1'b0;
+        load_fwd_recover_blocked1 = 1'b0;
+        load_fwd_recover_valid0 = 1'b0;
+        load_fwd_recover_valid1 = 1'b0;
+        load_fwd_recover_forward0 = 1'b0;
+        load_fwd_recover_forward1 = 1'b0;
+        load_fwd_recover_data0 = 32'h0;
+        load_fwd_recover_data1 = 32'h0;
+        for (load_fwd_recover_i = 0; load_fwd_recover_i < 2;
+             load_fwd_recover_i = load_fwd_recover_i + 1) begin
+            if ((load_fwd_recover_i < load_fwd_fifo_count_q) &&
+                !uop_is_younger(
+                    load_fwd_fifo_entry_q[load_fwd_fifo_head_q ^
+                                          load_fwd_recover_i[0]].uop_id,
+                    recover_id)) begin
+                if (load_fwd_recover_count == 0) begin
+                    load_fwd_recover_entry0 =
+                        load_fwd_fifo_entry_q[load_fwd_fifo_head_q ^
+                                              load_fwd_recover_i[0]];
+                    load_fwd_recover_blocked0 =
+                        load_fwd_fifo_blocked_q[load_fwd_fifo_head_q ^
+                                                load_fwd_recover_i[0]];
+                    load_fwd_recover_valid0 = 1'b1;
+                    load_fwd_recover_forward0 =
+                        load_fwd_fifo_forward_valid_q[load_fwd_fifo_head_q ^
+                                                      load_fwd_recover_i[0]];
+                    load_fwd_recover_data0 =
+                        load_fwd_fifo_data_q[load_fwd_fifo_head_q ^
+                                             load_fwd_recover_i[0]];
+                end else if (load_fwd_recover_count == 1) begin
+                    load_fwd_recover_entry1 =
+                        load_fwd_fifo_entry_q[load_fwd_fifo_head_q ^
+                                              load_fwd_recover_i[0]];
+                    load_fwd_recover_blocked1 =
+                        load_fwd_fifo_blocked_q[load_fwd_fifo_head_q ^
+                                                load_fwd_recover_i[0]];
+                    load_fwd_recover_valid1 = 1'b1;
+                    load_fwd_recover_forward1 =
+                        load_fwd_fifo_forward_valid_q[load_fwd_fifo_head_q ^
+                                                      load_fwd_recover_i[0]];
+                    load_fwd_recover_data1 =
+                        load_fwd_fifo_data_q[load_fwd_fifo_head_q ^
+                                             load_fwd_recover_i[0]];
+                end
+                load_fwd_recover_count = load_fwd_recover_count + 1;
+            end
+        end
+    end
+
+    always_ff @(posedge cpu_clk or negedge cpu_rstn) begin
+        if (!cpu_rstn) begin
+            load_fwd_fifo_head_q <= 1'b0;
+            load_fwd_fifo_tail_q <= 1'b0;
+            load_fwd_fifo_count_q <= 2'd0;
+            for (load_fwd_fifo_i = 0; load_fwd_fifo_i < 2;
+                 load_fwd_fifo_i = load_fwd_fifo_i + 1) begin
+                load_fwd_fifo_valid_q[load_fwd_fifo_i] <= 1'b0;
+                load_fwd_fifo_entry_q[load_fwd_fifo_i] <= '0;
+                load_fwd_fifo_blocked_q[load_fwd_fifo_i] <= 1'b0;
+                load_fwd_fifo_forward_valid_q[load_fwd_fifo_i] <= 1'b0;
+                load_fwd_fifo_data_q[load_fwd_fifo_i] <= 32'h0;
+            end
+        end else if (system_flush || (flush && !recover_valid)) begin
+            load_fwd_fifo_head_q <= 1'b0;
+            load_fwd_fifo_tail_q <= 1'b0;
+            load_fwd_fifo_count_q <= 2'd0;
+            for (load_fwd_fifo_i = 0; load_fwd_fifo_i < 2;
+                 load_fwd_fifo_i = load_fwd_fifo_i + 1) begin
+                load_fwd_fifo_valid_q[load_fwd_fifo_i] <= 1'b0;
+                load_fwd_fifo_entry_q[load_fwd_fifo_i] <= '0;
+                load_fwd_fifo_blocked_q[load_fwd_fifo_i] <= 1'b0;
+                load_fwd_fifo_forward_valid_q[load_fwd_fifo_i] <= 1'b0;
+                load_fwd_fifo_data_q[load_fwd_fifo_i] <= 32'h0;
+            end
+        end else if (flush) begin
+            load_fwd_fifo_head_q <= 1'b0;
+            load_fwd_fifo_tail_q <= (load_fwd_recover_count == 0) ? 1'b0 : 1'b1;
+            load_fwd_fifo_count_q <= load_fwd_recover_count[1:0];
+            load_fwd_fifo_valid_q[0] <= load_fwd_recover_valid0;
+            load_fwd_fifo_valid_q[1] <= load_fwd_recover_valid1;
+            load_fwd_fifo_entry_q[0] <= load_fwd_recover_entry0;
+            load_fwd_fifo_entry_q[1] <= load_fwd_recover_entry1;
+            load_fwd_fifo_blocked_q[0] <= load_fwd_recover_blocked0;
+            load_fwd_fifo_blocked_q[1] <= load_fwd_recover_blocked1;
+            load_fwd_fifo_forward_valid_q[0] <= load_fwd_recover_forward0;
+            load_fwd_fifo_forward_valid_q[1] <= load_fwd_recover_forward1;
+            load_fwd_fifo_data_q[0] <= load_fwd_recover_data0;
+            load_fwd_fifo_data_q[1] <= load_fwd_recover_data1;
+        end else begin
+            case ({load_fwd_fifo_push, load_fwd_fifo_pop})
+                2'b10: begin
+                    load_fwd_fifo_valid_q[load_fwd_fifo_tail_q] <= 1'b1;
+                    load_fwd_fifo_entry_q[load_fwd_fifo_tail_q] <= load_order_head_q;
+                    load_fwd_fifo_blocked_q[load_fwd_fifo_tail_q] <= load_order_blocked_p;
+                    load_fwd_fifo_forward_valid_q[load_fwd_fifo_tail_q] <= load_forward_valid_p;
+                    load_fwd_fifo_data_q[load_fwd_fifo_tail_q] <= load_forward_data_p;
+                    load_fwd_fifo_tail_q <= ~load_fwd_fifo_tail_q;
+                    load_fwd_fifo_count_q <= load_fwd_fifo_count_q + 2'd1;
+                end
+                2'b01: begin
+                    load_fwd_fifo_valid_q[load_fwd_fifo_head_q] <= 1'b0;
+                    load_fwd_fifo_head_q <= ~load_fwd_fifo_head_q;
+                    load_fwd_fifo_count_q <= load_fwd_fifo_count_q - 2'd1;
+                end
+                2'b11: begin
+                    load_fwd_fifo_valid_q[load_fwd_fifo_tail_q] <= 1'b1;
+                    load_fwd_fifo_entry_q[load_fwd_fifo_tail_q] <= load_order_head_q;
+                    load_fwd_fifo_blocked_q[load_fwd_fifo_tail_q] <= load_order_blocked_p;
+                    load_fwd_fifo_forward_valid_q[load_fwd_fifo_tail_q] <= load_forward_valid_p;
+                    load_fwd_fifo_data_q[load_fwd_fifo_tail_q] <= load_forward_data_p;
+                    load_fwd_fifo_tail_q <= ~load_fwd_fifo_tail_q;
+                    load_fwd_fifo_head_q <= ~load_fwd_fifo_head_q;
+                end
+                default: begin end
+            endcase
         end
     end
 
@@ -658,7 +979,7 @@ module LoadStoreUnit #(
     wire load_at_rob_head = rob_head_valid && uop_id_equal(load_l1_entry.uop_id, rob_head_id);
     wire load_memory_allowed = !load_is_mmio || load_at_rob_head;
 
-    LsuArbiter u_lsu_arbiter (
+    TaggedLsuArbiter u_lsu_arbiter (
         .clk(cpu_clk), .rstn(cpu_rstn),
         .flush(flush),
         .branch_flush(branch_flush),

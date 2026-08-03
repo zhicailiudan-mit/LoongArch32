@@ -68,44 +68,162 @@ module RegAliasTable (
     reg [4:0]            owner_rd       [0:`ROB_DEPTH-1];
     reg [`UOP_EPOCH_W-1:0] owner_epoch  [0:`ROB_DEPTH-1];
     
+    // Checkpoint storage is deliberately kept as a packed RAM word.  The old
+    // implementation described a three-dimensional, resettable register
+    // array (ROB slots x 31 registers x {valid,tag,epoch}); Vivado therefore
+    // built thousands of LUT/FFs and put the whole RAT on the rename timing
+    // cone.  A packed word with no data reset is inferable as block RAM.
+    localparam integer CP_ENTRY_W = 1 + `ROB_TAG_W + `UOP_EPOCH_W;
+    localparam integer CP_MAP_W = 31 * CP_ENTRY_W;
+    localparam integer CP_BANK_DEPTH = `ROB_DEPTH / 2;
+    (* ram_style = "block" *) reg [CP_MAP_W-1:0] cp_map_mem_even [0:CP_BANK_DEPTH-1];
+    (* ram_style = "block" *) reg [CP_MAP_W-1:0] cp_map_mem_odd  [0:CP_BANK_DEPTH-1];
     reg cp_slot_valid [0:`ROB_DEPTH-1];
     reg [`UOP_EPOCH_W-1:0] cp_slot_epoch [0:`ROB_DEPTH-1];
-    reg cp_map_valid [0:`ROB_DEPTH-1][1:31];
-    reg [`ROB_TAG_W-1:0] cp_map_tag [0:`ROB_DEPTH-1][1:31];
-    reg [`UOP_EPOCH_W-1:0] cp_map_epoch [0:`ROB_DEPTH-1][1:31];
+    // Recovery reads the selected RAM word on the recover edge and exposes it
+    // through the view below for the following cycle.  Rename can continue to
+    // see the restored map during that cycle; the architectural map is
+    // committed at the next edge together with any newly allocated uops.
+    reg [CP_MAP_W-1:0] cp_read_data_q;
+    reg cp_restore_pending_q;
+    reg cp_restore_valid_q;
+
+    reg [31:0] restore_map_valid;
+    reg [`ROB_TAG_W-1:0] restore_map_tag [0:31];
+    reg [`UOP_EPOCH_W-1:0] restore_map_epoch [0:31];
+    reg [31:0] view_map_valid;
+    reg [`ROB_TAG_W-1:0] view_map_tag [0:31];
+    reg [`UOP_EPOCH_W-1:0] view_map_epoch [0:31];
+    reg [CP_MAP_W-1:0] cp_write_data0;
+    reg [CP_MAP_W-1:0] cp_write_data1;
 
     integer i;
     integer r;
 
-    reg is_valid_cp;
-    reg cp_val;
-    reg [`UOP_EPOCH_W-1:0] cp_ep;
-    reg [`ROB_TAG_W-1:0] cp_tg;
-    reg producer_is_alive;
-    reg producer_is_committing;
+    integer v;
 
-    assign query_pending0 = (query_rs0 != 5'h0) && map_valid[query_rs0];
-    assign query_tag0 = map_tag[query_rs0];
-    assign query_epoch0 = map_epoch[query_rs0];
-    assign query_pending1 = (query_rs1 != 5'h0) && map_valid[query_rs1];
-    assign query_tag1 = map_tag[query_rs1];
-    assign query_epoch1 = map_epoch[query_rs1];
+    // Decode the packed synchronous checkpoint word.  The validity filter is
+    // kept identical to the former register-array implementation: a mapping
+    // survives recovery only when its ROB owner is still live and has not
+    // committed in the recovery cycle.
+    always @(*) begin
+        restore_map_valid = 32'h0;
+        for (v = 0; v < 32; v = v + 1) begin
+            restore_map_tag[v] = {`ROB_TAG_W{1'b0}};
+            restore_map_epoch[v] = {`UOP_EPOCH_W{1'b0}};
+        end
+        for (v = 1; v < 32; v = v + 1) begin
+            restore_map_tag[v] = cp_read_data_q[(v-1)*CP_ENTRY_W + 1 +: `ROB_TAG_W];
+            restore_map_epoch[v] = cp_read_data_q[(v-1)*CP_ENTRY_W + 1 + `ROB_TAG_W +: `UOP_EPOCH_W];
+            if (cp_restore_valid_q && cp_read_data_q[(v-1)*CP_ENTRY_W] &&
+                rob_live_mask[restore_map_tag[v]] &&
+                owner_has_dest[restore_map_tag[v]] &&
+                (owner_rd[restore_map_tag[v]] == v[4:0]) &&
+                (owner_epoch[restore_map_tag[v]] == restore_map_epoch[v]) &&
+                !((commit_valid && commit_has_dest &&
+                   (commit_rd == v[4:0]) &&
+                   (commit_tag == restore_map_tag[v]) &&
+                   (commit_epoch == restore_map_epoch[v])) ||
+                  (commit1_valid && commit1_has_dest &&
+                   (commit1_rd == v[4:0]) &&
+                   (commit1_tag == restore_map_tag[v]) &&
+                   (commit1_epoch == restore_map_epoch[v])))) begin
+                restore_map_valid[v] = 1'b1;
+            end
+        end
+
+        // During the one-cycle synchronous restore window, queries must see
+        // the checkpoint even though map_valid/map_tag/map_epoch are updated
+        // at the end of this cycle.  This avoids adding a rename bubble.
+        for (v = 0; v < 32; v = v + 1) begin
+            view_map_valid[v] = cp_restore_pending_q ? restore_map_valid[v] : map_valid[v];
+            view_map_tag[v] = cp_restore_pending_q ? restore_map_tag[v] : map_tag[v];
+            view_map_epoch[v] = cp_restore_pending_q ? restore_map_epoch[v] : map_epoch[v];
+        end
+    end
+
+    // A set map_valid bit is not sufficient after ROB tag wrap or checkpoint
+    // restore.  Only expose a dependency when the referenced ROB slot is
+    // still owned by the same architectural destination and epoch.  Without
+    // this identity check, rename can read a completed value from a reused
+    // ROB tag and silently inject an old loop-iteration operand.
+    wire query_map0_owned = view_map_valid[query_rs0] &&
+                            rob_live_mask[view_map_tag[query_rs0]] &&
+                            owner_has_dest[view_map_tag[query_rs0]] &&
+                            (owner_rd[view_map_tag[query_rs0]] == query_rs0) &&
+                            (owner_epoch[view_map_tag[query_rs0]] ==
+                             view_map_epoch[query_rs0]);
+    wire query_map1_owned = view_map_valid[query_rs1] &&
+                            rob_live_mask[view_map_tag[query_rs1]] &&
+                            owner_has_dest[view_map_tag[query_rs1]] &&
+                            (owner_rd[view_map_tag[query_rs1]] == query_rs1) &&
+                            (owner_epoch[view_map_tag[query_rs1]] ==
+                             view_map_epoch[query_rs1]);
+    wire query_map2_owned = view_map_valid[query_rs2] &&
+                            rob_live_mask[view_map_tag[query_rs2]] &&
+                            owner_has_dest[view_map_tag[query_rs2]] &&
+                            (owner_rd[view_map_tag[query_rs2]] == query_rs2) &&
+                            (owner_epoch[view_map_tag[query_rs2]] ==
+                             view_map_epoch[query_rs2]);
+    wire query_map3_owned = view_map_valid[query_rs3] &&
+                            rob_live_mask[view_map_tag[query_rs3]] &&
+                            owner_has_dest[view_map_tag[query_rs3]] &&
+                            (owner_rd[view_map_tag[query_rs3]] == query_rs3) &&
+                            (owner_epoch[view_map_tag[query_rs3]] ==
+                             view_map_epoch[query_rs3]);
+
+    assign query_pending0 = (query_rs0 != 5'h0) && query_map0_owned;
+    assign query_tag0 = view_map_tag[query_rs0];
+    assign query_epoch0 = view_map_epoch[query_rs0];
+    assign query_pending1 = (query_rs1 != 5'h0) && query_map1_owned;
+    assign query_tag1 = view_map_tag[query_rs1];
+    assign query_epoch1 = view_map_epoch[query_rs1];
     wire lane0_writes_rs2 = alloc_valid && alloc_rf_we &&
-                            (alloc_rd != 5'h0) && (alloc_rd == query_rs2);
+                             (alloc_rd != 5'h0) && (alloc_rd == query_rs2);
     wire lane0_writes_rs3 = alloc_valid && alloc_rf_we &&
                             (alloc_rd != 5'h0) && (alloc_rd == query_rs3);
     assign query_pending2 = (query_rs2 != 5'h0) &&
-                            (lane0_writes_rs2 || map_valid[query_rs2]);
-    assign query_tag2 = lane0_writes_rs2 ? alloc_tag : map_tag[query_rs2];
-    assign query_epoch2 = lane0_writes_rs2 ? alloc_epoch : map_epoch[query_rs2];
+                            (lane0_writes_rs2 || query_map2_owned);
+    assign query_tag2 = lane0_writes_rs2 ? alloc_tag : view_map_tag[query_rs2];
+    assign query_epoch2 = lane0_writes_rs2 ? alloc_epoch : view_map_epoch[query_rs2];
     assign query_pending3 = (query_rs3 != 5'h0) &&
-                            (lane0_writes_rs3 || map_valid[query_rs3]);
-    assign query_tag3 = lane0_writes_rs3 ? alloc_tag : map_tag[query_rs3];
-    assign query_epoch3 = lane0_writes_rs3 ? alloc_epoch : map_epoch[query_rs3];
+                            (lane0_writes_rs3 || query_map3_owned);
+    assign query_tag3 = lane0_writes_rs3 ? alloc_tag : view_map_tag[query_rs3];
+    assign query_epoch3 = lane0_writes_rs3 ? alloc_epoch : view_map_epoch[query_rs3];
+
+    // Build both checkpoint words from the map visible to rename.  The second
+    // lane includes lane0's same-cycle destination, matching the original
+    // dual-dispatch RAT semantics.
+    integer w;
+    always @(*) begin
+        cp_write_data0 = {CP_MAP_W{1'b0}};
+        cp_write_data1 = {CP_MAP_W{1'b0}};
+        for (w = 1; w < 32; w = w + 1) begin
+            cp_write_data0[(w-1)*CP_ENTRY_W] =
+                (alloc_valid && alloc_rf_we && (alloc_rd == w[4:0])) ? 1'b1 : view_map_valid[w];
+            cp_write_data0[(w-1)*CP_ENTRY_W + 1 +: `ROB_TAG_W] =
+                (alloc_valid && alloc_rf_we && (alloc_rd == w[4:0])) ? alloc_tag : view_map_tag[w];
+            cp_write_data0[(w-1)*CP_ENTRY_W + 1 + `ROB_TAG_W +: `UOP_EPOCH_W] =
+                (alloc_valid && alloc_rf_we && (alloc_rd == w[4:0])) ? alloc_epoch : view_map_epoch[w];
+
+            cp_write_data1[(w-1)*CP_ENTRY_W] =
+                (alloc1_valid && alloc1_rf_we && (alloc1_rd == w[4:0])) ? 1'b1 :
+                ((alloc_valid && alloc_rf_we && (alloc_rd == w[4:0])) ? 1'b1 : view_map_valid[w]);
+            cp_write_data1[(w-1)*CP_ENTRY_W + 1 +: `ROB_TAG_W] =
+                (alloc1_valid && alloc1_rf_we && (alloc1_rd == w[4:0])) ? alloc1_tag :
+                ((alloc_valid && alloc_rf_we && (alloc_rd == w[4:0])) ? alloc_tag : view_map_tag[w]);
+            cp_write_data1[(w-1)*CP_ENTRY_W + 1 + `ROB_TAG_W +: `UOP_EPOCH_W] =
+                (alloc1_valid && alloc1_rf_we && (alloc1_rd == w[4:0])) ? alloc1_epoch :
+                ((alloc_valid && alloc_rf_we && (alloc_rd == w[4:0])) ? alloc_epoch : view_map_epoch[w]);
+        end
+    end
 
     always @(posedge clk or negedge rstn) begin
         if (!rstn) begin
             map_valid <= 32'h0;
+            cp_read_data_q <= {CP_MAP_W{1'b0}};
+            cp_restore_pending_q <= 1'b0;
+            cp_restore_valid_q <= 1'b0;
             for (i = 0; i < 32; i = i + 1) begin
                 map_tag[i] <= {`ROB_TAG_W{1'b0}};
                 map_epoch[i] <= {`UOP_EPOCH_W{1'b0}};
@@ -115,119 +233,137 @@ module RegAliasTable (
                 owner_rd[i]       <= 5'h0;
                 owner_epoch[i]    <= {`UOP_EPOCH_W{1'b0}};
                 cp_slot_valid[i]  <= 1'b0;
+                cp_slot_epoch[i]  <= {`UOP_EPOCH_W{1'b0}};
             end
-        end else if (recover_valid) begin
-            if (system_flush) begin
+        end else begin
+            // A recovery starts a synchronous checkpoint read.  Queries are
+            // served from cp_read_data_q during cp_restore_pending_q, so this
+            // adds no ordinary rename bubble.
+            if (recover_valid && system_flush) begin
                 map_valid <= 32'h0;
-                for (i = 0; i < `ROB_DEPTH; i = i + 1) begin
+                cp_restore_pending_q <= 1'b0;
+                cp_restore_valid_q <= 1'b0;
+                for (i = 0; i < `ROB_DEPTH; i = i + 1)
                     cp_slot_valid[i] <= 1'b0;
-                end
-            end else begin
-                // Restore from the snapshot taken at dispatch.
-                is_valid_cp = cp_slot_valid[recover_tag] && (cp_slot_epoch[recover_tag] == recover_epoch);
+            end else if (recover_valid && !cp_restore_pending_q) begin
+                if (!recover_tag[0])
+                    cp_read_data_q <= cp_map_mem_even[recover_tag[`ROB_TAG_W-1:1]];
+                else
+                    cp_read_data_q <= cp_map_mem_odd[recover_tag[`ROB_TAG_W-1:1]];
+                cp_restore_pending_q <= 1'b1;
+                cp_restore_valid_q <= cp_slot_valid[recover_tag] &&
+                                      (cp_slot_epoch[recover_tag] == recover_epoch);
+                map_valid <= 32'h0;
                 `ifndef SYNTHESIS
-                if (recover_valid && !is_valid_cp) begin
+                if (!(cp_slot_valid[recover_tag] &&
+                      (cp_slot_epoch[recover_tag] == recover_epoch))) begin
                     $fatal(1, "RAT Checkpoint missing for recover_tag=%0d, recover_epoch=%0d, system_flush=%b, cp_slot_valid=%b, cp_slot_epoch=%0d, rob_live_mask=%b", recover_tag, recover_epoch, system_flush, cp_slot_valid[recover_tag], cp_slot_epoch[recover_tag], rob_live_mask);
                 end
                 `endif
-                if (!is_valid_cp) begin
-                    map_valid <= 32'h0; // Fallback for synthesis
-                end else begin
-                    for (r = 1; r < 32; r = r + 1) begin
-                        cp_val = cp_map_valid[recover_tag][r];
-                        cp_ep  = cp_map_epoch[recover_tag][r];
-                        cp_tg  = cp_map_tag[recover_tag][r];
-                        
-                        producer_is_committing = (commit_valid && (commit_tag == cp_tg) && (commit_epoch == cp_ep)) ||
-                                                 (commit1_valid && (commit1_tag == cp_tg) && (commit1_epoch == cp_ep));
-                                                 
-                        producer_is_alive = rob_live_mask[cp_tg] && owner_has_dest[cp_tg] && 
-                                            (owner_rd[cp_tg] == r[4:0]) && (owner_epoch[cp_tg] == cp_ep);
-                        
-                        map_valid[r] <= cp_val && producer_is_alive && !producer_is_committing;
-                        map_tag[r]   <= cp_tg;
-                        map_epoch[r] <= cp_ep;
+            end else if (cp_restore_pending_q) begin
+                // Commit the RAM snapshot and merge any allocations accepted
+                // in the restore cycle.  The latter is what preserves the
+                // normal two-uop rename contract across a branch recovery.
+                map_valid <= restore_map_valid;
+                for (i = 1; i < 32; i = i + 1) begin
+                    map_tag[i] <= restore_map_tag[i];
+                    map_epoch[i] <= restore_map_epoch[i];
+                end
+                map_valid[0] <= 1'b0;
+                cp_restore_pending_q <= 1'b0;
+                cp_restore_valid_q <= 1'b0;
+                if (alloc_valid) begin
+                    owner_has_dest[alloc_tag] <= alloc_rf_we && (alloc_rd != 5'h0);
+                    owner_rd[alloc_tag] <= alloc_rd;
+                    owner_epoch[alloc_tag] <= alloc_epoch;
+                    if (alloc_checkpoint) begin
+                        cp_slot_valid[alloc_tag] <= 1'b1;
+                        cp_slot_epoch[alloc_tag] <= alloc_epoch;
+                        if (!alloc_tag[0])
+                            cp_map_mem_even[alloc_tag[`ROB_TAG_W-1:1]] <= cp_write_data0;
+                        else
+                            cp_map_mem_odd[alloc_tag[`ROB_TAG_W-1:1]] <= cp_write_data0;
+                    end else begin
+                        cp_slot_valid[alloc_tag] <= 1'b0;
                     end
                 end
-            end
-            map_valid[0] <= 1'b0;
-        end else begin
-            if (commit_valid && commit_has_dest && (commit_rd != 5'h0) &&
-                map_valid[commit_rd] && (map_tag[commit_rd] == commit_tag) &&
-                (map_epoch[commit_rd] == commit_epoch))
-                map_valid[commit_rd] <= 1'b0;
-            if (commit1_valid && commit1_has_dest && (commit1_rd != 5'h0) &&
-                map_valid[commit1_rd] && (map_tag[commit1_rd] == commit1_tag) &&
-                (map_epoch[commit1_rd] == commit1_epoch))
-                map_valid[commit1_rd] <= 1'b0;
-
-            if (alloc_valid) begin
-                owner_has_dest[alloc_tag] <= alloc_rf_we && (alloc_rd != 5'h0);
-                owner_rd[alloc_tag]       <= alloc_rd;
-                owner_epoch[alloc_tag]    <= alloc_epoch;
-            end
-            if (alloc1_valid) begin
-                owner_has_dest[alloc1_tag] <= alloc1_rf_we && (alloc1_rd != 5'h0);
-                owner_rd[alloc1_tag]       <= alloc1_rd;
-                owner_epoch[alloc1_tag]    <= alloc1_epoch;
-            end
-
-            if (alloc_valid && alloc_rf_we && (alloc_rd != 5'h0)) begin
-                map_valid[alloc_rd] <= 1'b1;
-                map_tag[alloc_rd]   <= alloc_tag;
-                map_epoch[alloc_rd] <= alloc_epoch;
-            end
-            if (alloc1_valid && alloc1_rf_we && (alloc1_rd != 5'h0)) begin
-                map_valid[alloc1_rd] <= 1'b1;
-                map_tag[alloc1_rd]   <= alloc1_tag;
-                map_epoch[alloc1_rd] <= alloc1_epoch;
-            end
-
-            if (alloc_valid) begin
-                if (alloc_checkpoint) begin
-                    cp_slot_valid[alloc_tag] <= 1'b1;
-                    cp_slot_epoch[alloc_tag] <= alloc_epoch;
-                    for (r = 1; r < 32; r = r + 1) begin
-                        if (alloc_rf_we && (alloc_rd == r[4:0])) begin
-                            cp_map_valid[alloc_tag][r] <= 1'b1;
-                            cp_map_tag[alloc_tag][r]   <= alloc_tag;
-                            cp_map_epoch[alloc_tag][r] <= alloc_epoch;
-                        end else begin
-                            cp_map_valid[alloc_tag][r] <= map_valid[r];
-                            cp_map_tag[alloc_tag][r]   <= map_tag[r];
-                            cp_map_epoch[alloc_tag][r] <= map_epoch[r];
-                        end
+                if (alloc1_valid) begin
+                    owner_has_dest[alloc1_tag] <= alloc1_rf_we && (alloc1_rd != 5'h0);
+                    owner_rd[alloc1_tag] <= alloc1_rd;
+                    owner_epoch[alloc1_tag] <= alloc1_epoch;
+                    if (alloc1_checkpoint) begin
+                        cp_slot_valid[alloc1_tag] <= 1'b1;
+                        cp_slot_epoch[alloc1_tag] <= alloc1_epoch;
+                        if (!alloc1_tag[0])
+                            cp_map_mem_even[alloc1_tag[`ROB_TAG_W-1:1]] <= cp_write_data1;
+                        else
+                            cp_map_mem_odd[alloc1_tag[`ROB_TAG_W-1:1]] <= cp_write_data1;
+                    end else begin
+                        cp_slot_valid[alloc1_tag] <= 1'b0;
                     end
-                end else begin
-                    cp_slot_valid[alloc_tag] <= 1'b0;
                 end
-            end
-            
-            if (alloc1_valid) begin
-                if (alloc1_checkpoint) begin
-                    cp_slot_valid[alloc1_tag] <= 1'b1;
-                    cp_slot_epoch[alloc1_tag] <= alloc1_epoch;
-                    for (r = 1; r < 32; r = r + 1) begin
-                        if (alloc1_rf_we && (alloc1_rd == r[4:0])) begin
-                            cp_map_valid[alloc1_tag][r] <= 1'b1;
-                            cp_map_tag[alloc1_tag][r]   <= alloc1_tag;
-                            cp_map_epoch[alloc1_tag][r] <= alloc1_epoch;
-                        end else if (alloc_valid && alloc_rf_we && (alloc_rd == r[4:0])) begin
-                            cp_map_valid[alloc1_tag][r] <= 1'b1;
-                            cp_map_tag[alloc1_tag][r]   <= alloc_tag;
-                            cp_map_epoch[alloc1_tag][r] <= alloc_epoch;
-                        end else begin
-                            cp_map_valid[alloc1_tag][r] <= map_valid[r];
-                            cp_map_tag[alloc1_tag][r]   <= map_tag[r];
-                            cp_map_epoch[alloc1_tag][r] <= map_epoch[r];
-                        end
-                    end
-                end else begin
-                    cp_slot_valid[alloc1_tag] <= 1'b0;
+                if (alloc_valid && alloc_rf_we && (alloc_rd != 5'h0)) begin
+                    map_valid[alloc_rd] <= 1'b1;
+                    map_tag[alloc_rd] <= alloc_tag;
+                    map_epoch[alloc_rd] <= alloc_epoch;
                 end
-            end
+                if (alloc1_valid && alloc1_rf_we && (alloc1_rd != 5'h0)) begin
+                    map_valid[alloc1_rd] <= 1'b1;
+                    map_tag[alloc1_rd] <= alloc1_tag;
+                    map_epoch[alloc1_rd] <= alloc1_epoch;
+                end
+            end else begin
+                if (commit_valid && commit_has_dest && (commit_rd != 5'h0) &&
+                    map_valid[commit_rd] && (map_tag[commit_rd] == commit_tag) &&
+                    (map_epoch[commit_rd] == commit_epoch))
+                    map_valid[commit_rd] <= 1'b0;
+                if (commit1_valid && commit1_has_dest && (commit1_rd != 5'h0) &&
+                    map_valid[commit1_rd] && (map_tag[commit1_rd] == commit1_tag) &&
+                    (map_epoch[commit1_rd] == commit1_epoch))
+                    map_valid[commit1_rd] <= 1'b0;
 
-            map_valid[0] <= 1'b0;
+                if (alloc_valid) begin
+                    owner_has_dest[alloc_tag] <= alloc_rf_we && (alloc_rd != 5'h0);
+                    owner_rd[alloc_tag] <= alloc_rd;
+                    owner_epoch[alloc_tag] <= alloc_epoch;
+                    if (alloc_rf_we && (alloc_rd != 5'h0)) begin
+                        map_valid[alloc_rd] <= 1'b1;
+                        map_tag[alloc_rd] <= alloc_tag;
+                        map_epoch[alloc_rd] <= alloc_epoch;
+                    end
+                    if (alloc_checkpoint) begin
+                        cp_slot_valid[alloc_tag] <= 1'b1;
+                        cp_slot_epoch[alloc_tag] <= alloc_epoch;
+                        if (!alloc_tag[0])
+                            cp_map_mem_even[alloc_tag[`ROB_TAG_W-1:1]] <= cp_write_data0;
+                        else
+                            cp_map_mem_odd[alloc_tag[`ROB_TAG_W-1:1]] <= cp_write_data0;
+                    end else begin
+                        cp_slot_valid[alloc_tag] <= 1'b0;
+                    end
+                end
+                if (alloc1_valid) begin
+                    owner_has_dest[alloc1_tag] <= alloc1_rf_we && (alloc1_rd != 5'h0);
+                    owner_rd[alloc1_tag] <= alloc1_rd;
+                    owner_epoch[alloc1_tag] <= alloc1_epoch;
+                    if (alloc1_rf_we && (alloc1_rd != 5'h0)) begin
+                        map_valid[alloc1_rd] <= 1'b1;
+                        map_tag[alloc1_rd] <= alloc1_tag;
+                        map_epoch[alloc1_rd] <= alloc1_epoch;
+                    end
+                    if (alloc1_checkpoint) begin
+                        cp_slot_valid[alloc1_tag] <= 1'b1;
+                        cp_slot_epoch[alloc1_tag] <= alloc1_epoch;
+                        if (!alloc1_tag[0])
+                            cp_map_mem_even[alloc1_tag[`ROB_TAG_W-1:1]] <= cp_write_data1;
+                        else
+                            cp_map_mem_odd[alloc1_tag[`ROB_TAG_W-1:1]] <= cp_write_data1;
+                    end else begin
+                        cp_slot_valid[alloc1_tag] <= 1'b0;
+                    end
+                end
+                map_valid[0] <= 1'b0;
+            end
         end
     end
 

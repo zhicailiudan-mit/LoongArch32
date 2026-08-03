@@ -30,6 +30,13 @@ module BranchPredUnit (
     input  wire [ 2:0]  id_ras_sp_before_in,
     input  wire [ 3:0]  id_ras_count_before_in,
     input  wire         id_perf_btb_hit_in,
+    input  wire         ex_pred_valid_in,
+    input  wire         ex_pred_taken_in,
+    input  wire [31:0]  ex_pred_target_in,
+    input  wire [ 9:0]  ex_pred_index_in,
+    input  wire [ 2:0]  ex_ras_sp_before_in,
+    input  wire [ 3:0]  ex_ras_count_before_in,
+    input  wire         ex_perf_btb_hit_in,
     input  wire         pl_suspend ,
 
     // predict branch direction and target
@@ -175,58 +182,23 @@ module BranchPredUnit (
     wire ras_spec_push = if_pipe_fire & hit_call;
     wire ras_spec_pop  = if_pipe_fire & ras_pred_taken;
 
-    // ------------------------------------------------------------
-    // Prediction metadata follows the instruction through IBUF.
-    // When the backend really accepts the ID instruction, capture
-    // that packet for the next EX-stage prediction check.
-    // ------------------------------------------------------------
-    reg [`BHT_IDX_W-1:0] ex_index;
-
-    reg                  ex_pred_valid;
-
-    reg                  ex_pred_taken;
-    reg [31:0]           ex_pred_target;
-    reg                  ex_perf_btb_hit;
-
-    reg [2:0]            ex_ras_sp_before;
-    reg [`RAS_CNT_W-1:0] ex_ras_count_before;
+    // Prediction metadata is already registered with the issue packet in
+    // ExecutionLane0.  Keep the BPU free of the dispatch->id_fire capture
+    // cone; these wires are consumed only when the matching EX packet is
+    // valid.
+    wire [`BHT_IDX_W-1:0] ex_index            = ex_pred_index_in;
+    wire                  ex_pred_valid       = ex_pred_valid_in;
+    wire                  ex_pred_taken       = ex_pred_taken_in;
+    wire [31:0]           ex_pred_target      = ex_pred_target_in;
+    wire                  ex_perf_btb_hit     = ex_perf_btb_hit_in;
+    wire [2:0]            ex_ras_sp_before    = ex_ras_sp_before_in;
+    wire [`RAS_CNT_W-1:0] ex_ras_count_before = ex_ras_count_before_in;
 
     reg [ 2:0]           ras_sp_next;
     reg [`RAS_CNT_W-1:0] ras_count_next;
     wire                 ras_stack_we    = ras_spec_push;
     wire [ 2:0]          ras_stack_waddr = ras_sp;
     wire [31:0]          ras_stack_wdata = if_pc + 32'h4;
-
-    always @(posedge cpu_clk or negedge cpu_rstn) begin
-        if (!cpu_rstn) begin
-            ex_index       <= 'h0;
-            ex_pred_valid  <= 1'b0;
-            ex_pred_taken  <= 1'b0;
-            ex_pred_target <= 32'h0;
-            ex_perf_btb_hit <= 1'b0;
-
-            ex_ras_sp_before    <= 3'h0;
-            ex_ras_count_before <= 4'h0;
-        end
-        else begin
-            if (pred_error) begin
-                ex_pred_valid <= 1'b0;
-            end
-            else if (id_fire) begin
-                ex_index       <= id_pred_index_in;
-                ex_pred_valid  <= id_pred_valid_in;
-                ex_pred_taken  <= id_pred_taken_in;
-                ex_pred_target <= id_pred_target_in;
-                ex_perf_btb_hit <= id_perf_btb_hit_in;
-
-                ex_ras_sp_before    <= id_ras_sp_before_in;
-                ex_ras_count_before <= id_ras_count_before_in;
-            end
-            else if (!ex_valid) begin
-                ex_pred_valid <= 1'b0;
-            end
-        end
-    end
 
     wire prediction_taken_error =
         ex_pred_valid &&

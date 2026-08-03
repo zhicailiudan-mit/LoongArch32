@@ -43,6 +43,11 @@ module RenameDispatch (
     wire source_used [0:3];
     wire [4:0] source_arch [0:3];
     wire [31:0] source_base_value [0:3];
+    // A producer may have completed before a consumer reaches the DQ while
+    // the RAT mapping is still visible for this rename cycle.  Keep the
+    // completion value local to the rename packet in that case; the DQ still
+    // owns all later broadcasts and wakeups.
+    wire rob_done_value_valid [0:3];
     wire commit0_bypass [0:3];
     wire commit1_bypass [0:3];
     wire [31:0] source_value [0:3];
@@ -70,6 +75,10 @@ module RenameDispatch (
     genvar q;
     generate
         for (q = 0; q < 4; q = q + 1) begin : GEN_COMMIT_BYPASS
+            assign rob_done_value_valid[q] = source_used[q] &&
+                                              (source_arch[q] != 5'h0) &&
+                                              rat_pending[q] &&
+                                              rob_query_done[q];
             assign commit0_bypass[q] = commit[0].valid && commit[0].reg_write &&
                                        rat_pending[q] && source_used[q] &&
                                        (source_arch[q] != 5'h0) &&
@@ -78,7 +87,7 @@ module RenameDispatch (
                                        rat_pending[q] && source_used[q] &&
                                        (source_arch[q] != 5'h0) &&
                                        uop_id_equal(commit[1].uop_id, rat_id[q]);
-            assign source_value[q] = (rat_pending[q] && rob_query_done[q]) ?
+            assign source_value[q] = rob_done_value_valid[q] ?
                                      rob_query_value[q] :
                                      commit0_bypass[q] ? commit[0].value :
                                      commit1_bypass[q] ? commit[1].value :
@@ -97,20 +106,21 @@ module RenameDispatch (
     assign rename_pop_count = dispatch1_fire ? 2'd2 :
                               dispatch0_fire ? 2'd1 : 2'd0;
 
-    // Same-cycle execution completion is intentionally not folded into the
-    // enqueue packet.  DispatchQueue holds a local registered completion copy
-    // which makes a colliding consumer ready in its first issuable cycle.
+    // ROB done is a read-only, identity-checked fallback.  It does not
+    // replace DQ's completion broadcast; it only prevents a consumer from
+    // entering the queue with an already-retired producer tag and no future
+    // wakeup event.
     assign dispatch_src_ready[0][0] = !source_used[0] || !rat_pending[0] ||
-                                      rob_query_done[0] ||
+                                      rob_done_value_valid[0] ||
                                       commit0_bypass[0] || commit1_bypass[0];
     assign dispatch_src_ready[0][1] = !source_used[1] || !rat_pending[1] ||
-                                      rob_query_done[1] ||
+                                      rob_done_value_valid[1] ||
                                       commit0_bypass[1] || commit1_bypass[1];
     assign dispatch_src_ready[1][0] = !source_used[2] || !rat_pending[2] ||
-                                      rob_query_done[2] ||
+                                      rob_done_value_valid[2] ||
                                       commit0_bypass[2] || commit1_bypass[2];
     assign dispatch_src_ready[1][1] = !source_used[3] || !rat_pending[3] ||
-                                      rob_query_done[3] ||
+                                      rob_done_value_valid[3] ||
                                       commit0_bypass[3] || commit1_bypass[3];
 
     RenameBundle u_DECODE_RENAME (

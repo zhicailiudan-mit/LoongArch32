@@ -2,7 +2,16 @@
 `include "defines.vh"
 import cpu_types_pkg::*;
 
-module StoreQueue #(parameter integer DEPTH = 4) (
+module StoreQueue #(
+    parameter integer DEPTH = 4,
+    // A registered release boundary keeps the StoreQueue's oldest-entry
+    // selection out of the same-cycle StoreBuffer ready/accept path.  The
+    // parameter is retained for small standalone tests which still need the
+    // historical fall-through behavior; the CPU build uses the registered
+    // mode so the queue scales as an elastic producer rather than a
+    // combinational FIFO.
+    parameter bit REGISTERED_RELEASE = 1'b1
+) (
     input logic clk, input logic rstn,
     input logic flush,
     input logic recover_valid, input logic system_flush,
@@ -32,6 +41,7 @@ module StoreQueue #(parameter integer DEPTH = 4) (
     input logic reserve1_src1_ready,
     input logic [31:0] reserve1_src1_value,
     input uop_id_t reserve1_src1_id,
+    output logic [1:0] reserve_credit,
 
     // Decoupled Address & Data Update Interface (from AGU Execution)
     input logic addr_update0_valid,
@@ -124,8 +134,18 @@ module StoreQueue #(parameter integer DEPTH = 4) (
     uop_id_t addr_update1_q_data_src_id;
 
     logic [COUNT_W-1:0] count;
+    // Registered, capped free-slot credit.  Three credits cover the two-entry
+    // DQ token FIFO plus the one-entry handoff into the Scheduler FIFO while
+    // keeping the two-bit interface.  Scheduler uses this state to
+    // admit a Store before the SQ ready/oldest comparator is evaluated; the
+    // combinational SQ ready path therefore cannot return into DQ selection.
+    logic [1:0] reserve_credit_q;
     logic [INDEX_W-1:0] oldest_sel;
     logic oldest_found;
+    logic release_pending_q;
+    lsu_entry_t release_pending_entry_q;
+    logic release_candidate_valid;
+    lsu_entry_t release_candidate_entry;
     integer i, j, q, byte_i;
     integer flush_dst;
 
@@ -269,6 +289,45 @@ module StoreQueue #(parameter integer DEPTH = 4) (
         end
     endfunction
 
+    // The live StoreQueue is four entries deep.  Select its oldest entry with
+    // a balanced tournament instead of the serial scan below.  The comparator
+    // polarity matches the original scan: when the left entry is younger,
+    // the right entry wins as the older one.
+    function automatic [2:0] pick_oldest4(
+        input logic [3:0] mask,
+        input uop_id_t id0, input uop_id_t id1,
+        input uop_id_t id2, input uop_id_t id3
+    );
+        logic valid01, valid23;
+        logic [1:0] sel01, sel23;
+        uop_id_t win01, win23;
+        begin
+            valid01 = mask[0] | mask[1];
+            valid23 = mask[2] | mask[3];
+            if (mask[0] && (!mask[1] || uop_is_younger(id1, id0))) begin
+                sel01 = 2'd0;
+                win01 = id0;
+            end else begin
+                sel01 = 2'd1;
+                win01 = id1;
+            end
+            if (mask[2] && (!mask[3] || uop_is_younger(id3, id2))) begin
+                sel23 = 2'd2;
+                win23 = id2;
+            end else begin
+                sel23 = 2'd3;
+                win23 = id3;
+            end
+
+            if (!valid01 && !valid23)
+                pick_oldest4 = 3'b000;
+            else if (valid01 && (!valid23 || uop_is_younger(win23, win01)))
+                pick_oldest4 = {1'b1, sel01};
+            else
+                pick_oldest4 = {1'b1, sel23};
+        end
+    endfunction
+
 `ifndef SYNTHESIS
     localparam integer RELEASE_HISTORY_DEPTH = 16;
     logic release_history_valid [0:RELEASE_HISTORY_DEPTH-1];
@@ -310,12 +369,64 @@ module StoreQueue #(parameter integer DEPTH = 4) (
     wire r0_do = !flush && r0_active && reserve0_ready;
     wire r1_do = !flush && r1_active && reserve1_ready;
 
-    wire release_do = !flush && release_fire && oldest_found &&
-                      entries[oldest_sel].valid &&
-                      !entries[oldest_sel].unaligned &&
-                      committed[oldest_sel] &&
-                      entries[oldest_sel].addr_ready &&
-                      store_data_ready[oldest_sel];
+    // A reservation can already carry its Store data, or the producer can
+    // complete on the same edge that the reservation is accepted.  Preserve
+    // those two zero-cycle cases at insertion.  Commit wakeup is intentionally
+    // excluded here: commit_data_wakeup*_q is the registered fallback path
+    // and must remain one cycle delayed for a newly reserved Store.
+    wire r0_addr_data_match0 = r0_do && addr_update0_valid &&
+                               uop_id_equal(r0_uop_id, addr_update0_uop_id) &&
+                               addr_update0_data_ready;
+    wire r0_addr_data_match1 = r0_do && addr_update1_valid &&
+                               uop_id_equal(r0_uop_id, addr_update1_uop_id) &&
+                               addr_update1_data_ready;
+    wire r1_addr_data_match0 = r1_do && addr_update0_valid &&
+                               uop_id_equal(r1_uop_id, addr_update0_uop_id) &&
+                               addr_update0_data_ready;
+    wire r1_addr_data_match1 = r1_do && addr_update1_valid &&
+                               uop_id_equal(r1_uop_id, addr_update1_uop_id) &&
+                               addr_update1_data_ready;
+    wire r0_complete_data_match0 = complete0.valid && complete0.reg_write &&
+                                   uop_id_equal(complete0.uop_id, r0_src1_id);
+    wire r0_complete_data_match1 = complete1.valid && complete1.reg_write &&
+                                   uop_id_equal(complete1.uop_id, r0_src1_id);
+    wire r1_complete_data_match0 = complete0.valid && complete0.reg_write &&
+                                   uop_id_equal(complete0.uop_id, r1_src1_id);
+    wire r1_complete_data_match1 = complete1.valid && complete1.reg_write &&
+                                   uop_id_equal(complete1.uop_id, r1_src1_id);
+    wire r0_initial_data_ready = r0_src1_ready || r0_addr_data_match0 ||
+                                 r0_addr_data_match1 || r0_complete_data_match0 ||
+                                 r0_complete_data_match1;
+    wire r1_initial_data_ready = r1_src1_ready || r1_addr_data_match0 ||
+                                 r1_addr_data_match1 || r1_complete_data_match0 ||
+                                 r1_complete_data_match1;
+    wire [31:0] r0_initial_data_value =
+        r0_src1_ready ? r0_src1_value :
+        r0_addr_data_match0 ? addr_update0_data_value :
+        r0_addr_data_match1 ? addr_update1_data_value :
+        r0_complete_data_match0 ? complete0.value :
+        r0_complete_data_match1 ? complete1.value : 32'h0;
+    wire [31:0] r1_initial_data_value =
+        r1_src1_ready ? r1_src1_value :
+        r1_addr_data_match0 ? addr_update0_data_value :
+        r1_addr_data_match1 ? addr_update1_data_value :
+        r1_complete_data_match0 ? complete0.value :
+        r1_complete_data_match1 ? complete1.value : 32'h0;
+    wire r0_commit_now = r0_do &&
+                         ((commit0.valid && uop_id_equal(r0_uop_id, commit0.uop_id)) ||
+                          (commit1.valid && uop_id_equal(r0_uop_id, commit1.uop_id)));
+    wire r1_commit_now = r1_do &&
+                         ((commit0.valid && uop_id_equal(r1_uop_id, commit0.uop_id)) ||
+                          (commit1.valid && uop_id_equal(r1_uop_id, commit1.uop_id)));
+
+    // In registered-release mode the StoreQueue removes an entry only after
+    // the already-registered release packet is accepted by the StoreBuffer.
+    // Consequently the oldest-entry comparator is never in the same-cycle
+    // ready/accept/compaction cone.  The legacy mode keeps the old behavior
+    // for focused unit tests.
+    wire release_do = !flush && release_fire &&
+                      (REGISTERED_RELEASE ? release_pending_q :
+                       release_candidate_valid);
 
     // Account for same-cycle release when computing free slots.  Without this,
     // a steady-state SQ at DEPTH sees free_slots==0 for one cycle each time it
@@ -330,14 +441,60 @@ module StoreQueue #(parameter integer DEPTH = 4) (
     // free_slots or reserve*_ready, so the path is strictly feed-forward:
     //   release_do → free_slots → reserve*_ready → Scheduler → DQ.
     wire [COUNT_W:0] free_slots = (DEPTH - count) + {{COUNT_W{1'b0}}, release_do};
+    // Do not expose the same-cycle release through the reservation interface.
+    // `release_do` is driven by the StoreBuffer handshake and its oldest-entry
+    // uop-id comparisons.  Feeding it into reserve_credit/reserve*_ready lets
+    // that completion cone return through Scheduler and the DispatchQueue in
+    // the same cycle.  The queue state is updated at this edge, so the next
+    // cycle sees the freed slot without any correctness loss; the only change
+    // is a conservative one-cycle bubble when a full SQ releases an entry.
+    // Keep free_slots for the internal compact/append update, where the
+    // same-cycle release is required to place a newly accepted reservation in
+    // the vacated physical slot.
+    wire [COUNT_W:0] reserve_visible_slots = DEPTH - count;
+    wire [COUNT_W:0] reserve_free_after = (DEPTH - count) +
+                                           {{COUNT_W{1'b0}}, release_do} -
+                                           {{COUNT_W{1'b0}}, r0_do} -
+                                           {{COUNT_W{1'b0}}, r1_do};
+    wire [1:0] reserve_credit_next =
+        (reserve_free_after >= 3) ? 2'd3 : reserve_free_after[1:0];
 
-    // Combinational address-update acknowledgement only searches entries
-    // which were reserved on an earlier clock edge.  In the CPU pipeline a
-    // Store reservation is accepted with issue_fire, then the execution lane
-    // produces its address no earlier than the following cycle.  Treating a
-    // current reservation grant as an address hit is therefore unreachable,
-    // and creates a false combinational cycle through reserve_ready,
-    // issue_ready and DispatchQueue selection.
+    generate
+        if (DEPTH == 4) begin : GEN_OLDEST4
+            wire [3:0] oldest_mask4 = {
+                (entries[3].valid && (3 < count)),
+                (entries[2].valid && (2 < count)),
+                (entries[1].valid && (1 < count)),
+                (entries[0].valid && (0 < count))
+            };
+            wire [2:0] oldest_pick4 = pick_oldest4(
+                oldest_mask4,
+                entries[0].uop_id, entries[1].uop_id,
+                entries[2].uop_id, entries[3].uop_id);
+            always_comb begin
+                oldest_found = oldest_pick4[2];
+                oldest_sel = oldest_pick4[INDEX_W-1:0];
+            end
+        end else begin : GEN_OLDEST_GENERIC
+            always_comb begin
+                oldest_found = 1'b0;
+                oldest_sel = '0;
+                for (i = 0; i < DEPTH; i = i + 1) begin
+                    if ((i < count) && entries[i].valid &&
+                        (!oldest_found || uop_is_younger(entries[oldest_sel].uop_id,
+                                                         entries[i].uop_id))) begin
+                        oldest_found = 1'b1;
+                        oldest_sel = i[INDEX_W-1:0];
+                    end
+                end
+            end
+        end
+    endgenerate
+
+    assign reserve_credit = flush ? 2'd0 : reserve_credit_q;
+
+    // Combinational address-update acknowledgement searches both existing entries
+    // and current-cycle accepted reservation intents.
     always_comb begin
         addr_update0_ack = 1'b0;
         if (!flush && addr_update0_valid) begin
@@ -346,6 +503,10 @@ module StoreQueue #(parameter integer DEPTH = 4) (
                     addr_update0_ack = 1'b1;
                 end
             end
+            if (r0_do && uop_id_equal(reserve0_uop_id, addr_update0_uop_id))
+                addr_update0_ack = 1'b1;
+            if (r1_do && uop_id_equal(reserve1_uop_id, addr_update0_uop_id))
+                addr_update0_ack = 1'b1;
         end
 
         addr_update1_ack = 1'b0;
@@ -355,6 +516,59 @@ module StoreQueue #(parameter integer DEPTH = 4) (
                     addr_update1_ack = 1'b1;
                 end
             end
+            if (r0_do && uop_id_equal(reserve0_uop_id, addr_update1_uop_id))
+                addr_update1_ack = 1'b1;
+            if (r1_do && uop_id_equal(reserve1_uop_id, addr_update1_uop_id))
+                addr_update1_ack = 1'b1;
+        end
+    end
+
+    // Build the current oldest release packet once.  In the CPU build this is
+    // captured into release_pending_entry_q and presented to StoreBuffer on
+    // the following cycle; no downstream ready signal can feed back into the
+    // metadata update path.
+    always_comb begin
+        release_candidate_valid = !flush && oldest_found &&
+                                  entries[oldest_sel].valid &&
+                                  !entries[oldest_sel].unaligned &&
+                                  committed[oldest_sel] &&
+                                  entries[oldest_sel].addr_ready &&
+                                  store_data_ready[oldest_sel];
+        release_candidate_entry = '0;
+        if (release_candidate_valid) begin
+            release_candidate_entry.valid = 1'b1;
+            release_candidate_entry.uop_id = entries[oldest_sel].uop_id;
+            release_candidate_entry.pc = entries[oldest_sel].pc;
+            release_candidate_entry.address = entries[oldest_sel].address;
+            release_candidate_entry.store_wen = entries[oldest_sel].store_wen;
+            release_candidate_entry.store_data = compute_aligned_data(
+                raw_store_data[oldest_sel], entries[oldest_sel].raw_mask,
+                entries[oldest_sel].address[1:0]);
+            release_candidate_entry.store_data_ready = 1'b1;
+            release_candidate_entry.store_data_src_id = store_data_src_id[oldest_sel];
+        end
+    end
+
+    // Explicit producer-side release register.  It is intentionally a
+    // one-entry elastic boundary: a slow StoreBuffer holds the packet here,
+    // while the StoreQueue state remains untouched until the packet's actual
+    // acceptance.  This makes release completion exactly one pop and removes
+    // the old StoreQueue -> StoreBuffer -> StoreQueue combinational loop.
+    always_ff @(posedge clk or negedge rstn) begin
+        if (!rstn || flush) begin
+            release_pending_q <= 1'b0;
+            release_pending_entry_q <= '0;
+        end else if (REGISTERED_RELEASE) begin
+            if (release_do) begin
+                release_pending_q <= 1'b0;
+                release_pending_entry_q <= '0;
+            end else if (!release_pending_q && release_candidate_valid) begin
+                release_pending_q <= 1'b1;
+                release_pending_entry_q <= release_candidate_entry;
+            end
+        end else begin
+            release_pending_q <= 1'b0;
+            release_pending_entry_q <= '0;
         end
     end
 
@@ -362,8 +576,8 @@ module StoreQueue #(parameter integer DEPTH = 4) (
     always_comb begin
         reserve0_ready = 1'b0;
         reserve1_ready = 1'b0;
-        if (!flush && free_slots != 0) begin
-            if (free_slots >= 2) begin
+        if (!flush && reserve_visible_slots != 0) begin
+            if (reserve_visible_slots >= 2) begin
                 reserve0_ready = 1'b1;
                 reserve1_ready = 1'b1;
             end else if (!both_active) begin
@@ -376,33 +590,15 @@ module StoreQueue #(parameter integer DEPTH = 4) (
             end
         end
 
-        oldest_found = 1'b0;
-        oldest_sel = '0;
-        for (i = 0; i < DEPTH; i = i + 1) begin
-            if ((i < count) && entries[i].valid &&
-                (!oldest_found || uop_is_younger(entries[oldest_sel].uop_id, entries[i].uop_id))) begin
-                oldest_found = 1'b1;
-                oldest_sel = i[INDEX_W-1:0];
-            end
-        end
-
-        release_valid = !flush && oldest_found &&
-                        entries[oldest_sel].valid &&
-                        !entries[oldest_sel].unaligned &&
-                        committed[oldest_sel] &&
-                        entries[oldest_sel].addr_ready &&
-                        store_data_ready[oldest_sel];
-
         release_entry = '0;
-        if (release_valid) begin
-            release_entry.valid = 1'b1;
-            release_entry.uop_id = entries[oldest_sel].uop_id;
-            release_entry.pc = entries[oldest_sel].pc;
-            release_entry.address = entries[oldest_sel].address;
-            release_entry.store_wen = entries[oldest_sel].store_wen;
-            release_entry.store_data = compute_aligned_data(raw_store_data[oldest_sel], entries[oldest_sel].raw_mask, entries[oldest_sel].address[1:0]);
-            release_entry.store_data_ready = 1'b1;
-            release_entry.store_data_src_id = store_data_src_id[oldest_sel];
+        if (REGISTERED_RELEASE) begin
+            release_valid = !flush && release_pending_q;
+            if (release_valid)
+                release_entry = release_pending_entry_q;
+        end else begin
+            release_valid = release_candidate_valid;
+            if (release_valid)
+                release_entry = release_candidate_entry;
         end
 
         valid_vec = '0;
@@ -522,6 +718,7 @@ module StoreQueue #(parameter integer DEPTH = 4) (
     always_ff @(posedge clk or negedge rstn) begin
         if (!rstn) begin
             count <= '0;
+            reserve_credit_q <= (DEPTH >= 3) ? 2'd3 : ((DEPTH == 2) ? 2'd2 : 2'd1);
             for (q = 0; q < DEPTH; q = q + 1) begin
                 entries[q] <= '0;
                 store_data_ready[q] <= 1'b0;
@@ -584,6 +781,12 @@ module StoreQueue #(parameter integer DEPTH = 4) (
 `endif
             end
             count <= flush_dst;
+            // Credit is the number of free SQ slots after recovery, not the
+            // number of retained entries.  Using flush_dst here inverted the
+            // admission window: an empty post-flush SQ received zero credit
+            // while a nearly-full SQ could over-admit Stores.
+            reserve_credit_q <= ((DEPTH - flush_dst) >= 3) ?
+                                2'd3 : (DEPTH - flush_dst);
         end else begin
             // 1. Commit state for existing entries.  Payload/data/address are
             // updated atomically in the release/no-release branches below.
@@ -719,49 +922,42 @@ module StoreQueue #(parameter integer DEPTH = 4) (
                     r1_pc, r1_uop_id, r1_mask,
                     r1_has_addr, r1_addr
                 );
-                store_data_ready[release_do ? count-1 : count] <= 1'b0;
-                raw_store_data[release_do ? count-1 : count] <= 32'h0;
+                store_data_ready[release_do ? count-1 : count] <= r1_initial_data_ready;
+                raw_store_data[release_do ? count-1 : count] <= r1_initial_data_value;
                 store_data_src_id[release_do ? count-1 : count] <= r1_src1_id;
-                committed[release_do ? count-1 : count] <=
-                    (commit0.valid && uop_id_equal(r1_uop_id, commit0.uop_id)) ||
-                    (commit1.valid && uop_id_equal(r1_uop_id, commit1.uop_id));
+                committed[release_do ? count-1 : count] <= r1_commit_now;
                 entries[(release_do ? count-1 : count) + 1] <= make_reserved_sq_entry(
                     r0_pc, r0_uop_id, r0_mask,
                     r0_has_addr, r0_addr
                 );
-                store_data_ready[(release_do ? count-1 : count) + 1] <= 1'b0;
-                raw_store_data[(release_do ? count-1 : count) + 1] <= 32'h0;
+                store_data_ready[(release_do ? count-1 : count) + 1] <= r0_initial_data_ready;
+                raw_store_data[(release_do ? count-1 : count) + 1] <= r0_initial_data_value;
                 store_data_src_id[(release_do ? count-1 : count) + 1] <= r0_src1_id;
-                committed[(release_do ? count-1 : count) + 1] <=
-                    (commit0.valid && uop_id_equal(r0_uop_id, commit0.uop_id)) ||
-                    (commit1.valid && uop_id_equal(r0_uop_id, commit1.uop_id));
+                committed[(release_do ? count-1 : count) + 1] <= r0_commit_now;
             end else begin
                 if (r0_do) begin
                     entries[release_do ? count-1 : count] <= make_reserved_sq_entry(
                         r0_pc, r0_uop_id, r0_mask,
                         r0_has_addr, r0_addr
                     );
-                    store_data_ready[release_do ? count-1 : count] <= 1'b0;
-                    raw_store_data[release_do ? count-1 : count] <= 32'h0;
+                    store_data_ready[release_do ? count-1 : count] <= r0_initial_data_ready;
+                    raw_store_data[release_do ? count-1 : count] <= r0_initial_data_value;
                     store_data_src_id[release_do ? count-1 : count] <= r0_src1_id;
-                    committed[release_do ? count-1 : count] <=
-                        (commit0.valid && uop_id_equal(r0_uop_id, commit0.uop_id)) ||
-                        (commit1.valid && uop_id_equal(r0_uop_id, commit1.uop_id));
+                    committed[release_do ? count-1 : count] <= r0_commit_now;
                 end
                 if (r1_do) begin
                     entries[(release_do ? count-1 : count) + r0_do] <= make_reserved_sq_entry(
                         r1_pc, r1_uop_id, r1_mask,
                         r1_has_addr, r1_addr
                     );
-                    store_data_ready[(release_do ? count-1 : count) + r0_do] <= 1'b0;
-                    raw_store_data[(release_do ? count-1 : count) + r0_do] <= 32'h0;
+                    store_data_ready[(release_do ? count-1 : count) + r0_do] <= r1_initial_data_ready;
+                    raw_store_data[(release_do ? count-1 : count) + r0_do] <= r1_initial_data_value;
                     store_data_src_id[(release_do ? count-1 : count) + r0_do] <= r1_src1_id;
-                    committed[(release_do ? count-1 : count) + r0_do] <=
-                        (commit0.valid && uop_id_equal(r1_uop_id, commit0.uop_id)) ||
-                        (commit1.valid && uop_id_equal(r1_uop_id, commit1.uop_id));
+                    committed[(release_do ? count-1 : count) + r0_do] <= r1_commit_now;
                 end
             end
             count <= count - release_do + r0_do + r1_do;
+            reserve_credit_q <= reserve_credit_next;
         end
 
     end

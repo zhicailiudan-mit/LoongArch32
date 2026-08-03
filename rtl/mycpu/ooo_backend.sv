@@ -62,6 +62,7 @@ module OooBackend (
     output logic                         reserve1_src1_ready,
     output logic [31:0]                  reserve1_src1_value,
     output uop_id_t                      reserve1_src1_id,
+    input  logic [1:0]                   store_reserve_credit,
 
     output logic [`ROB_TAG_W:0]          perf_rob_occupancy,
     output logic [3:0]                   perf_issue_occupancy,
@@ -219,6 +220,7 @@ module OooBackend (
         .reserve1_src1_ready  (reserve1_src1_ready),
         .reserve1_src1_value  (reserve1_src1_value),
         .reserve1_src1_id     (reserve1_src1_id),
+        .store_reserve_credit (store_reserve_credit),
         .perf_true_source_wait(perf_true_source_wait),
         .perf_source_wait_dep_load(perf_source_wait_dep_load),
         .perf_source_wait_dep_muldiv(perf_source_wait_dep_muldiv),

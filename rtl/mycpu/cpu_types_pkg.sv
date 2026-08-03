@@ -220,6 +220,7 @@ package cpu_types_pkg;
         logic [31:0]             branch_target;
         logic [31:0]             writeback_value;
         logic                    select_ram;
+        prediction_meta_t        pred;
     } execute_result_t;
 
     // Existing external data-access request/response pins, grouped without
@@ -229,6 +230,7 @@ package cpu_types_pkg;
         logic [31:0] addr;
         logic [3:0]  wen;
         logic [31:0] wdata;
+        logic [2:0]  load_tid;
     } memory_request_t;
 
     typedef struct packed {
@@ -238,6 +240,7 @@ package cpu_types_pkg;
         logic        wready;
         logic        wposted;
         logic        wresp;
+        logic [2:0]  load_tid;
     } memory_response_t;
 
     typedef struct packed {

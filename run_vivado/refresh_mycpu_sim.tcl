@@ -18,6 +18,7 @@ set cpu_required_files [list \
     cpu_types_pkg.sv \
     my_cpu.sv \
     mycpu_top.v \
+    L2DCache.v \
     frontend.sv \
     ooo_backend.sv \
     load_store_unit.sv]
