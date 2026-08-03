@@ -3334,11 +3334,9 @@ module TaggedDCache #(
     reg [1:0] wcb_drain_idx;
     reg [7:0] wcb_drain_sent_mask;
     reg [3:0] wcb_drain_pending_count;
-    // Snapshot the draining entry's byte mask when ownership transfers to
-    // the write engine.  A same-line store is blocked while draining, so the
-    // snapshot is stable for the whole request and removes the live 32-bit
-    // WCB mask from the pending-count/word-scan timing path.
-    reg [31:0] wcb_drain_byte_valid_q;
+    // Per-word drain mask snapshot (replaces 32-bit byte mask)
+    reg [7:0] wcb_drain_word_valid_q;
+    reg [3:0] wcb_drain_word_wen_q [0:7];
     reg [5:0] wcb_idle_count;
 
     function automatic [255:0] wcb_merge_line;
@@ -3410,8 +3408,74 @@ module TaggedDCache #(
 
     reg [TAG_WID-1:0] cache_tag0 [0:CACHE_LINES-1];
     reg [TAG_WID-1:0] cache_tag1 [0:CACHE_LINES-1];
-    reg [255:0] cache_data0 [0:CACHE_LINES-1];
-    reg [255:0] cache_data1 [0:CACHE_LINES-1];
+    // Banked 32-bit word data arrays (8 banks per way)
+    reg [31:0] cache_data0_b0 [0:CACHE_LINES-1];
+    reg [31:0] cache_data0_b1 [0:CACHE_LINES-1];
+    reg [31:0] cache_data0_b2 [0:CACHE_LINES-1];
+    reg [31:0] cache_data0_b3 [0:CACHE_LINES-1];
+    reg [31:0] cache_data0_b4 [0:CACHE_LINES-1];
+    reg [31:0] cache_data0_b5 [0:CACHE_LINES-1];
+    reg [31:0] cache_data0_b6 [0:CACHE_LINES-1];
+    reg [31:0] cache_data0_b7 [0:CACHE_LINES-1];
+
+    reg [31:0] cache_data1_b0 [0:CACHE_LINES-1];
+    reg [31:0] cache_data1_b1 [0:CACHE_LINES-1];
+    reg [31:0] cache_data1_b2 [0:CACHE_LINES-1];
+    reg [31:0] cache_data1_b3 [0:CACHE_LINES-1];
+    reg [31:0] cache_data1_b4 [0:CACHE_LINES-1];
+    reg [31:0] cache_data1_b5 [0:CACHE_LINES-1];
+    reg [31:0] cache_data1_b6 [0:CACHE_LINES-1];
+    reg [31:0] cache_data1_b7 [0:CACHE_LINES-1];
+
+    function automatic [31:0] read_cache_word0;
+        input [4:0] idx;
+        input [2:0] w;
+        begin
+            case (w)
+                3'd0: read_cache_word0 = cache_data0_b0[idx];
+                3'd1: read_cache_word0 = cache_data0_b1[idx];
+                3'd2: read_cache_word0 = cache_data0_b2[idx];
+                3'd3: read_cache_word0 = cache_data0_b3[idx];
+                3'd4: read_cache_word0 = cache_data0_b4[idx];
+                3'd5: read_cache_word0 = cache_data0_b5[idx];
+                3'd6: read_cache_word0 = cache_data0_b6[idx];
+                3'd7: read_cache_word0 = cache_data0_b7[idx];
+            endcase
+        end
+    endfunction
+
+    function automatic [31:0] read_cache_word1;
+        input [4:0] idx;
+        input [2:0] w;
+        begin
+            case (w)
+                3'd0: read_cache_word1 = cache_data1_b0[idx];
+                3'd1: read_cache_word1 = cache_data1_b1[idx];
+                3'd2: read_cache_word1 = cache_data1_b2[idx];
+                3'd3: read_cache_word1 = cache_data1_b3[idx];
+                3'd4: read_cache_word1 = cache_data1_b4[idx];
+                3'd5: read_cache_word1 = cache_data1_b5[idx];
+                3'd6: read_cache_word1 = cache_data1_b6[idx];
+                3'd7: read_cache_word1 = cache_data1_b7[idx];
+            endcase
+        end
+    endfunction
+
+    // Refill commit pipeline register
+    reg        refill_commit_valid_q;
+    reg        refill_commit_way_q;
+    reg [4:0]  refill_commit_index_q;
+    reg [TAG_WID-1:0] refill_commit_tag_q;
+    reg [255:0] refill_commit_line_q;
+
+    // Store update pipeline register
+    reg        store_update_valid_q;
+    reg [4:0]  store_update_index_q;
+    reg        store_update_way_q;
+    reg [2:0]  store_update_word_q;
+    reg [3:0]  store_update_wen_q;
+    reg [31:0] store_update_data_q;
+
     reg cache_valid0 [0:CACHE_LINES-1];
     reg cache_valid1 [0:CACHE_LINES-1];
     reg replace_way [0:CACHE_LINES-1];
@@ -3561,9 +3625,27 @@ module TaggedDCache #(
                            (cache_tag0[req_head_index] == req_head_tag);
     wire        req_hit1 = cache_valid1[req_head_index] &&
                            (cache_tag1[req_head_index] == req_head_tag);
-    wire [31:0] req_hit_data = req_hit0 ?
-        forward_wcb_word(select_word(cache_data0[req_head_index], req_head_word), req_head_addr) :
-        forward_wcb_word(select_word(cache_data1[req_head_index], req_head_word), req_head_addr);
+    wire [31:0] req_hit_data_raw = req_hit0 ?
+        read_cache_word0(req_head_index, req_head_word) :
+        read_cache_word1(req_head_index, req_head_word);
+
+    wire req_refill_commit_hit = refill_commit_valid_q &&
+                                 (refill_commit_index_q == req_head_index) &&
+                                 (refill_commit_tag_q == req_head_tag) &&
+                                 (refill_commit_way_q == (req_hit1 ? 1'b1 : 1'b0));
+
+    wire req_store_update_hit = store_update_valid_q &&
+                                (store_update_index_q == req_head_index) &&
+                                (store_update_way_q == (req_hit1 ? 1'b1 : 1'b0)) &&
+                                (store_update_word_q == req_head_word);
+
+    wire [31:0] req_hit_data_base = req_refill_commit_hit ?
+        select_word(refill_commit_line_q, req_head_word) :
+        (req_store_update_hit ?
+            merge_bytes(req_hit_data_raw, store_update_wen_q, store_update_data_q) :
+            req_hit_data_raw);
+
+    wire [31:0] req_hit_data = forward_wcb_word(req_hit_data_base, req_head_addr);
     wire req_mshr_match0 = mshr_valid0 && (mshr_line0 == req_head_addr[31:5]);
     wire req_mshr_match1 = mshr_valid1 && (mshr_line1 == req_head_addr[31:5]);
     wire req_mshr_match = req_mshr_match0 || req_mshr_match1;
@@ -3740,37 +3822,32 @@ module TaggedDCache #(
                                    !ch1_overwrites_store_slot &&
                                    (cache_store_hit0 || cache_store_hit1);
 
-    wire [7:0] wcb_drain_valid_words =
-        {wcb_word_mask(wcb_drain_byte_valid_q, 3'd7) != 0,
-         wcb_word_mask(wcb_drain_byte_valid_q, 3'd6) != 0,
-         wcb_word_mask(wcb_drain_byte_valid_q, 3'd5) != 0,
-         wcb_word_mask(wcb_drain_byte_valid_q, 3'd4) != 0,
-         wcb_word_mask(wcb_drain_byte_valid_q, 3'd3) != 0,
-         wcb_word_mask(wcb_drain_byte_valid_q, 3'd2) != 0,
-         wcb_word_mask(wcb_drain_byte_valid_q, 3'd1) != 0,
-         wcb_word_mask(wcb_drain_byte_valid_q, 3'd0) != 0};
+    wire [7:0] wcb_drain_valid_words = wcb_drain_word_valid_q;
+    wire [7:0] remaining_words = wcb_drain_word_valid_q & ~wcb_drain_sent_mask;
     reg [2:0] wcb_drain_word_idx;
     reg [3:0] wcb_drain_word_wen;
     reg [31:0] wcb_drain_word_data;
     reg wcb_drain_word_found;
-    integer wcb_word_scan_i;
     always @(*) begin
         wcb_drain_word_idx = 3'd0;
         wcb_drain_word_wen = 4'h0;
         wcb_drain_word_data = 32'h0;
         wcb_drain_word_found = 1'b0;
-        if (wcb_drain_active)
-            for (wcb_word_scan_i = 0; wcb_word_scan_i < LINE_WORDS; wcb_word_scan_i = wcb_word_scan_i + 1)
-                if (!wcb_drain_word_found &&
-                    !wcb_drain_sent_mask[wcb_word_scan_i] &&
-                    wcb_drain_valid_words[wcb_word_scan_i]) begin
-                    wcb_drain_word_idx = wcb_word_scan_i[2:0];
-                    wcb_drain_word_wen = wcb_word_mask(
-                        wcb_drain_byte_valid_q, wcb_word_scan_i[2:0]);
-                    wcb_drain_word_data = select_word(
-                        wcb_data[wcb_drain_idx], wcb_word_scan_i[2:0]);
-                    wcb_drain_word_found = 1'b1;
-                end
+        if (wcb_drain_active) begin
+            if (remaining_words[0]) begin wcb_drain_word_idx = 3'd0; wcb_drain_word_found = 1'b1; end
+            else if (remaining_words[1]) begin wcb_drain_word_idx = 3'd1; wcb_drain_word_found = 1'b1; end
+            else if (remaining_words[2]) begin wcb_drain_word_idx = 3'd2; wcb_drain_word_found = 1'b1; end
+            else if (remaining_words[3]) begin wcb_drain_word_idx = 3'd3; wcb_drain_word_found = 1'b1; end
+            else if (remaining_words[4]) begin wcb_drain_word_idx = 3'd4; wcb_drain_word_found = 1'b1; end
+            else if (remaining_words[5]) begin wcb_drain_word_idx = 3'd5; wcb_drain_word_found = 1'b1; end
+            else if (remaining_words[6]) begin wcb_drain_word_idx = 3'd6; wcb_drain_word_found = 1'b1; end
+            else if (remaining_words[7]) begin wcb_drain_word_idx = 3'd7; wcb_drain_word_found = 1'b1; end
+
+            if (wcb_drain_word_found) begin
+                wcb_drain_word_wen = wcb_drain_word_wen_q[wcb_drain_word_idx];
+                wcb_drain_word_data = select_word(wcb_data[wcb_drain_idx], wcb_drain_word_idx);
+            end
+        end
     end
 
     wire wcb_drain_write_valid = wcb_drain_active && wcb_drain_word_found;
@@ -3862,7 +3939,9 @@ module TaggedDCache #(
             wcb_drain_idx <= 2'd0;
             wcb_drain_sent_mask <= 8'h0;
             wcb_drain_pending_count <= 4'd0;
-            wcb_drain_byte_valid_q <= 32'h0;
+            wcb_drain_word_valid_q <= 8'h0;
+            for (wcb_state_i = 0; wcb_state_i < 8; wcb_state_i = wcb_state_i + 1)
+                wcb_drain_word_wen_q[wcb_state_i] <= 4'h0;
             wcb_idle_count <= 6'd0;
             wcb_order_head <= 2'd0;
             wcb_order_tail <= 2'd0;
@@ -3918,8 +3997,12 @@ module TaggedDCache #(
                 if (wcb_drain_start) begin
                     wcb_drain_active <= 1'b1;
                     wcb_drain_idx <= wcb_order[wcb_order_head];
-                    wcb_drain_byte_valid_q <=
-                        wcb_byte_valid[wcb_order[wcb_order_head]];
+                    for (wcb_state_i = 0; wcb_state_i < 8; wcb_state_i = wcb_state_i + 1) begin
+                        wcb_drain_word_wen_q[wcb_state_i] <=
+                            wcb_byte_valid[wcb_order[wcb_order_head]][wcb_state_i*4 +: 4];
+                        wcb_drain_word_valid_q[wcb_state_i] <=
+                            |wcb_byte_valid[wcb_order[wcb_order_head]][wcb_state_i*4 +: 4];
+                    end
                     wcb_drain_sent_mask <= 8'h0;
                     wcb_drain_pending_count <= 4'd0;
                     wcb_draining[wcb_order[wcb_order_head]] <= 1'b1;
@@ -4191,54 +4274,126 @@ module TaggedDCache #(
         end
     end
 
-    // Cache-array commit/update.  A WCB overlay is included in a refill so a
-    // store posted while its line was being fetched cannot be lost.
     integer cache_i;
     always @(posedge cpu_clk or negedge cpu_rstn) begin
         if (!cpu_rstn) begin
+            refill_commit_valid_q <= 1'b0;
+            refill_commit_way_q   <= 1'b0;
+            refill_commit_index_q <= 5'd0;
+            refill_commit_tag_q   <= {TAG_WID{1'b0}};
+            refill_commit_line_q  <= 256'd0;
+            store_update_valid_q  <= 1'b0;
+            store_update_index_q  <= 5'd0;
+            store_update_way_q    <= 1'b0;
+            store_update_word_q   <= 3'd0;
+            store_update_wen_q    <= 4'h0;
+            store_update_data_q   <= 32'd0;
             for (cache_i = 0; cache_i < CACHE_LINES; cache_i = cache_i + 1) begin
                 cache_tag0[cache_i] <= 0;
                 cache_tag1[cache_i] <= 0;
-                cache_data0[cache_i] <= 0;
-                cache_data1[cache_i] <= 0;
                 cache_valid0[cache_i] <= 1'b0;
                 cache_valid1[cache_i] <= 1'b0;
                 replace_way[cache_i] <= 1'b0;
+                cache_data0_b0[cache_i] <= 32'd0;
+                cache_data0_b1[cache_i] <= 32'd0;
+                cache_data0_b2[cache_i] <= 32'd0;
+                cache_data0_b3[cache_i] <= 32'd0;
+                cache_data0_b4[cache_i] <= 32'd0;
+                cache_data0_b5[cache_i] <= 32'd0;
+                cache_data0_b6[cache_i] <= 32'd0;
+                cache_data0_b7[cache_i] <= 32'd0;
+                cache_data1_b0[cache_i] <= 32'd0;
+                cache_data1_b1[cache_i] <= 32'd0;
+                cache_data1_b2[cache_i] <= 32'd0;
+                cache_data1_b3[cache_i] <= 32'd0;
+                cache_data1_b4[cache_i] <= 32'd0;
+                cache_data1_b5[cache_i] <= 32'd0;
+                cache_data1_b6[cache_i] <= 32'd0;
+                cache_data1_b7[cache_i] <= 32'd0;
             end
         end else begin
+            // Stage 1: Capture Refill Line Commit Register
             if (ch0_last) begin
-                if (ch0_way == 1'b0) begin
-                    cache_tag0[ch0_index] <= ch0_line[26:5];
-                    cache_data0[ch0_index] <= ch0_line_after_beat;
-                    cache_valid0[ch0_index] <= 1'b1;
-                    replace_way[ch0_index] <= 1'b1;
+                refill_commit_valid_q <= 1'b1;
+                refill_commit_way_q   <= ch0_way;
+                refill_commit_index_q <= ch0_index;
+                refill_commit_tag_q   <= ch0_line[26:5];
+                refill_commit_line_q  <= ch0_line_after_beat;
+            end else if (ch1_last) begin
+                refill_commit_valid_q <= 1'b1;
+                refill_commit_way_q   <= ch1_way;
+                refill_commit_index_q <= ch1_index;
+                refill_commit_tag_q   <= ch1_line[26:5];
+                refill_commit_line_q  <= ch1_line_after_beat;
+            end else begin
+                refill_commit_valid_q <= 1'b0;
+            end
+
+            // Stage 2: Write Refill Line to Cache Data Array Banks
+            if (refill_commit_valid_q) begin
+                if (!refill_commit_way_q) begin
+                    cache_tag0[refill_commit_index_q] <= refill_commit_tag_q;
+                    cache_valid0[refill_commit_index_q] <= 1'b1;
+                    replace_way[refill_commit_index_q] <= 1'b1;
+                    cache_data0_b0[refill_commit_index_q] <= refill_commit_line_q[0*32 +: 32];
+                    cache_data0_b1[refill_commit_index_q] <= refill_commit_line_q[1*32 +: 32];
+                    cache_data0_b2[refill_commit_index_q] <= refill_commit_line_q[2*32 +: 32];
+                    cache_data0_b3[refill_commit_index_q] <= refill_commit_line_q[3*32 +: 32];
+                    cache_data0_b4[refill_commit_index_q] <= refill_commit_line_q[4*32 +: 32];
+                    cache_data0_b5[refill_commit_index_q] <= refill_commit_line_q[5*32 +: 32];
+                    cache_data0_b6[refill_commit_index_q] <= refill_commit_line_q[6*32 +: 32];
+                    cache_data0_b7[refill_commit_index_q] <= refill_commit_line_q[7*32 +: 32];
                 end else begin
-                    cache_tag1[ch0_index] <= ch0_line[26:5];
-                    cache_data1[ch0_index] <= ch0_line_after_beat;
-                    cache_valid1[ch0_index] <= 1'b1;
-                    replace_way[ch0_index] <= 1'b0;
+                    cache_tag1[refill_commit_index_q] <= refill_commit_tag_q;
+                    cache_valid1[refill_commit_index_q] <= 1'b1;
+                    replace_way[refill_commit_index_q] <= 1'b0;
+                    cache_data1_b0[refill_commit_index_q] <= refill_commit_line_q[0*32 +: 32];
+                    cache_data1_b1[refill_commit_index_q] <= refill_commit_line_q[1*32 +: 32];
+                    cache_data1_b2[refill_commit_index_q] <= refill_commit_line_q[2*32 +: 32];
+                    cache_data1_b3[refill_commit_index_q] <= refill_commit_line_q[3*32 +: 32];
+                    cache_data1_b4[refill_commit_index_q] <= refill_commit_line_q[4*32 +: 32];
+                    cache_data1_b5[refill_commit_index_q] <= refill_commit_line_q[5*32 +: 32];
+                    cache_data1_b6[refill_commit_index_q] <= refill_commit_line_q[6*32 +: 32];
+                    cache_data1_b7[refill_commit_index_q] <= refill_commit_line_q[7*32 +: 32];
                 end
             end
-            if (ch1_last) begin
-                if (ch1_way == 1'b0) begin
-                    cache_tag0[ch1_index] <= ch1_line[26:5];
-                    cache_data0[ch1_index] <= ch1_line_after_beat;
-                    cache_valid0[ch1_index] <= 1'b1;
-                    replace_way[ch1_index] <= 1'b1;
-                end else begin
-                    cache_tag1[ch1_index] <= ch1_line[26:5];
-                    cache_data1[ch1_index] <= ch1_line_after_beat;
-                    cache_valid1[ch1_index] <= 1'b1;
-                    replace_way[ch1_index] <= 1'b0;
-                end
-            end
+
+            // Stage 1: Capture Store Cache Update Register
             if (store_cache_update_fire) begin
-                if (cache_store_hit0)
-                    cache_data0[input_index] <= merge_line_store(
-                        cache_data0[input_index], data_addr[4:0], data_wen, data_wdata);
-                else
-                    cache_data1[input_index] <= merge_line_store(
-                        cache_data1[input_index], data_addr[4:0], data_wen, data_wdata);
+                store_update_valid_q <= 1'b1;
+                store_update_index_q <= input_index;
+                store_update_way_q   <= cache_store_hit1;
+                store_update_word_q  <= data_addr[4:2];
+                store_update_wen_q   <= data_wen;
+                store_update_data_q  <= data_wdata;
+            end else begin
+                store_update_valid_q <= 1'b0;
+            end
+
+            // Stage 2: Commit Store Word Update to Cache Data Array Banks
+            if (store_update_valid_q) begin
+                if (!store_update_way_q) begin
+                    case (store_update_word_q)
+                        3'd0: cache_data0_b0[store_update_index_q] <= merge_bytes(cache_data0_b0[store_update_index_q], store_update_wen_q, store_update_data_q);
+                        3'd1: cache_data0_b1[store_update_index_q] <= merge_bytes(cache_data0_b1[store_update_index_q], store_update_wen_q, store_update_data_q);
+                        3'd2: cache_data0_b2[store_update_index_q] <= merge_bytes(cache_data0_b2[store_update_index_q], store_update_wen_q, store_update_data_q);
+                        3'd3: cache_data0_b3[store_update_index_q] <= merge_bytes(cache_data0_b3[store_update_index_q], store_update_wen_q, store_update_data_q);
+                        3'd4: cache_data0_b4[store_update_index_q] <= merge_bytes(cache_data0_b4[store_update_index_q], store_update_wen_q, store_update_data_q);
+                        3'd5: cache_data0_b5[store_update_index_q] <= merge_bytes(cache_data0_b5[store_update_index_q], store_update_wen_q, store_update_data_q);
+                        3'd6: cache_data0_b6[store_update_index_q] <= merge_bytes(cache_data0_b6[store_update_index_q], store_update_wen_q, store_update_data_q);
+                        3'd7: cache_data0_b7[store_update_index_q] <= merge_bytes(cache_data0_b7[store_update_index_q], store_update_wen_q, store_update_data_q);
+                    endcase
+                end else begin
+                    case (store_update_word_q)
+                        3'd0: cache_data1_b0[store_update_index_q] <= merge_bytes(cache_data1_b0[store_update_index_q], store_update_wen_q, store_update_data_q);
+                        3'd1: cache_data1_b1[store_update_index_q] <= merge_bytes(cache_data1_b1[store_update_index_q], store_update_wen_q, store_update_data_q);
+                        3'd2: cache_data1_b2[store_update_index_q] <= merge_bytes(cache_data1_b2[store_update_index_q], store_update_wen_q, store_update_data_q);
+                        3'd3: cache_data1_b3[store_update_index_q] <= merge_bytes(cache_data1_b3[store_update_index_q], store_update_wen_q, store_update_data_q);
+                        3'd4: cache_data1_b4[store_update_index_q] <= merge_bytes(cache_data1_b4[store_update_index_q], store_update_wen_q, store_update_data_q);
+                        3'd5: cache_data1_b5[store_update_index_q] <= merge_bytes(cache_data1_b5[store_update_index_q], store_update_wen_q, store_update_data_q);
+                        3'd6: cache_data1_b6[store_update_index_q] <= merge_bytes(cache_data1_b6[store_update_index_q], store_update_wen_q, store_update_data_q);
+                    endcase
+                end
             end
             if (req_hit_fire)
                 replace_way[req_head_index] <= req_hit0 ? 1'b1 : 1'b0;

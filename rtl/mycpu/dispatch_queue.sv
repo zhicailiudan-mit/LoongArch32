@@ -85,6 +85,8 @@ module DispatchQueue #(
     reg [2:0] ram_ext_op [0:DQ_DEPTH-1];
     reg is_br_jmp [0:DQ_DEPTH-1];
     reg is_ld_st [0:DQ_DEPTH-1];
+    reg is_load [0:DQ_DEPTH-1];
+    reg is_store [0:DQ_DEPTH-1];
     reg is_call [0:DQ_DEPTH-1];
     reg is_ret [0:DQ_DEPTH-1];
     reg [2:0] system_op [0:DQ_DEPTH-1];
@@ -658,11 +660,9 @@ module DispatchQueue #(
             ) begin
                 if (
                     valid[store_old] &&
-                    is_ld_st[store_old] &&
-                    (ram_we[store_old] != `RAM_WE_N) &&
+                    is_store[store_old] &&
                     valid[store_q] &&
-                    is_ld_st[store_q] &&
-                    (ram_we[store_q] == `RAM_WE_N) &&
+                    is_load[store_q] &&
                     seq_is_older(
                         alloc_seq[store_old],
                         alloc_seq[store_q]
@@ -850,16 +850,10 @@ module DispatchQueue #(
                 src0_select_ready[q] &&
                 (
                     src1_select_ready[q] ||
-                    (
-                        is_ld_st[q] &&
-                        (ram_we[q] != `RAM_WE_N)
-                    )
+                    is_store[q]
                 ) &&
                 (
-                    !(
-                        is_ld_st[q] &&
-                        (ram_we[q] == `RAM_WE_N)
-                    ) ||
+                    !is_load[q] ||
                     !store_pending_for_select[q]
                 ) &&
                 (
@@ -884,12 +878,10 @@ module DispatchQueue #(
                 (system_op[q] != 3'd0);
 
             assign slot_fast_eligible[q] =
+                is_load[q] ||
                 (
-                    is_ld_st[q] &&
-                    (
-                        (ram_we[q] == `RAM_WE_N) ||
-                        src1_select_ready[q]
-                    )
+                    is_store[q] &&
+                    src1_select_ready[q]
                 ) ||
                 (
                     !slot_restricted[q] &&
@@ -907,8 +899,7 @@ module DispatchQueue #(
 
             assign live_store_mask[q] =
                 valid[q] &&
-                is_ld_st[q] &&
-                (ram_we[q] != `RAM_WE_N);
+                is_store[q];
 
             assign serializing_mask[q] =
                 valid[q] &&
@@ -1158,14 +1149,12 @@ module DispatchQueue #(
     wire main_hold_is_store =
         main_hold_valid &&
         valid[main_hold_sel] &&
-        is_ld_st[main_hold_sel] &&
-        (ram_we[main_hold_sel] != `RAM_WE_N);
+        is_store[main_hold_sel];
 
     wire fast_hold_is_store =
         fast_hold_valid &&
         valid[fast_hold_sel] &&
-        is_ld_st[fast_hold_sel] &&
-        (ram_we[fast_hold_sel] != `RAM_WE_N);
+        is_store[fast_hold_sel];
 
     wire store_lane1_is_older =
         main_hold_is_store &&
@@ -1186,14 +1175,12 @@ module DispatchQueue #(
     wire main_new_store_candidate =
         !main_hold_valid &&
         main_pick[3] &&
-        is_ld_st[main_pick[2:0]] &&
-        (ram_we[main_pick[2:0]] != `RAM_WE_N);
+        is_store[main_pick[2:0]];
 
     wire fast_new_store_candidate =
         !fast_hold_valid &&
         fast_issue_found &&
-        is_ld_st[fast_pick[2:0]] &&
-        (ram_we[fast_pick[2:0]] != `RAM_WE_N);
+        is_store[fast_pick[2:0]];
 
     wire new_store_lane1_is_older =
         main_new_store_candidate &&
@@ -1320,13 +1307,11 @@ module DispatchQueue #(
 
     wire main_refill_selected_store =
         main_refill_pick[3] &&
-        is_ld_st[main_refill_pick[2:0]] &&
-        (ram_we[main_refill_pick[2:0]] != `RAM_WE_N);
+        is_store[main_refill_pick[2:0]];
 
     wire fast_refill_selected_store =
         fast_refill_pick[3] &&
-        is_ld_st[fast_refill_pick[2:0]] &&
-        (ram_we[fast_refill_pick[2:0]] != `RAM_WE_N);
+        is_store[fast_refill_pick[2:0]];
 
     assign main_refill_valid =
         main_payload_capture &&
@@ -1583,13 +1568,11 @@ module DispatchQueue #(
 
             store_order_next_is_load[store_next_q] =
                 valid[store_next_q] &&
-                is_ld_st[store_next_q] &&
-                (ram_we[store_next_q] == `RAM_WE_N);
+                is_load[store_next_q];
 
             store_order_next_is_store[store_next_q] =
                 valid[store_next_q] &&
-                is_ld_st[store_next_q] &&
-                (ram_we[store_next_q] != `RAM_WE_N);
+                is_store[store_next_q];
         end
 
         if (flush || system_flush) begin
@@ -1623,18 +1606,10 @@ module DispatchQueue #(
                             1'b1;
 
                         store_order_next_is_load[store_next_q] =
-                            is_ld_st[store_next_q] &&
-                            (
-                                ram_we[store_next_q] ==
-                                `RAM_WE_N
-                            );
+                            is_load[store_next_q];
 
                         store_order_next_is_store[store_next_q] =
-                            is_ld_st[store_next_q] &&
-                            (
-                                ram_we[store_next_q] !=
-                                `RAM_WE_N
-                            );
+                            is_store[store_next_q];
                     end
                 end
             end
@@ -1903,11 +1878,7 @@ module DispatchQueue #(
                         : PROD_UNKNOWN;
 
                 is_store_oldest =
-                    is_ld_st[perf_oldest_idx] &&
-                    (
-                        ram_we[perf_oldest_idx] !=
-                        `RAM_WE_N
-                    );
+                    is_store[perf_oldest_idx];
 
                 perf_true_source_wait =
                     is_store_oldest
@@ -1982,11 +1953,7 @@ module DispatchQueue #(
             perf_lsu_order =
                 src0_ready_eff[perf_oldest_idx] &&
                 src1_ready_eff[perf_oldest_idx] &&
-                is_ld_st[perf_oldest_idx] &&
-                (
-                    ram_we[perf_oldest_idx] ==
-                    `RAM_WE_N
-                ) &&
+                is_load[perf_oldest_idx] &&
                 older_store_pending[perf_oldest_idx];
 
             perf_serializing =
@@ -2807,6 +2774,8 @@ module DispatchQueue #(
                 ram_ext_op[i] <= 3'h0;
                 is_br_jmp[i] <= 1'b0;
                 is_ld_st[i] <= 1'b0;
+                is_load[i] <= 1'b0;
+                is_store[i] <= 1'b0;
                 is_call[i] <= 1'b0;
                 is_ret[i] <= 1'b0;
                 system_op[i] <= 3'h0;
@@ -3116,6 +3085,8 @@ module DispatchQueue #(
                 ram_ext_op[enq_sel] <= enq_ram_ext_op;
                 is_br_jmp[enq_sel] <= enq_is_br_jmp;
                 is_ld_st[enq_sel] <= enq_is_ld_st;
+                is_load[enq_sel] <= enq_is_ld_st && (enq_ram_we == `RAM_WE_N);
+                is_store[enq_sel] <= enq_is_ld_st && (enq_ram_we != `RAM_WE_N);
                 is_call[enq_sel] <= enq_is_call;
                 is_ret[enq_sel] <= enq_is_ret;
                 system_op[enq_sel] <= enq_system_op;
@@ -3219,6 +3190,8 @@ module DispatchQueue #(
                 ram_ext_op[enq1_sel] <= enq1_ram_ext_op;
                 is_br_jmp[enq1_sel] <= enq1_is_br_jmp;
                 is_ld_st[enq1_sel] <= enq1_is_ld_st;
+                is_load[enq1_sel] <= enq1_is_ld_st && (enq1_ram_we == `RAM_WE_N);
+                is_store[enq1_sel] <= enq1_is_ld_st && (enq1_ram_we != `RAM_WE_N);
                 is_call[enq1_sel] <= enq1_is_call;
                 is_ret[enq1_sel] <= enq1_is_ret;
                 system_op[enq1_sel] <= enq1_system_op;
