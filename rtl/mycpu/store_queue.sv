@@ -122,41 +122,10 @@ module StoreQueue #(
 
     logic [COUNT_W-1:0] count;
 
-    /*
-     * Age-ordered sparse-slot link.
-     *
-     * release_owner_sel_q is the head, namely the oldest Store.
-     * release_tail_sel_q is the youngest Store.
-     * release_next_* links each occupied physical slot to the next younger slot.
-     */
     logic release_owner_valid_q;
     logic [INDEX_W-1:0] release_owner_sel_q;
-    logic [INDEX_W-1:0] release_tail_sel_q;
-
-    logic [DEPTH-1:0] release_next_valid_q;
-    logic [INDEX_W-1:0] release_next_sel_q [0:DEPTH-1];
-
-    logic release_owner_valid_d;
-    logic [INDEX_W-1:0] release_owner_sel_d;
-    logic [INDEX_W-1:0] release_tail_sel_d;
-
-    logic [DEPTH-1:0] release_next_valid_d;
-    logic [INDEX_W-1:0] release_next_sel_d [0:DEPTH-1];
-
-    /*
-     * Accepted reservations reordered by architectural age before insertion.
-     */
-    logic append0_valid;
-    logic append1_valid;
-    logic [INDEX_W-1:0] append0_sel;
-    logic [INDEX_W-1:0] append1_sel;
-    uop_id_t append0_uop_id;
-    uop_id_t append1_uop_id;
-
-    /*
-     * Slots that survive a recovery/system flush.
-     */
-    logic [DEPTH-1:0] flush_keep_mask;
+    logic release_owner_next_valid;
+    logic [INDEX_W-1:0] release_owner_next_sel;
 `ifndef SYNTHESIS
     logic release_stall_q;
     logic release_owner_valid_prev_q;
@@ -725,6 +694,23 @@ module StoreQueue #(
         release_candidate_valid &&
         release_fire;
 
+    wire release_owner_hold =
+        !flush &&
+        release_candidate_valid &&
+        !release_fire;
+
+    wire release_owner_reselect =
+        !release_owner_hold &&
+        (
+            release_do ||
+            r0_do ||
+            r1_do ||
+            (
+                !release_owner_valid_q &&
+                (count != 0)
+            )
+        );
+
     wire [COUNT_W:0] free_slots =
         (DEPTH - count) +
         {{COUNT_W{1'b0}}, release_do};
@@ -776,54 +762,6 @@ module StoreQueue #(
                         alloc_scan[INDEX_W-1:0];
                 end
             end
-        end
-    end
-
-    wire [INDEX_W-1:0] r0_alloc_slot =
-        alloc0_sel;
-
-    wire [INDEX_W-1:0] r1_alloc_slot =
-        r0_do ?
-            alloc1_sel :
-            alloc0_sel;
-
-    /*
-     * Convert the two accepted reservation channels into an age-ordered
-     * append sequence.
-     *
-     * append0 is always older than append1.
-     */
-    always_comb begin : build_append_order
-        append0_valid = 1'b0;
-        append1_valid = 1'b0;
-        append0_sel = '0;
-        append1_sel = '0;
-        append0_uop_id = '0;
-        append1_uop_id = '0;
-
-        if (r0_do && r1_do) begin
-            append0_valid = 1'b1;
-            append1_valid = 1'b1;
-
-            if (r1_older) begin
-                append0_sel = r1_alloc_slot;
-                append0_uop_id = r1_uop_id;
-                append1_sel = r0_alloc_slot;
-                append1_uop_id = r0_uop_id;
-            end else begin
-                append0_sel = r0_alloc_slot;
-                append0_uop_id = r0_uop_id;
-                append1_sel = r1_alloc_slot;
-                append1_uop_id = r1_uop_id;
-            end
-        end else if (r0_do) begin
-            append0_valid = 1'b1;
-            append0_sel = r0_alloc_slot;
-            append0_uop_id = r0_uop_id;
-        end else if (r1_do) begin
-            append0_valid = 1'b1;
-            append0_sel = r1_alloc_slot;
-            append0_uop_id = r1_uop_id;
         end
     end
 
@@ -1036,443 +974,141 @@ module StoreQueue #(
         end
     end
 
-    always_comb begin : build_flush_keep_mask
-        integer keep_i;
+    always_comb begin : release_owner_next_logic
+        logic [DEPTH-1:0] next_slot_valid;
+        uop_id_t          next_slot_uop_id [0:DEPTH-1];
 
-        flush_keep_mask = '0;
+        logic [DEPTH-1:0] has_older;
+        logic [DEPTH-1:0] oldest_onehot;
 
-        for (
-            keep_i = 0;
-            keep_i < DEPTH;
-            keep_i = keep_i + 1
-        ) begin
-            flush_keep_mask[keep_i] =
-                entries[keep_i].valid &&
-                (
-                    committed[keep_i] ||
-                    (
-                        commit0.valid &&
-                        uop_id_equal(
-                            entries[keep_i].uop_id,
-                            commit0.uop_id
-                        )
-                    ) ||
-                    (
-                        commit1.valid &&
-                        uop_id_equal(
-                            entries[keep_i].uop_id,
-                            commit1.uop_id
-                        )
-                    ) ||
-                    (
-                        !system_flush &&
-                        recover_valid &&
-                        !uop_is_younger(
-                            entries[keep_i].uop_id,
-                            recover_id
-                        )
-                    )
-                );
-        end
-    end
+        logic [INDEX_W-1:0] r1_alloc_sel;
+        logic select_found;
 
-    /*
-     * Maintain an age-ordered linked list over the fixed physical SQ slots.
-     *
-     * Normal-cycle critical paths:
-     *
-     * release:
-     *   head -> next[head] -> new head
-     *
-     * reserve:
-     *   tail -> next[tail]
-     *
-     * No existing-entry uop_id comparison is performed.
-     */
-    always_comb begin : release_link_next_logic
-        logic base_valid;
-        logic [INDEX_W-1:0] base_head;
-        logic [INDEX_W-1:0] base_tail;
-
-        logic flush_tail_found;
-
-        integer link_i;
-
-        release_owner_valid_d = release_owner_valid_q;
-        release_owner_sel_d = release_owner_sel_q;
-        release_tail_sel_d = release_tail_sel_q;
-
-        release_next_valid_d = release_next_valid_q;
+        integer owner_i;
+        integer owner_j;
 
         for (
-            link_i = 0;
-            link_i < DEPTH;
-            link_i = link_i + 1
+            owner_i = 0;
+            owner_i < DEPTH;
+            owner_i = owner_i + 1
         ) begin
-            release_next_sel_d[link_i] =
-                release_next_sel_q[link_i];
+            next_slot_valid[owner_i] =
+                entries[owner_i].valid;
+
+            next_slot_uop_id[owner_i] =
+                entries[owner_i].uop_id;
         end
 
-        /*
-         * Recovery keeps an age-prefix of the current Store list:
-         * committed Stores and Stores not younger than recover_id.
-         *
-         * The head remains unchanged.  Only the first surviving node whose
-         * successor is killed becomes the new tail.
-         */
-        if (flush) begin
-            release_owner_valid_d =
-                release_owner_valid_q &&
-                flush_keep_mask[release_owner_sel_q];
+        if (
+            release_do &&
+            release_owner_valid_q
+        ) begin
+            next_slot_valid[
+                release_owner_sel_q
+            ] = 1'b0;
 
-            if (release_owner_valid_d)
-                release_owner_sel_d =
-                    release_owner_sel_q;
-            else
-                release_owner_sel_d = '0;
+            next_slot_uop_id[
+                release_owner_sel_q
+            ] = '0;
+        end
 
-            release_tail_sel_d = '0;
-            flush_tail_found = 1'b0;
+        if (r0_do) begin
+            next_slot_valid[
+                alloc0_sel
+            ] = 1'b1;
 
+            next_slot_uop_id[
+                alloc0_sel
+            ] = r0_uop_id;
+        end
+
+        r1_alloc_sel =
+            r0_do ?
+                alloc1_sel :
+                alloc0_sel;
+
+        if (r1_do) begin
+            next_slot_valid[
+                r1_alloc_sel
+            ] = 1'b1;
+
+            next_slot_uop_id[
+                r1_alloc_sel
+            ] = r1_uop_id;
+        end
+
+        has_older = '0;
+
+        for (
+            owner_i = 0;
+            owner_i < DEPTH;
+            owner_i = owner_i + 1
+        ) begin
             for (
-                link_i = 0;
-                link_i < DEPTH;
-                link_i = link_i + 1
+                owner_j = 0;
+                owner_j < DEPTH;
+                owner_j = owner_j + 1
             ) begin
-                if (!flush_keep_mask[link_i]) begin
-                    release_next_valid_d[link_i] = 1'b0;
-                    release_next_sel_d[link_i] = '0;
-                end else begin
-                    /*
-                     * If this slot's successor is killed, this slot becomes
-                     * the youngest surviving Store.
-                     */
-                    if (
-                        !release_next_valid_q[link_i] ||
-                        !flush_keep_mask[
-                            release_next_sel_q[link_i]
-                        ]
-                    ) begin
-                        release_next_valid_d[link_i] = 1'b0;
-                        release_next_sel_d[link_i] = '0;
-
-                        if (!flush_tail_found) begin
-                            release_tail_sel_d =
-                                link_i[INDEX_W-1:0];
-
-                            flush_tail_found = 1'b1;
-                        end
-                    end
-                end
-            end
-
-            if (!release_owner_valid_d) begin
-                release_next_valid_d = '0;
-                release_tail_sel_d = '0;
-
-                for (
-                    link_i = 0;
-                    link_i < DEPTH;
-                    link_i = link_i + 1
-                ) begin
-                    release_next_sel_d[link_i] = '0;
-                end
-            end
-        end else begin
-            /*
-             * Construct the queue remaining after the current head release.
-             */
-            logic work_valid;
-            logic [INDEX_W-1:0] work_head;
-            logic [INDEX_W-1:0] work_tail;
-            logic [DEPTH-1:0] work_next_valid;
-            logic [INDEX_W-1:0] work_next_sel [0:DEPTH-1];
-            logic insert_done;
-            logic [INDEX_W-1:0] insert_scan;
-            logic [INDEX_W-1:0] insert_prev;
-            integer insert_i;
-
-            base_valid = release_owner_valid_q;
-            base_head = release_owner_sel_q;
-            base_tail = release_tail_sel_q;
-
-            if (
-                release_do &&
-                release_owner_valid_q
-            ) begin
-                /*
-                 * The released physical slot may be allocated again in the
-                 * same cycle, so first detach its old link.
-                 */
-                release_next_valid_d[
-                    release_owner_sel_q
-                ] = 1'b0;
-
-                release_next_sel_d[
-                    release_owner_sel_q
-                ] = '0;
-
                 if (
-                    release_next_valid_q[
-                        release_owner_sel_q
-                    ]
-                ) begin
-                    base_valid = 1'b1;
-
-                    base_head =
-                        release_next_sel_q[
-                            release_owner_sel_q
-                        ];
-                end else begin
-                    base_valid = 1'b0;
-                    base_head = '0;
-                    base_tail = '0;
-                end
-            end
-
-            /*
-             * Work chain starts as the queue remaining after the optional
-             * release.  Newly allocated slots must not retain stale links
-             * from an older occupant of the same physical slot.
-             */
-            work_valid = base_valid;
-            work_head = base_head;
-            work_tail = base_tail;
-            work_next_valid = release_next_valid_d;
-
-            for (
-                link_i = 0;
-                link_i < DEPTH;
-                link_i = link_i + 1
-            ) begin
-                work_next_sel[link_i] =
-                    release_next_sel_d[link_i];
-            end
-
-            /*
-             * Reservations are accepted in issue order, which is not the
-             * architectural age order, so each new Store is inserted at its
-             * age-ordered position: in front of the first node younger than
-             * it, behind the tail when no younger node exists, or as the new
-             * head when the current head is younger.
-             */
-            if (append0_valid) begin
-                work_next_valid[append0_sel] = 1'b0;
-                work_next_sel[append0_sel] = '0;
-
-                insert_done = 1'b0;
-
-                if (!work_valid) begin
-                    work_valid = 1'b1;
-                    work_head = append0_sel;
-                    work_tail = append0_sel;
-                    insert_done = 1'b1;
-                end else if (
+                    (owner_i != owner_j) &&
+                    next_slot_valid[owner_i] &&
+                    next_slot_valid[owner_j] &&
                     uop_is_younger(
-                        entries[work_head].uop_id,
-                        append0_uop_id
+                        next_slot_uop_id[owner_i],
+                        next_slot_uop_id[owner_j]
                     )
                 ) begin
-                    work_next_valid[append0_sel] =
+                    has_older[owner_i] = 1'b1;
+                end
+            end
+        end
+
+        for (
+            owner_i = 0;
+            owner_i < DEPTH;
+            owner_i = owner_i + 1
+        ) begin
+            oldest_onehot[owner_i] =
+                next_slot_valid[owner_i] &&
+                !has_older[owner_i];
+        end
+
+        release_owner_next_valid = 1'b0;
+        release_owner_next_sel = '0;
+        select_found = 1'b0;
+
+        if (!flush) begin
+            for (
+                owner_i = 0;
+                owner_i < DEPTH;
+                owner_i = owner_i + 1
+            ) begin
+                if (
+                    oldest_onehot[owner_i] &&
+                    !select_found
+                ) begin
+                    release_owner_next_valid =
                         1'b1;
 
-                    work_next_sel[append0_sel] =
-                        work_head;
+                    release_owner_next_sel =
+                        owner_i[INDEX_W-1:0];
 
-                    work_head = append0_sel;
-                    insert_done = 1'b1;
-                end else begin
-                    insert_scan = work_head;
-                    insert_prev = work_head;
-
-                    for (
-                        insert_i = 0;
-                        insert_i < DEPTH &&
-                            !insert_done;
-                        insert_i = insert_i + 1
-                    ) begin
-                        if (
-                            uop_is_younger(
-                                entries[insert_scan]
-                                    .uop_id,
-                                append0_uop_id
-                            )
-                        ) begin
-                            work_next_valid[
-                                append0_sel
-                            ] = 1'b1;
-
-                            work_next_sel[
-                                append0_sel
-                            ] = insert_scan;
-
-                            work_next_valid[
-                                insert_prev
-                            ] = 1'b1;
-
-                            work_next_sel[
-                                insert_prev
-                            ] = append0_sel;
-
-                            insert_done = 1'b1;
-                        end else if (
-                            !work_next_valid[
-                                insert_scan
-                            ]
-                        ) begin
-                            /*
-                             * No younger node: insert behind the tail.
-                             */
-                            work_next_valid[
-                                insert_scan
-                            ] = 1'b1;
-
-                            work_next_sel[
-                                insert_scan
-                            ] = append0_sel;
-
-                            work_tail = append0_sel;
-                            insert_done = 1'b1;
-                        end else begin
-                            insert_prev =
-                                insert_scan;
-
-                            insert_scan =
-                                work_next_sel[
-                                    insert_scan
-                                ];
-                        end
-                    end
+                    select_found = 1'b1;
                 end
-            end
-
-            /*
-             * Insert append1 at its age-ordered position.  append1 is never
-             * older than append0, so it cannot replace the head chosen for
-             * append0, but it may still land in the middle of the queue.
-             */
-            if (append1_valid) begin
-                work_next_valid[append1_sel] = 1'b0;
-                work_next_sel[append1_sel] = '0;
-
-                insert_done = 1'b0;
-                insert_scan = work_head;
-                insert_prev = work_head;
-
-                for (
-                    insert_i = 0;
-                    insert_i < DEPTH &&
-                        !insert_done;
-                    insert_i = insert_i + 1
-                ) begin
-                    if (
-                        uop_is_younger(
-                            entries[insert_scan]
-                                .uop_id,
-                            append1_uop_id
-                        )
-                    ) begin
-                        work_next_valid[
-                            append1_sel
-                        ] = 1'b1;
-
-                        work_next_sel[
-                            append1_sel
-                        ] = insert_scan;
-
-                        work_next_valid[
-                            insert_prev
-                        ] = 1'b1;
-
-                        work_next_sel[
-                            insert_prev
-                        ] = append1_sel;
-
-                        insert_done = 1'b1;
-                    end else if (
-                        !work_next_valid[
-                            insert_scan
-                        ]
-                    ) begin
-                        work_next_valid[
-                            insert_scan
-                        ] = 1'b1;
-
-                        work_next_sel[
-                            insert_scan
-                        ] = append1_sel;
-
-                        work_tail = append1_sel;
-                        insert_done = 1'b1;
-                    end else begin
-                        insert_prev =
-                            insert_scan;
-
-                        insert_scan =
-                            work_next_sel[
-                                insert_scan
-                            ];
-                    end
-                end
-            end
-
-            /*
-             * Commit the resulting chain back to the register inputs.
-             */
-            release_owner_valid_d = work_valid;
-            release_owner_sel_d = work_head;
-            release_tail_sel_d = work_tail;
-            release_next_valid_d = work_next_valid;
-
-            for (
-                link_i = 0;
-                link_i < DEPTH;
-                link_i = link_i + 1
-            ) begin
-                release_next_sel_d[link_i] =
-                    work_next_sel[link_i];
             end
         end
     end
 
-    always_ff @(posedge clk or negedge rstn) begin : release_link_registers
-        integer link_i;
-
-        if (!rstn) begin
+    always_ff @(posedge clk or negedge rstn) begin
+        if (!rstn || flush) begin
             release_owner_valid_q <= 1'b0;
             release_owner_sel_q <= '0;
-            release_tail_sel_q <= '0;
-
-            release_next_valid_q <= '0;
-
-            for (
-                link_i = 0;
-                link_i < DEPTH;
-                link_i = link_i + 1
-            ) begin
-                release_next_sel_q[link_i] <= '0;
-            end
-        end else begin
+        end else if (release_owner_reselect) begin
             release_owner_valid_q <=
-                release_owner_valid_d;
+                release_owner_next_valid;
 
             release_owner_sel_q <=
-                release_owner_sel_d;
-
-            release_tail_sel_q <=
-                release_tail_sel_d;
-
-            release_next_valid_q <=
-                release_next_valid_d;
-
-            for (
-                link_i = 0;
-                link_i < DEPTH;
-                link_i = link_i + 1
-            ) begin
-                release_next_sel_q[link_i] <=
-                    release_next_sel_d[link_i];
-            end
+                release_owner_next_sel;
         end
     end
 
@@ -2102,36 +1738,9 @@ module StoreQueue #(
             integer check_i;
             if (rstn && !flush && release_owner_valid_q) begin
                 for (check_i = 0; check_i < DEPTH; check_i = check_i + 1) begin
-                    /*
-                     * uop_is_younger is only well-defined for identifiers
-                     * allocated within the same window.  After a flush the
-                     * queue legitimately mixes committed stores from an older
-                     * epoch with stores of the new epoch, so restrict the age
-                     * check to same-epoch entries.
-                     */
-                    if (
-                        entries[check_i].valid &&
-                        (check_i != release_owner_sel_q) &&
-                        (entries[check_i].uop_id.epoch ==
-                         entries[release_owner_sel_q].uop_id.epoch)
-                    ) begin
-                        if (
-                            uop_is_younger(
-                                entries[release_owner_sel_q].uop_id,
-                                entries[check_i].uop_id
-                            )
-                        )
-                            $fatal(
-                                1,
-                                "SQ release owner is not oldest: head_slot=%0d head_epoch=%0d head_tag=%0d other_slot=%0d other_epoch=%0d other_tag=%0d count=%0d",
-                                release_owner_sel_q,
-                                entries[release_owner_sel_q].uop_id.epoch,
-                                entries[release_owner_sel_q].uop_id.rob_tag,
-                                check_i,
-                                entries[check_i].uop_id.epoch,
-                                entries[check_i].uop_id.rob_tag,
-                                count
-                            );
+                    if (entries[check_i].valid && (check_i != release_owner_sel_q)) begin
+                        assert (!uop_is_younger(entries[release_owner_sel_q].uop_id, entries[check_i].uop_id))
+                            else $fatal(1, "SQ release owner is not the oldest entry");
                     end
                 end
             end
