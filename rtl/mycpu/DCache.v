@@ -4275,6 +4275,25 @@ module TaggedDCache #(
     end
 
     integer cache_i;
+
+    // Declare maintenance state before the cache-array commit process.  The
+    // process shares the valid-bit write port with refill/store updates, so
+    // the state and enum values must be visible at its point of use to both
+    // xvlog and Vivado elaboration.
+    localparam M_IDLE   = 3'd0;
+    localparam M_LOOKUP = 3'd1;
+    localparam M_APPLY  = 3'd2;
+    localparam M_ALL    = 3'd3;
+    localparam M_DONE   = 3'd4;
+    reg [2:0] maint_state;
+    reg [4:0] maint_index_r, maint_count;
+    reg [TAG_WID-1:0] maint_tag_r;
+    reg [1:0] maint_mode_r;
+    wire maint_hit0 = cache_valid0[maint_index_r] &&
+                       (cache_tag0[maint_index_r] == maint_tag_r);
+    wire maint_hit1 = cache_valid1[maint_index_r] &&
+                       (cache_tag1[maint_index_r] == maint_tag_r);
+
     always @(posedge cpu_clk or negedge cpu_rstn) begin
         if (!cpu_rstn) begin
             refill_commit_valid_q <= 1'b0;
@@ -4392,6 +4411,7 @@ module TaggedDCache #(
                         3'd4: cache_data1_b4[store_update_index_q] <= merge_bytes(cache_data1_b4[store_update_index_q], store_update_wen_q, store_update_data_q);
                         3'd5: cache_data1_b5[store_update_index_q] <= merge_bytes(cache_data1_b5[store_update_index_q], store_update_wen_q, store_update_data_q);
                         3'd6: cache_data1_b6[store_update_index_q] <= merge_bytes(cache_data1_b6[store_update_index_q], store_update_wen_q, store_update_data_q);
+                        3'd7: cache_data1_b7[store_update_index_q] <= merge_bytes(cache_data1_b7[store_update_index_q], store_update_wen_q, store_update_data_q);
                     endcase
                 end
             end
@@ -4428,20 +4448,6 @@ module TaggedDCache #(
             end
         end
     end
-
-    localparam M_IDLE = 3'd0;
-    localparam M_LOOKUP = 3'd1;
-    localparam M_APPLY = 3'd2;
-    localparam M_ALL = 3'd3;
-    localparam M_DONE = 3'd4;
-    reg [2:0] maint_state;
-    reg [4:0] maint_index_r, maint_count;
-    reg [TAG_WID-1:0] maint_tag_r;
-    reg [1:0] maint_mode_r;
-    wire maint_hit0 = cache_valid0[maint_index_r] &&
-                       (cache_tag0[maint_index_r] == maint_tag_r);
-    wire maint_hit1 = cache_valid1[maint_index_r] &&
-                       (cache_tag1[maint_index_r] == maint_tag_r);
 
     assign maint_ready = (maint_state == M_IDLE) &&
                          (req_count == 2'd0) && !active_refill &&
