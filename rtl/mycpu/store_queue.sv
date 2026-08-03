@@ -126,6 +126,11 @@ module StoreQueue #(
     logic [INDEX_W-1:0] release_owner_sel_q;
     logic release_owner_next_valid;
     logic [INDEX_W-1:0] release_owner_next_sel;
+`ifndef SYNTHESIS
+    logic release_stall_q;
+    logic release_owner_valid_prev_q;
+    logic [INDEX_W-1:0] release_owner_sel_prev_q;
+`endif
 
     logic release_candidate_valid;
     lsu_entry_t release_candidate_entry;
@@ -139,7 +144,6 @@ module StoreQueue #(
     integer i;
     integer q;
     integer byte_i;
-    integer owner_scan;
     integer alloc_scan;
     integer flush_dst;
 
@@ -690,6 +694,23 @@ module StoreQueue #(
         release_candidate_valid &&
         release_fire;
 
+    wire release_owner_hold =
+        !flush &&
+        release_candidate_valid &&
+        !release_fire;
+
+    wire release_owner_reselect =
+        !release_owner_hold &&
+        (
+            release_do ||
+            r0_do ||
+            r1_do ||
+            (
+                !release_owner_valid_q &&
+                (count != 0)
+            )
+        );
+
     wire [COUNT_W:0] free_slots =
         (DEPTH - count) +
         {{COUNT_W{1'b0}}, release_do};
@@ -954,117 +975,135 @@ module StoreQueue #(
     end
 
     always_comb begin : release_owner_next_logic
-        logic candidate_valid;
-        uop_id_t candidate_id;
-        logic [INDEX_W-1:0] candidate_sel;
-        logic [INDEX_W-1:0] r1_alloc_sel;
+        logic [DEPTH-1:0] next_slot_valid;
+        uop_id_t          next_slot_uop_id [0:DEPTH-1];
 
-        candidate_valid = 1'b0;
-        candidate_id = '0;
-        candidate_sel = '0;
+        logic [DEPTH-1:0] has_older;
+        logic [DEPTH-1:0] oldest_onehot;
+
+        logic [INDEX_W-1:0] r1_alloc_sel;
+        logic select_found;
+
+        integer owner_i;
+        integer owner_j;
+
+        for (
+            owner_i = 0;
+            owner_i < DEPTH;
+            owner_i = owner_i + 1
+        ) begin
+            next_slot_valid[owner_i] =
+                entries[owner_i].valid;
+
+            next_slot_uop_id[owner_i] =
+                entries[owner_i].uop_id;
+        end
+
+        if (
+            release_do &&
+            release_owner_valid_q
+        ) begin
+            next_slot_valid[
+                release_owner_sel_q
+            ] = 1'b0;
+
+            next_slot_uop_id[
+                release_owner_sel_q
+            ] = '0;
+        end
+
+        if (r0_do) begin
+            next_slot_valid[
+                alloc0_sel
+            ] = 1'b1;
+
+            next_slot_uop_id[
+                alloc0_sel
+            ] = r0_uop_id;
+        end
 
         r1_alloc_sel =
             r0_do ?
                 alloc1_sel :
                 alloc0_sel;
 
-        if (!flush) begin
-            if (
-                release_candidate_valid &&
-                !release_fire
+        if (r1_do) begin
+            next_slot_valid[
+                r1_alloc_sel
+            ] = 1'b1;
+
+            next_slot_uop_id[
+                r1_alloc_sel
+            ] = r1_uop_id;
+        end
+
+        has_older = '0;
+
+        for (
+            owner_i = 0;
+            owner_i < DEPTH;
+            owner_i = owner_i + 1
+        ) begin
+            for (
+                owner_j = 0;
+                owner_j < DEPTH;
+                owner_j = owner_j + 1
             ) begin
-                candidate_valid = 1'b1;
-
-                candidate_id =
-                    entries[
-                        release_owner_sel_q
-                    ].uop_id;
-
-                candidate_sel =
-                    release_owner_sel_q;
-            end else begin
-                for (
-                    owner_scan = 0;
-                    owner_scan < DEPTH;
-                    owner_scan = owner_scan + 1
+                if (
+                    (owner_i != owner_j) &&
+                    next_slot_valid[owner_i] &&
+                    next_slot_valid[owner_j] &&
+                    uop_is_younger(
+                        next_slot_uop_id[owner_i],
+                        next_slot_uop_id[owner_j]
+                    )
                 ) begin
-                    if (
-                        entries[owner_scan].valid &&
-                        !(
-                            release_do &&
-                            release_owner_valid_q &&
-                            (
-                                owner_scan ==
-                                release_owner_sel_q
-                            )
-                        )
-                    ) begin
-                        if (
-                            !candidate_valid ||
-                            uop_is_younger(
-                                candidate_id,
-                                entries[
-                                    owner_scan
-                                ].uop_id
-                            )
-                        ) begin
-                            candidate_valid = 1'b1;
-
-                            candidate_id =
-                                entries[
-                                    owner_scan
-                                ].uop_id;
-
-                            candidate_sel =
-                                owner_scan[
-                                    INDEX_W-1:0
-                                ];
-                        end
-                    end
-                end
-
-                if (r0_do) begin
-                    if (
-                        !candidate_valid ||
-                        uop_is_younger(
-                            candidate_id,
-                            r0_uop_id
-                        )
-                    ) begin
-                        candidate_valid = 1'b1;
-                        candidate_id = r0_uop_id;
-                        candidate_sel = alloc0_sel;
-                    end
-                end
-
-                if (r1_do) begin
-                    if (
-                        !candidate_valid ||
-                        uop_is_younger(
-                            candidate_id,
-                            r1_uop_id
-                        )
-                    ) begin
-                        candidate_valid = 1'b1;
-                        candidate_id = r1_uop_id;
-                        candidate_sel = r1_alloc_sel;
-                    end
+                    has_older[owner_i] = 1'b1;
                 end
             end
         end
 
-        release_owner_next_valid =
-            candidate_valid;
+        for (
+            owner_i = 0;
+            owner_i < DEPTH;
+            owner_i = owner_i + 1
+        ) begin
+            oldest_onehot[owner_i] =
+                next_slot_valid[owner_i] &&
+                !has_older[owner_i];
+        end
 
-        release_owner_next_sel =
-            candidate_sel;
+        release_owner_next_valid = 1'b0;
+        release_owner_next_sel = '0;
+        select_found = 1'b0;
+
+        if (!flush) begin
+            for (
+                owner_i = 0;
+                owner_i < DEPTH;
+                owner_i = owner_i + 1
+            ) begin
+                if (
+                    oldest_onehot[owner_i] &&
+                    !select_found
+                ) begin
+                    release_owner_next_valid =
+                        1'b1;
+
+                    release_owner_next_sel =
+                        owner_i[INDEX_W-1:0];
+
+                    select_found = 1'b1;
+                end
+            end
+        end
     end
 
     always_ff @(posedge clk or negedge rstn) begin
         if (!rstn || flush) begin
             release_owner_valid_q <= 1'b0;
             release_owner_sel_q <= '0;
-        end else begin
+        end else if (release_owner_reselect) begin
             release_owner_valid_q <=
                 release_owner_next_valid;
 
@@ -1669,6 +1708,43 @@ module StoreQueue #(
                 );
         end
     end
+
+        always @(posedge clk or negedge rstn) begin
+            if (!rstn || flush) begin
+                release_stall_q <= 1'b0;
+                release_owner_valid_prev_q <= 1'b0;
+                release_owner_sel_prev_q <= '0;
+            end else begin
+                if (release_stall_q) begin
+                    assert (release_owner_valid_q == release_owner_valid_prev_q)
+                        else $fatal(1, "SQ owner valid changed while release was stalled");
+                    assert (release_owner_sel_q == release_owner_sel_prev_q)
+                        else $fatal(1, "SQ owner changed while release was stalled");
+                end
+                release_stall_q <= release_valid && !release_fire;
+                release_owner_valid_prev_q <= release_owner_valid_q;
+                release_owner_sel_prev_q <= release_owner_sel_q;
+            end
+        end
+
+        always @(posedge clk) begin
+            if (rstn && !flush && release_owner_valid_q) begin
+                assert (entries[release_owner_sel_q].valid)
+                    else $fatal(1, "SQ release owner points to an invalid slot");
+            end
+        end
+
+        always @(posedge clk) begin : check_release_owner_oldest
+            integer check_i;
+            if (rstn && !flush && release_owner_valid_q) begin
+                for (check_i = 0; check_i < DEPTH; check_i = check_i + 1) begin
+                    if (entries[check_i].valid && (check_i != release_owner_sel_q)) begin
+                        assert (!uop_is_younger(entries[release_owner_sel_q].uop_id, entries[check_i].uop_id))
+                            else $fatal(1, "SQ release owner is not the oldest entry");
+                    end
+                end
+            end
+        end
 `endif
 
 endmodule
