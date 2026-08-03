@@ -62,7 +62,7 @@ module StoreBuffer #(parameter integer DEPTH = 4) (
         integer b;
         integer idx;
 
-        accept_ready = rstn && ((count < DEPTH) || pop_do);
+        accept_ready = rstn && (count < DEPTH);
         head_valid = (count != 0);
         head_entry = '0;
         if (head_valid)

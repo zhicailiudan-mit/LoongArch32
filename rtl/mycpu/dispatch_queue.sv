@@ -5,37 +5,12 @@
 import cpu_types_pkg::*;
 
 module DispatchQueue #(
-    // Keep the standalone queue contract strictly oldest-ready by default.
-    // The Scheduler enables this option because lane0 owns branch/LSU/system
-    // resources while lane1 owns the second integer/MDU execution path.
     parameter RESOURCE_AWARE_PAIRING = 1'b0,
-    // The current backend uses a whole-queue branch flush.  Until recovery is
-    // age-selective in every queue, resolving a branch before all older uops
-    // retire can delete an older uncompleted load/store while ROB recovery
-    // correctly preserves it.  Scheduler therefore enables this guard.
     parameter BRANCH_AT_ROB_HEAD = 1'b0,
-    // Preserve a narrow same-cycle value capture for Store data at the
-    // payload ownership boundary.  This never participates in issue select.
     parameter SAME_CYCLE_COMPLETION_BYPASS = 1'b1,
-    // Selection timing knob.  A completion/wakeup broadcast may still be
-    // carried in the issue packet, but the age/resource selector uses the
-    // registered ready bits when this is set.  This removes the full
-    // uop-id compare matrix from the selector's same-cycle path.  Stores may
-    // still issue on their address source while data is unresolved; the
-    // StoreQueue owns the data wakeup in that case.
     parameter REGISTERED_SELECT_WAKEUP = 1'b1,
-    // Timing probe knob.  The normal scheduler may use a fair round-robin
-    // ready-entry selector instead of comparing every alloc_seq in the
-    // issue path.  Barrier age protection remains separate below.
     parameter ROUND_ROBIN_SELECT = 1'b0,
-    // Store/load and branch ordering comparisons are also kept out of the
-    // issue selector when enabled.  The registered masks are conservative by
-    // one cycle after an older uop leaves, but never allow a younger memory
-    // operation to pass an older one.
     parameter REGISTERED_ORDER_SELECT = 1'b0,
-    // Legacy timing-probe knob.  The active Scheduler configuration uses the
-    // explicit select-index/payload ownership stages below; this parameter is
-    // retained only for source compatibility with standalone users.
     parameter REGISTER_ISSUE_CLEAR = 1'b0
 ) (
     input  wire                  clk,
@@ -70,23 +45,16 @@ module DispatchQueue #(
     output wire                  issue_valid [0:1],
     input  wire                  issue_ready [0:1],
     output issue_uop_t           issue [0:1],
-    // A Store that has left the queue crosses a registered ownership
-    // boundary before Scheduler creates the StoreQueue reservation.  The
-    // token is held in a real two-entry ready/valid queue until Scheduler
-    // accepts it, so a full reservation-intent pair cannot silently lose a
-    // Store.
+
     input  wire                  store_issue_pending_ready,
     input  wire                  store_issue_pending_admit,
-    output logic                  store_issue_pending_valid,
-    output issue_uop_t            store_issue_pending,
-    output logic [1:0]            store_issue_pending_occupancy,
+    output logic                 store_issue_pending_valid,
+    output issue_uop_t           store_issue_pending,
+    output logic [1:0]           store_issue_pending_occupancy,
     output wire [3:0]            occupancy
 );
 
     localparam DQ_DEPTH = 8;
-    // One bit beyond the ROB tag is sufficient because at most ROB_DEPTH
-    // uops can be live. Any two live queue entries are therefore separated
-    // by less than half of this modular sequence space.
     localparam DQ_SEQ_W = `ROB_TAG_W + 1;
 
     reg [DQ_DEPTH-1:0] valid;
@@ -125,52 +93,42 @@ module DispatchQueue #(
     reg serializing [0:DQ_DEPTH-1];
     reg [DQ_DEPTH-1:0] barrier_blocked;
     reg barrier_active;
-    // Both issue lanes are independent ready/valid outputs.  Once either lane
-    // is presented while stalled, keep its selected entry stable even if the
-    // other lane fires and changes the normal issue arbitration.
+
     reg main_hold_valid;
     reg [2:0] main_hold_sel;
     reg fast_hold_valid;
     reg [2:0] fast_hold_sel;
-    // A Store may cross the select-index/payload boundary only after this
-    // registered grant has reserved one entry in the local Store-token FIFO.
-    // The grant is ownership, not a pulse: it remains attached to the held
-    // index until that Store transfers, is released, or is killed.
     reg main_hold_store_grant_q;
     reg fast_hold_store_grant_q;
     reg [2:0] main_rr_ptr;
     reg [2:0] fast_rr_ptr;
-    // Ownership-transfer pulses are registered separately so candidate type,
-    // grant and pick logic terminate here instead of reaching either RR FF.
     reg main_ownership_transfer_q;
     reg fast_ownership_transfer_q;
     reg [DQ_DEPTH-1:0] older_branch_pending_q;
     reg [DQ_DEPTH-1:0] older_store_pending_q;
     reg older_store_any_q;
-    // Issue ownership is transferred in two explicit stages.  The hold
-    // registers are the select-index stage; once a held slot is copied into
-    // the payload register, the DQ slot is released and the payload belongs
-    // to the execution lane until its ready/valid handshake.
+
     issue_uop_t issue_payload_q [0:1];
-    logic       issue_payload_valid_q;
-    logic       fast_payload_valid_q;
+    logic issue_payload_valid_q;
+    logic fast_payload_valid_q;
     reg issue_pending_valid;
     reg [2:0] issue_pending_sel;
     reg fast_pending_valid;
     reg [2:0] fast_pending_sel;
-    // Only four fields cross the Store reservation boundary.  Keeping a full
-    // issue_uop_t here made recovery, clear and credit control drive hundreds
-    // of data bits which are never consumed by Scheduler.
+
     typedef struct packed {
         uop_id_t     uop_id;
         logic [31:0] pc;
         logic [3:0]  store_mask;
         uop_id_t     src1_id;
     } store_token_t;
+
     store_token_t store_token_fifo_q [0:1];
-    logic       store_token_head_q;
-    logic       store_token_tail_q;
+    logic store_token_head_q;
+    logic store_token_tail_q;
     logic [1:0] store_token_count_q;
+    logic store_select_credit_q;
+
     reg [2:0] ras_ptr [0:DQ_DEPTH-1];
     reg pred_valid [0:DQ_DEPTH-1];
     reg pred_taken [0:DQ_DEPTH-1];
@@ -178,8 +136,6 @@ module DispatchQueue #(
     reg [9:0] pred_index [0:DQ_DEPTH-1];
     reg [2:0] ras_sp_before [0:DQ_DEPTH-1];
     reg [3:0] ras_count_before [0:DQ_DEPTH-1];
-    // Observation-only Fetch-time BTB lookup result.  This bit follows the
-    // prediction packet but is never used by issue selection or CPU control.
     reg perf_btb_hit [0:DQ_DEPTH-1];
 
     reg [3:0] count;
@@ -187,10 +143,10 @@ module DispatchQueue #(
     wire [2:0] fast_issue_sel;
     reg [2:0] enq_sel;
     reg [2:0] enq1_sel;
-    wire      issue_found;
-    wire      fast_issue_found;
-    reg       free_found;
-    reg       second_free_found;
+    wire issue_found;
+    wire fast_issue_found;
+    reg free_found;
+    reg second_free_found;
     reg [DQ_SEQ_W-1:0] next_alloc_seq;
     integer i;
     integer recover_count;
@@ -199,9 +155,6 @@ module DispatchQueue #(
     integer occupancy_i;
     issue_uop_t issue_selected_payload [0:1];
 
-    // Keep the queue state machine below field-oriented for now, while the
-    // module boundary carries typed lane packets.  These aliases are local
-    // implementation names, not part of the public interface.
     wire enq_valid = enq[0].valid;
     wire enq1_valid = enq[1].valid;
     wire uop_id_t enq_uop_id = enq[0].uop.uop_id;
@@ -224,6 +177,7 @@ module DispatchQueue #(
     wire [`ROB_TAG_W-1:0] enq1_src0_tag = enq1_src0_id.rob_tag;
     wire [`ROB_TAG_W-1:0] enq_src1_tag = enq_src1_id.rob_tag;
     wire [`ROB_TAG_W-1:0] enq1_src1_tag = enq1_src1_id.rob_tag;
+
     genvar sid;
     generate
         for (sid = 0; sid < DQ_DEPTH; sid = sid + 1) begin : GEN_SRC_TAG
@@ -231,6 +185,7 @@ module DispatchQueue #(
             assign src1_tag[sid] = src1_id[sid].rob_tag;
         end
     endgenerate
+
     wire [4:0] enq_rR1 = enq[0].uop.arch_rs1;
     wire [4:0] enq1_rR1 = enq[1].uop.arch_rs1;
     wire [4:0] enq_rR2 = enq[0].uop.arch_rs2;
@@ -302,27 +257,21 @@ module DispatchQueue #(
     wire uop_id_t complete1_id = complete[1].uop_id;
     wire [31:0] complete1_value = complete[1].value;
     wire complete1_rf_we = complete[1].reg_write;
-    // Completion terminates at the per-slot ready/value state.  In
-    // particular, it must not pass through slot_ready and the two issue
-    // selectors in the same cycle.  Matching the raw completion here lets a
-    // resident entry capture it at the next edge without the extra cycle that
-    // the former completion_wakeup_q shadow register introduced.
+
     wire wakeup0_valid = complete_valid &&
         !(recover_valid && uop_is_younger(complete_id, recover_id));
     wire uop_id_t wakeup0_id = complete_id;
     wire [31:0] wakeup0_value = complete_value;
     wire wakeup0_rf_we = complete_rf_we;
+
     wire wakeup1_valid = complete1_valid &&
         !(recover_valid && uop_is_younger(complete1_id, recover_id));
     wire uop_id_t wakeup1_id = complete1_id;
     wire [31:0] wakeup1_value = complete1_value;
     wire wakeup1_rf_we = complete1_rf_we;
-    // System completion remains real-time for ROB retirement and barrier
-    // release, but its queue-wide operand wakeup is intentionally local and
-    // registered.  It does not participate in same-cycle issue selection;
-    // this prevents the wakeup tag from re-entering the ready -> oldest-select
-    // -> issue-fire -> ready-register feedback path.
+
     completion_t system_wakeup_q;
+
     always_ff @(posedge clk or negedge rstn) begin
         if (!rstn)
             system_wakeup_q <= '0;
@@ -331,17 +280,14 @@ module DispatchQueue #(
         else
             system_wakeup_q <= system_complete;
     end
+
     wire system_wakeup_valid = system_wakeup_q.valid;
     wire uop_id_t system_wakeup_id = system_wakeup_q.uop_id;
     wire [31:0] system_wakeup_value = system_wakeup_q.value;
     wire system_wakeup_rf_we = system_wakeup_q.reg_write;
-    // Completion normally updates registered operand state.  Commit is only a
-    // fallback for a consumer which entered the queue after the producer's
-    // completion broadcast.  Register that fallback locally so ROB retirement
-    // does not drive every ready/value register through the queue-wide compare
-    // tree.  Do not clear it on flush: an older surviving consumer may need a
-    // producer which retired in the recovery cycle.
+
     commit_t commit_wakeup_q [0:1];
+
     always_ff @(posedge clk or negedge rstn) begin
         if (!rstn) begin
             commit_wakeup_q[0] <= '0;
@@ -364,16 +310,13 @@ module DispatchQueue #(
     function seq_is_older;
         input [DQ_SEQ_W-1:0] lhs;
         input [DQ_SEQ_W-1:0] rhs;
-        reg   [DQ_SEQ_W-1:0] delta;
+        reg [DQ_SEQ_W-1:0] delta;
         begin
             delta = lhs - rhs;
             seq_is_older = delta[DQ_SEQ_W-1];
         end
     endfunction
 
-    // Balanced 8-way tournament. Pair, quarter, and final comparisons form
-    // three fixed levels; no timing-critical serial priority loop is used.
-    // Return value: {found, slot[2:0]}.
     function [3:0] pick_oldest8;
         input [DQ_DEPTH-1:0] mask;
         input [DQ_SEQ_W-1:0] seq0;
@@ -384,49 +327,78 @@ module DispatchQueue #(
         input [DQ_SEQ_W-1:0] seq5;
         input [DQ_SEQ_W-1:0] seq6;
         input [DQ_SEQ_W-1:0] seq7;
-        reg valid01, valid23, valid45, valid67;
-        reg valid03, valid47;
-        reg [2:0] sel01, sel23, sel45, sel67;
-        reg [2:0] sel03, sel47;
-        reg [DQ_SEQ_W-1:0] win01, win23, win45, win67;
-        reg [DQ_SEQ_W-1:0] win03, win47;
+        reg valid01;
+        reg valid23;
+        reg valid45;
+        reg valid67;
+        reg valid03;
+        reg valid47;
+        reg [2:0] sel01;
+        reg [2:0] sel23;
+        reg [2:0] sel45;
+        reg [2:0] sel67;
+        reg [2:0] sel03;
+        reg [2:0] sel47;
+        reg [DQ_SEQ_W-1:0] win01;
+        reg [DQ_SEQ_W-1:0] win23;
+        reg [DQ_SEQ_W-1:0] win45;
+        reg [DQ_SEQ_W-1:0] win67;
+        reg [DQ_SEQ_W-1:0] win03;
+        reg [DQ_SEQ_W-1:0] win47;
         begin
             valid01 = mask[0] | mask[1];
             valid23 = mask[2] | mask[3];
             valid45 = mask[4] | mask[5];
             valid67 = mask[6] | mask[7];
+
             if (mask[0] && (!mask[1] || seq_is_older(seq0, seq1))) begin
-                sel01 = 3'd0; win01 = seq0;
+                sel01 = 3'd0;
+                win01 = seq0;
             end else begin
-                sel01 = 3'd1; win01 = seq1;
+                sel01 = 3'd1;
+                win01 = seq1;
             end
+
             if (mask[2] && (!mask[3] || seq_is_older(seq2, seq3))) begin
-                sel23 = 3'd2; win23 = seq2;
+                sel23 = 3'd2;
+                win23 = seq2;
             end else begin
-                sel23 = 3'd3; win23 = seq3;
+                sel23 = 3'd3;
+                win23 = seq3;
             end
+
             if (mask[4] && (!mask[5] || seq_is_older(seq4, seq5))) begin
-                sel45 = 3'd4; win45 = seq4;
+                sel45 = 3'd4;
+                win45 = seq4;
             end else begin
-                sel45 = 3'd5; win45 = seq5;
+                sel45 = 3'd5;
+                win45 = seq5;
             end
+
             if (mask[6] && (!mask[7] || seq_is_older(seq6, seq7))) begin
-                sel67 = 3'd6; win67 = seq6;
+                sel67 = 3'd6;
+                win67 = seq6;
             end else begin
-                sel67 = 3'd7; win67 = seq7;
+                sel67 = 3'd7;
+                win67 = seq7;
             end
 
             valid03 = valid01 | valid23;
             if (valid01 && (!valid23 || seq_is_older(win01, win23))) begin
-                sel03 = sel01; win03 = win01;
+                sel03 = sel01;
+                win03 = win01;
             end else begin
-                sel03 = sel23; win03 = win23;
+                sel03 = sel23;
+                win03 = win23;
             end
+
             valid47 = valid45 | valid67;
             if (valid45 && (!valid67 || seq_is_older(win45, win67))) begin
-                sel47 = sel45; win47 = win45;
+                sel47 = sel45;
+                win47 = win45;
             end else begin
-                sel47 = sel67; win47 = win67;
+                sel47 = sel67;
+                win47 = win67;
             end
 
             if (!valid03 && !valid47)
@@ -441,22 +413,27 @@ module DispatchQueue #(
     function [3:0] pick_first8;
         input [DQ_DEPTH-1:0] mask;
         begin
-            if (mask[0])      pick_first8 = 4'b1000;
-            else if (mask[1]) pick_first8 = 4'b1001;
-            else if (mask[2]) pick_first8 = 4'b1010;
-            else if (mask[3]) pick_first8 = 4'b1011;
-            else if (mask[4]) pick_first8 = 4'b1100;
-            else if (mask[5]) pick_first8 = 4'b1101;
-            else if (mask[6]) pick_first8 = 4'b1110;
-            else if (mask[7]) pick_first8 = 4'b1111;
-            else              pick_first8 = 4'b0000;
+            if (mask[0])
+                pick_first8 = 4'b1000;
+            else if (mask[1])
+                pick_first8 = 4'b1001;
+            else if (mask[2])
+                pick_first8 = 4'b1010;
+            else if (mask[3])
+                pick_first8 = 4'b1011;
+            else if (mask[4])
+                pick_first8 = 4'b1100;
+            else if (mask[5])
+                pick_first8 = 4'b1101;
+            else if (mask[6])
+                pick_first8 = 4'b1110;
+            else if (mask[7])
+                pick_first8 = 4'b1111;
+            else
+                pick_first8 = 4'b0000;
         end
     endfunction
 
-    // Fair selector used by the timing-oriented scheduler configuration.
-    // The mask is rotated around a 3-bit pointer, then the first set bit is
-    // mapped back to the queue slot.  This has no alloc_seq comparator or
-    // serial priority loop and still visits every ready slot over time.
     function [3:0] pick_round_robin8;
         input [DQ_DEPTH-1:0] mask;
         input [2:0] start;
@@ -465,18 +442,53 @@ module DispatchQueue #(
         reg [2:0] offset;
         begin
             case (start)
-                3'd0: rotated = {mask[7], mask[6], mask[5], mask[4], mask[3], mask[2], mask[1], mask[0]};
-                3'd1: rotated = {mask[0], mask[7], mask[6], mask[5], mask[4], mask[3], mask[2], mask[1]};
-                3'd2: rotated = {mask[1], mask[0], mask[7], mask[6], mask[5], mask[4], mask[3], mask[2]};
-                3'd3: rotated = {mask[2], mask[1], mask[0], mask[7], mask[6], mask[5], mask[4], mask[3]};
-                3'd4: rotated = {mask[3], mask[2], mask[1], mask[0], mask[7], mask[6], mask[5], mask[4]};
-                3'd5: rotated = {mask[4], mask[3], mask[2], mask[1], mask[0], mask[7], mask[6], mask[5]};
-                3'd6: rotated = {mask[5], mask[4], mask[3], mask[2], mask[1], mask[0], mask[7], mask[6]};
-                default: rotated = {mask[6], mask[5], mask[4], mask[3], mask[2], mask[1], mask[0], mask[7]};
+                3'd0:
+                    rotated = {
+                        mask[7], mask[6], mask[5], mask[4],
+                        mask[3], mask[2], mask[1], mask[0]
+                    };
+                3'd1:
+                    rotated = {
+                        mask[0], mask[7], mask[6], mask[5],
+                        mask[4], mask[3], mask[2], mask[1]
+                    };
+                3'd2:
+                    rotated = {
+                        mask[1], mask[0], mask[7], mask[6],
+                        mask[5], mask[4], mask[3], mask[2]
+                    };
+                3'd3:
+                    rotated = {
+                        mask[2], mask[1], mask[0], mask[7],
+                        mask[6], mask[5], mask[4], mask[3]
+                    };
+                3'd4:
+                    rotated = {
+                        mask[3], mask[2], mask[1], mask[0],
+                        mask[7], mask[6], mask[5], mask[4]
+                    };
+                3'd5:
+                    rotated = {
+                        mask[4], mask[3], mask[2], mask[1],
+                        mask[0], mask[7], mask[6], mask[5]
+                    };
+                3'd6:
+                    rotated = {
+                        mask[5], mask[4], mask[3], mask[2],
+                        mask[1], mask[0], mask[7], mask[6]
+                    };
+                default:
+                    rotated = {
+                        mask[6], mask[5], mask[4], mask[3],
+                        mask[2], mask[1], mask[0], mask[7]
+                    };
             endcase
+
             first = pick_first8(rotated);
             offset = first[2:0];
-            pick_round_robin8 = first[3] ? {1'b1, (start + offset)} : 4'b0000;
+
+            pick_round_robin8 =
+                first[3] ? {1'b1, start + offset} : 4'b0000;
         end
     endfunction
 
@@ -511,47 +523,53 @@ module DispatchQueue #(
     logic [DQ_DEPTH-1:0] older_store_pending;
     wire [DQ_DEPTH-1:0] live_branch_mask;
     wire [DQ_DEPTH-1:0] live_store_mask;
-    // Timing-oriented Scheduler mode uses a conservative global Store
-    // presence bit instead of carrying eight independent age results into
-    // every Load's ready cone.  If any registered older-Store relation still
-    // exists, all resident Loads wait one extra cycle; Stores/ALU/branches are
-    // unaffected.  This cannot allow a younger Load to pass an older Store,
-    // and the mask is refreshed from the same registered ordering state.
+
     wire [DQ_DEPTH-1:0] branch_pending_for_select =
-        REGISTERED_ORDER_SELECT ? older_branch_pending_q : older_branch_pending;
+        REGISTERED_ORDER_SELECT
+            ? older_branch_pending_q
+            : older_branch_pending;
+
     wire [DQ_DEPTH-1:0] store_pending_for_select =
-        REGISTERED_ORDER_SELECT ? {DQ_DEPTH{older_store_any_q}} : older_store_pending;
-    // Scheduler credit terminates at a narrow grant register.  A held grant
-    // is included because it has already reserved a FIFO entry even though
-    // the compact token is written only at payload transfer.  Credit may mask
-    // a new Store selection, but can no longer drive payload/token data or CE.
-    wire [2:0] store_reserved_count = {1'b0, store_token_count_q} +
-                                      main_hold_store_grant_q +
-                                      fast_hold_store_grant_q;
-    wire store_reservation_space = (store_reserved_count < 3'd2);
-    wire store_reservation_available = store_reservation_space &&
-                                       store_issue_pending_admit;
-    wire [DQ_DEPTH-1:0] store_select_block = live_store_mask &
+        REGISTERED_ORDER_SELECT
+            ? {DQ_DEPTH{older_store_any_q}}
+            : older_store_pending;
+
+    wire [2:0] store_reserved_count =
+        {1'b0, store_token_count_q} +
+        main_hold_store_grant_q +
+        fast_hold_store_grant_q;
+
+    wire store_reservation_available = store_select_credit_q;
+
+    wire [DQ_DEPTH-1:0] store_select_block =
+        live_store_mask &
         {DQ_DEPTH{!store_reservation_available}};
+
     wire [3:0] next_barrier_pick;
     wire next_barrier_found;
     wire [DQ_SEQ_W-1:0] next_barrier_seq;
     wire [DQ_DEPTH-1:0] next_barrier_blocks;
     wire barrier_blocks_new;
-    wire [DQ_DEPTH-1:0] fast_hold_onehot = fast_hold_valid ?
-        ({{(DQ_DEPTH-1){1'b0}}, 1'b1} << fast_hold_sel) :
-        {DQ_DEPTH{1'b0}};
-    wire [DQ_DEPTH-1:0] main_hold_onehot = main_hold_valid ?
-        ({{(DQ_DEPTH-1){1'b0}}, 1'b1} << main_hold_sel) :
-        {DQ_DEPTH{1'b0}};
+
+    wire [DQ_DEPTH-1:0] fast_hold_onehot =
+        fast_hold_valid
+            ? ({{(DQ_DEPTH-1){1'b0}}, 1'b1} << fast_hold_sel)
+            : {DQ_DEPTH{1'b0}};
+
+    wire [DQ_DEPTH-1:0] main_hold_onehot =
+        main_hold_valid
+            ? ({{(DQ_DEPTH-1){1'b0}}, 1'b1} << main_hold_sel)
+            : {DQ_DEPTH{1'b0}};
+
     wire [DQ_DEPTH-1:0] issue_pending_onehot =
-        (REGISTER_ISSUE_CLEAR && issue_pending_valid) ?
-        ({{(DQ_DEPTH-1){1'b0}}, 1'b1} << issue_pending_sel) :
-        {DQ_DEPTH{1'b0}};
+        (REGISTER_ISSUE_CLEAR && issue_pending_valid)
+            ? ({{(DQ_DEPTH-1){1'b0}}, 1'b1} << issue_pending_sel)
+            : {DQ_DEPTH{1'b0}};
+
     wire [DQ_DEPTH-1:0] fast_pending_onehot =
-        (REGISTER_ISSUE_CLEAR && fast_pending_valid) ?
-        ({{(DQ_DEPTH-1){1'b0}}, 1'b1} << fast_pending_sel) :
-        {DQ_DEPTH{1'b0}};
+        (REGISTER_ISSUE_CLEAR && fast_pending_valid)
+            ? ({{(DQ_DEPTH-1){1'b0}}, 1'b1} << fast_pending_sel)
+            : {DQ_DEPTH{1'b0}};
 
     wire main_payload_space;
     wire fast_payload_space;
@@ -569,22 +587,33 @@ module DispatchQueue #(
         logic [`UOP_EPOCH_W-1:0] epoch;
         producer_type_e ptype;
     } producer_entry_t;
+
     producer_entry_t producer_table [0:(1<<`ROB_TAG_W)-1];
 
-    // Control-flow recovery is not composable when a younger branch is
-    // allowed to redirect before an older unresolved branch.  In that case
-    // the younger target can reach the frontend first and later be replaced
-    // by the older target, while the wrong-path branch may already commit.
-    // Keep only the oldest pending branch eligible; ordinary ALU/LSU uops
-    // remain fully out-of-order.
     integer branch_q;
     integer branch_old;
+
     always @(*) begin
         older_branch_pending = {DQ_DEPTH{1'b0}};
-        for (branch_q = 0; branch_q < DQ_DEPTH; branch_q = branch_q + 1) begin
-            for (branch_old = 0; branch_old < DQ_DEPTH; branch_old = branch_old + 1) begin
-                if (valid[branch_old] && is_br_jmp[branch_old] &&
-                    seq_is_older(alloc_seq[branch_old], alloc_seq[branch_q]))
+
+        for (
+            branch_q = 0;
+            branch_q < DQ_DEPTH;
+            branch_q = branch_q + 1
+        ) begin
+            for (
+                branch_old = 0;
+                branch_old < DQ_DEPTH;
+                branch_old = branch_old + 1
+            ) begin
+                if (
+                    valid[branch_old] &&
+                    is_br_jmp[branch_old] &&
+                    seq_is_older(
+                        alloc_seq[branch_old],
+                        alloc_seq[branch_q]
+                    )
+                )
                     older_branch_pending[branch_q] = 1'b1;
             end
         end
@@ -592,8 +621,17 @@ module DispatchQueue #(
 
 `ifndef SYNTHESIS
     wire [3:0] perf_oldest_valid = pick_oldest8(
-        valid, alloc_seq[0], alloc_seq[1], alloc_seq[2], alloc_seq[3],
-        alloc_seq[4], alloc_seq[5], alloc_seq[6], alloc_seq[7]);
+        valid,
+        alloc_seq[0],
+        alloc_seq[1],
+        alloc_seq[2],
+        alloc_seq[3],
+        alloc_seq[4],
+        alloc_seq[5],
+        alloc_seq[6],
+        alloc_seq[7]
+    );
+
     wire [2:0] perf_oldest_idx = perf_oldest_valid[2:0];
     wire perf_oldest_is_valid = perf_oldest_valid[3];
 `else
@@ -602,21 +640,34 @@ module DispatchQueue #(
     assign perf_serializing = 1'b0;
 `endif
 
-    // The SQ receives an entry when address generation completes, not at
-    // dispatch. Until an older Store has left this queue, its address is
-    // unknown to the LSU. Conservatively keep a younger Load here rather
-    // than speculate and require a memory-order-violation replay path.
     integer store_q;
     integer store_old;
+
     always @(*) begin
         older_store_pending = {DQ_DEPTH{1'b0}};
-        for (store_q = 0; store_q < DQ_DEPTH; store_q = store_q + 1) begin
-            for (store_old = 0; store_old < DQ_DEPTH; store_old = store_old + 1) begin
-                if (valid[store_old] && is_ld_st[store_old] &&
+
+        for (
+            store_q = 0;
+            store_q < DQ_DEPTH;
+            store_q = store_q + 1
+        ) begin
+            for (
+                store_old = 0;
+                store_old < DQ_DEPTH;
+                store_old = store_old + 1
+            ) begin
+                if (
+                    valid[store_old] &&
+                    is_ld_st[store_old] &&
                     (ram_we[store_old] != `RAM_WE_N) &&
-                    valid[store_q] && is_ld_st[store_q] &&
+                    valid[store_q] &&
+                    is_ld_st[store_q] &&
                     (ram_we[store_q] == `RAM_WE_N) &&
-                    seq_is_older(alloc_seq[store_old], alloc_seq[store_q]))
+                    seq_is_older(
+                        alloc_seq[store_old],
+                        alloc_seq[store_q]
+                    )
+                )
                     older_store_pending[store_q] = 1'b1;
             end
         end
@@ -625,175 +676,250 @@ module DispatchQueue #(
     genvar q;
     generate
         for (q = 0; q < DQ_DEPTH; q = q + 1) begin : GEN_ISSUE_STATE
-            // A ready source no longer has a meaningful producer ID.  Limit
-            // completion matching to unresolved sources so a wrapped ROB ID
-            // cannot replace an already-authoritative operand value.
-            assign complete0_src0_match[q] = wakeup0_valid && wakeup0_rf_we &&
-                                              valid[q] && rR1_re[q] &&
-                                              (rR1[q] != 5'h0) && !src0_ready[q] &&
-                                              uop_id_equal(wakeup0_id, src0_id[q]);
-            assign complete0_src1_match[q] = wakeup0_valid && wakeup0_rf_we &&
-                                              valid[q] && rR2_re[q] &&
-                                              (rR2[q] != 5'h0) && !src1_ready[q] &&
-                                              uop_id_equal(wakeup0_id, src1_id[q]);
-            assign complete1_src0_match[q] = wakeup1_valid && wakeup1_rf_we &&
-                                              valid[q] && rR1_re[q] &&
-                                              (rR1[q] != 5'h0) && !src0_ready[q] &&
-                                              uop_id_equal(wakeup1_id, src0_id[q]);
-            assign complete1_src1_match[q] = wakeup1_valid && wakeup1_rf_we &&
-                                              valid[q] && rR2_re[q] &&
-                                              (rR2[q] != 5'h0) && !src1_ready[q] &&
-                                              uop_id_equal(wakeup1_id, src1_id[q]);
-            assign system_src0_match[q] = system_wakeup_valid &&
-                                           system_wakeup_rf_we && valid[q] &&
-                                           rR1_re[q] && (rR1[q] != 5'h0) &&
-                                           !src0_ready[q] &&
-                                           uop_id_equal(system_wakeup_id,
-                                                        src0_id[q]);
-            assign system_src1_match[q] = system_wakeup_valid &&
-                                           system_wakeup_rf_we && valid[q] &&
-                                           rR2_re[q] && (rR2[q] != 5'h0) &&
-                                           !src1_ready[q] &&
-                                           uop_id_equal(system_wakeup_id,
-                                                        src1_id[q]);
+            assign complete0_src0_match[q] =
+                wakeup0_valid &&
+                wakeup0_rf_we &&
+                valid[q] &&
+                rR1_re[q] &&
+                (rR1[q] != 5'h0) &&
+                !src0_ready[q] &&
+                uop_id_equal(wakeup0_id, src0_id[q]);
+
+            assign complete0_src1_match[q] =
+                wakeup0_valid &&
+                wakeup0_rf_we &&
+                valid[q] &&
+                rR2_re[q] &&
+                (rR2[q] != 5'h0) &&
+                !src1_ready[q] &&
+                uop_id_equal(wakeup0_id, src1_id[q]);
+
+            assign complete1_src0_match[q] =
+                wakeup1_valid &&
+                wakeup1_rf_we &&
+                valid[q] &&
+                rR1_re[q] &&
+                (rR1[q] != 5'h0) &&
+                !src0_ready[q] &&
+                uop_id_equal(wakeup1_id, src0_id[q]);
+
+            assign complete1_src1_match[q] =
+                wakeup1_valid &&
+                wakeup1_rf_we &&
+                valid[q] &&
+                rR2_re[q] &&
+                (rR2[q] != 5'h0) &&
+                !src1_ready[q] &&
+                uop_id_equal(wakeup1_id, src1_id[q]);
+
+            assign system_src0_match[q] =
+                system_wakeup_valid &&
+                system_wakeup_rf_we &&
+                valid[q] &&
+                rR1_re[q] &&
+                (rR1[q] != 5'h0) &&
+                !src0_ready[q] &&
+                uop_id_equal(system_wakeup_id, src0_id[q]);
+
+            assign system_src1_match[q] =
+                system_wakeup_valid &&
+                system_wakeup_rf_we &&
+                valid[q] &&
+                rR2_re[q] &&
+                (rR2[q] != 5'h0) &&
+                !src1_ready[q] &&
+                uop_id_equal(system_wakeup_id, src1_id[q]);
+
             assign wake0_src0_vec[q] = complete0_src0_match[q];
             assign wake0_src1_vec[q] = complete0_src1_match[q];
             assign wake1_src0_vec[q] = complete1_src0_match[q];
             assign wake1_src1_vec[q] = complete1_src1_match[q];
-            // Raw completion updates the registered operand state at the
-            // clock edge. Keep the registered commit broadcasts as a
-            // last-resort fallback for an operand whose producer retired
-            // before the consumer reached the issue queue.
-            assign wake2_src0_vec[q] = commit_valid && commit_rf_we &&
-                                       valid[q] && rR1_re[q] &&
-                                       (rR1[q] != 5'h0) && !src0_ready[q] &&
-                                       uop_id_equal(commit_id, src0_id[q]);
-            assign wake2_src1_vec[q] = commit_valid && commit_rf_we &&
-                                       valid[q] && rR2_re[q] &&
-                                       (rR2[q] != 5'h0) && !src1_ready[q] &&
-                                       uop_id_equal(commit_id, src1_id[q]);
-            assign wake3_src0_vec[q] = commit1_valid && commit1_rf_we &&
-                                       valid[q] && rR1_re[q] &&
-                                       (rR1[q] != 5'h0) && !src0_ready[q] &&
-                                       uop_id_equal(commit1_id, src0_id[q]);
-            assign wake3_src1_vec[q] = commit1_valid && commit1_rf_we &&
-                                       valid[q] && rR2_re[q] &&
-                                       (rR2[q] != 5'h0) && !src1_ready[q] &&
-                                       uop_id_equal(commit1_id, src1_id[q]);
-            assign wake_src0_vec[q] = wake0_src0_vec[q] || wake1_src0_vec[q] ||
-                                       system_src0_match[q] ||
-                                       wake2_src0_vec[q] || wake3_src0_vec[q];
-            assign wake_src1_vec[q] = wake0_src1_vec[q] || wake1_src1_vec[q] ||
-                                       system_src1_match[q] ||
-                                       wake2_src1_vec[q] || wake3_src1_vec[q];
-            assign src0_ready_eff[q] = src0_ready[q] ||
-                                        (SAME_CYCLE_COMPLETION_BYPASS &&
-                                         (complete0_src0_match[q] ||
-                                          complete1_src0_match[q])) ||
-                                        wake0_src0_vec[q] ||
-                                        wake1_src0_vec[q] ||
-                                        wake2_src0_vec[q] ||
-                                        wake3_src0_vec[q];
-            assign src1_ready_eff[q] = src1_ready[q] ||
-                                        (SAME_CYCLE_COMPLETION_BYPASS &&
-                                         (complete0_src1_match[q] ||
-                                          complete1_src1_match[q])) ||
-                                        wake0_src1_vec[q] ||
-                                        wake1_src1_vec[q] ||
-                                        wake2_src1_vec[q] ||
-                                        wake3_src1_vec[q];
-            // A Store may leave the queue while its data is unresolved.  If
-            // the producer retires in that same cycle, carry the commit value
-            // into the issued packet instead of only recording it at the edge.
-            assign src0_value_eff[q] = (SAME_CYCLE_COMPLETION_BYPASS &&
-                                        complete0_src0_match[q]) ? complete_value :
-                                       (SAME_CYCLE_COMPLETION_BYPASS &&
-                                        complete1_src0_match[q]) ? complete1_value :
-                                       wake0_src0_vec[q]       ? wakeup0_value :
-                                       wake1_src0_vec[q]       ? wakeup1_value :
-                                       wake2_src0_vec[q]       ? commit_value :
-                                       wake3_src0_vec[q]       ? commit1_value :
-                                       rD1[q];
-            assign src1_value_eff[q] = (SAME_CYCLE_COMPLETION_BYPASS &&
-                                        complete0_src1_match[q]) ? complete_value :
-                                       (SAME_CYCLE_COMPLETION_BYPASS &&
-                                        complete1_src1_match[q]) ? complete1_value :
-                                       wake0_src1_vec[q]       ? wakeup0_value :
-                                       wake1_src1_vec[q]       ? wakeup1_value :
-                                       wake2_src1_vec[q]       ? commit_value :
-                                       wake3_src1_vec[q]       ? commit1_value :
-                                       rD2[q];
-            // The issue selector has a hard registered boundary.  The
-            // parameter is retained for source compatibility with existing
-            // probes, but completion is never allowed to feed the global
-            // select/hold cone combinationally.
+
+            assign wake2_src0_vec[q] =
+                commit_valid &&
+                commit_rf_we &&
+                valid[q] &&
+                rR1_re[q] &&
+                (rR1[q] != 5'h0) &&
+                !src0_ready[q] &&
+                uop_id_equal(commit_id, src0_id[q]);
+
+            assign wake2_src1_vec[q] =
+                commit_valid &&
+                commit_rf_we &&
+                valid[q] &&
+                rR2_re[q] &&
+                (rR2[q] != 5'h0) &&
+                !src1_ready[q] &&
+                uop_id_equal(commit_id, src1_id[q]);
+
+            assign wake3_src0_vec[q] =
+                commit1_valid &&
+                commit1_rf_we &&
+                valid[q] &&
+                rR1_re[q] &&
+                (rR1[q] != 5'h0) &&
+                !src0_ready[q] &&
+                uop_id_equal(commit1_id, src0_id[q]);
+
+            assign wake3_src1_vec[q] =
+                commit1_valid &&
+                commit1_rf_we &&
+                valid[q] &&
+                rR2_re[q] &&
+                (rR2[q] != 5'h0) &&
+                !src1_ready[q] &&
+                uop_id_equal(commit1_id, src1_id[q]);
+
+            assign wake_src0_vec[q] =
+                wake0_src0_vec[q] ||
+                wake1_src0_vec[q] ||
+                system_src0_match[q] ||
+                wake2_src0_vec[q] ||
+                wake3_src0_vec[q];
+
+            assign wake_src1_vec[q] =
+                wake0_src1_vec[q] ||
+                wake1_src1_vec[q] ||
+                system_src1_match[q] ||
+                wake2_src1_vec[q] ||
+                wake3_src1_vec[q];
+
+            assign src0_ready_eff[q] =
+                src0_ready[q] ||
+                (
+                    SAME_CYCLE_COMPLETION_BYPASS &&
+                    (
+                        complete0_src0_match[q] ||
+                        complete1_src0_match[q]
+                    )
+                ) ||
+                wake0_src0_vec[q] ||
+                wake1_src0_vec[q] ||
+                wake2_src0_vec[q] ||
+                wake3_src0_vec[q];
+
+            assign src1_ready_eff[q] =
+                src1_ready[q] ||
+                (
+                    SAME_CYCLE_COMPLETION_BYPASS &&
+                    (
+                        complete0_src1_match[q] ||
+                        complete1_src1_match[q]
+                    )
+                ) ||
+                wake0_src1_vec[q] ||
+                wake1_src1_vec[q] ||
+                wake2_src1_vec[q] ||
+                wake3_src1_vec[q];
+
+            assign src0_value_eff[q] =
+                (
+                    SAME_CYCLE_COMPLETION_BYPASS &&
+                    complete0_src0_match[q]
+                ) ? complete_value :
+                (
+                    SAME_CYCLE_COMPLETION_BYPASS &&
+                    complete1_src0_match[q]
+                ) ? complete1_value :
+                wake0_src0_vec[q] ? wakeup0_value :
+                wake1_src0_vec[q] ? wakeup1_value :
+                wake2_src0_vec[q] ? commit_value :
+                wake3_src0_vec[q] ? commit1_value :
+                rD1[q];
+
+            assign src1_value_eff[q] =
+                (
+                    SAME_CYCLE_COMPLETION_BYPASS &&
+                    complete0_src1_match[q]
+                ) ? complete_value :
+                (
+                    SAME_CYCLE_COMPLETION_BYPASS &&
+                    complete1_src1_match[q]
+                ) ? complete1_value :
+                wake0_src1_vec[q] ? wakeup0_value :
+                wake1_src1_vec[q] ? wakeup1_value :
+                wake2_src1_vec[q] ? commit_value :
+                wake3_src1_vec[q] ? commit1_value :
+                rD2[q];
+
             assign src0_select_ready[q] = src0_ready[q];
             assign src1_select_ready[q] = src1_ready[q];
-            // Device reads have an irreversible side effect (for example a
-            // UART RBR read pops one RX byte).  Address generation may be
-            // speculative, but the read itself must not leave the scheduler
-            // until the complete uop identity is at the ROB head.  RAM loads
-            // retain normal out-of-order issue.
-            // Address generation is moved out to avoid long combinational path.
-            // RAM loads retain normal out-of-order issue.
-            // Completion wakeup is captured into src*_ready/rD* at the clock
-            // edge.  Selection starts from that registered state on the next
-            // cycle.
-            // Store address/data decoupling:
-            //
-            // A Store may issue as soon as its address source is ready.  Its
-            // data source may remain unresolved and is carried with the full
-            // producer uop_id through ExecutionLane into StoreQueue.
-            //
-            // src1_ready_eff/src1_value_eff still provide same-cycle capture
-            // when the Store data producer completes at payload transfer.
-            assign slot_ready[q] = src0_select_ready[q] &&
-                                    (src1_select_ready[q] ||
-                                     (is_ld_st[q] &&
-                                      (ram_we[q] != `RAM_WE_N))) &&
-                                    (!(is_ld_st[q] &&
-                                       (ram_we[q] == `RAM_WE_N)) ||
-                                     !store_pending_for_select[q]) &&
-                                    (!is_br_jmp[q] ||
-                                     !branch_pending_for_select[q]) &&
-                                    (!BRANCH_AT_ROB_HEAD ||
-                                     !is_br_jmp[q] ||
-                                     (rob_head_valid &&
-                                      uop_id_equal(uop_id[q],
-                                                   rob_head_id)));
-            assign slot_restricted[q] = is_br_jmp[q] || is_ld_st[q] ||
-                                        is_call[q] || is_ret[q] ||
-                                        pred_taken[q] ||
-                                        (system_op[q] != 3'd0);
-            // Lane1 owns a second address generator, but an unresolved-data
-            // Store must not occupy both scheduler output holds while the SQ
-            // is full.  The Store data producer may itself be a ready ALU in
-            // this queue; reserving both outputs for blocked Stores would then
-            // form SQ-full -> Store-hold -> producer-not-issued -> SQ-full.
-            // Keep such a Store eligible on lane0, and admit it to lane1 only
-            // after its data is available.  Loads and data-ready Stores retain
-            // dual-lane address-generation throughput.
+
+            assign slot_ready[q] =
+                src0_select_ready[q] &&
+                (
+                    src1_select_ready[q] ||
+                    (
+                        is_ld_st[q] &&
+                        (ram_we[q] != `RAM_WE_N)
+                    )
+                ) &&
+                (
+                    !(
+                        is_ld_st[q] &&
+                        (ram_we[q] == `RAM_WE_N)
+                    ) ||
+                    !store_pending_for_select[q]
+                ) &&
+                (
+                    !is_br_jmp[q] ||
+                    !branch_pending_for_select[q]
+                ) &&
+                (
+                    !BRANCH_AT_ROB_HEAD ||
+                    !is_br_jmp[q] ||
+                    (
+                        rob_head_valid &&
+                        uop_id_equal(uop_id[q], rob_head_id)
+                    )
+                );
+
+            assign slot_restricted[q] =
+                is_br_jmp[q] ||
+                is_ld_st[q] ||
+                is_call[q] ||
+                is_ret[q] ||
+                pred_taken[q] ||
+                (system_op[q] != 3'd0);
+
             assign slot_fast_eligible[q] =
-                (is_ld_st[q] &&
-                 ((ram_we[q] == `RAM_WE_N) || src1_select_ready[q])) ||
-                (!slot_restricted[q] && (wd_sel[q] == `WD_ALU));
-            // System operations are deliberately excluded.  They use the
-            // serializing ROB-head path and must never be pulled forward just
-            // to fill an execution lane.
-            assign slot_lane0_only[q] = slot_restricted[q] && !is_ld_st[q] &&
-                                        (system_op[q] == 3'd0);
-            assign live_branch_mask[q] = valid[q] && is_br_jmp[q];
-            assign live_store_mask[q] = valid[q] && is_ld_st[q] &&
-                                        (ram_we[q] != `RAM_WE_N);
-            // Keep the serializing barrier visible to the release/age logic.
-            // This was previously an undriven net, which let synthesis remove
-            // the barrier path and made system-op ordering dependent on X/Z
-            // simulation behavior.
-            assign serializing_mask[q] = valid[q] && serializing[q];
-            wire has_serializing_op = |serializing_mask;
-            assign next_barrier_blocks[q] = has_serializing_op && next_barrier_found &&
-                                            seq_is_older(next_barrier_seq,
-                                                         alloc_seq[q]);
+                (
+                    is_ld_st[q] &&
+                    (
+                        (ram_we[q] == `RAM_WE_N) ||
+                        src1_select_ready[q]
+                    )
+                ) ||
+                (
+                    !slot_restricted[q] &&
+                    (wd_sel[q] == `WD_ALU)
+                );
+
+            assign slot_lane0_only[q] =
+                slot_restricted[q] &&
+                !is_ld_st[q] &&
+                (system_op[q] == 3'd0);
+
+            assign live_branch_mask[q] =
+                valid[q] &&
+                is_br_jmp[q];
+
+            assign live_store_mask[q] =
+                valid[q] &&
+                is_ld_st[q] &&
+                (ram_we[q] != `RAM_WE_N);
+
+            assign serializing_mask[q] =
+                valid[q] &&
+                serializing[q];
+
+            assign next_barrier_blocks[q] =
+                next_barrier_found &&
+                seq_is_older(
+                    next_barrier_seq,
+                    alloc_seq[q]
+                );
         end
     endgenerate
 
@@ -801,117 +927,211 @@ module DispatchQueue #(
     wire fast_issue_fire;
     wire enq_fire;
     wire enq1_fire;
-    // Decode issue selections once.  A slot is cleared when its payload is
-    // transferred into the lane-owned payload register, not when the
-    // execution unit eventually consumes that register.
-    wire [DQ_DEPTH-1:0] issue_clear_vec = main_payload_capture ?
-        ({{(DQ_DEPTH-1){1'b0}}, 1'b1} << main_hold_sel) : {DQ_DEPTH{1'b0}};
-    wire [DQ_DEPTH-1:0] fast_issue_clear_vec = fast_payload_capture ?
-        ({{(DQ_DEPTH-1){1'b0}}, 1'b1} << fast_hold_sel) : {DQ_DEPTH{1'b0}};
-    wire [DQ_DEPTH-1:0] state_clear_vec = issue_clear_vec | fast_issue_clear_vec;
-    reg  barrier_release_reg;
 
-    // Barrier age comparisons are no longer on the release write-enable path.
-    // A barrier bit is assigned when an entry is enqueued and then retained
-    // while any serializing entry remains in the queue.  Because allocation
-    // order is monotonic, every entry which was younger than the first
-    // barrier is also younger than every later barrier; retaining the bit is
-    // therefore equivalent to recomputing the full age matrix.  Once the last
-    // serializing entry disappears, the sequential state below clears all
-    // stale bits.  This keeps the precise ordering invariant while removing
-    // the alloc_seq -> pick_oldest8 -> barrier_blocked combinational path.
+    wire [DQ_DEPTH-1:0] issue_clear_vec =
+        main_payload_capture
+            ? ({{(DQ_DEPTH-1){1'b0}}, 1'b1} << main_hold_sel)
+            : {DQ_DEPTH{1'b0}};
+
+    wire [DQ_DEPTH-1:0] fast_issue_clear_vec =
+        fast_payload_capture
+            ? ({{(DQ_DEPTH-1){1'b0}}, 1'b1} << fast_hold_sel)
+            : {DQ_DEPTH{1'b0}};
+
+    wire [DQ_DEPTH-1:0] state_clear_vec =
+        issue_clear_vec |
+        fast_issue_clear_vec;
+
+    reg barrier_release_reg;
+
     wire has_serializing_op = |serializing_mask;
+
     assign next_barrier_pick = pick_oldest8(
         serializing_mask,
-        alloc_seq[0], alloc_seq[1], alloc_seq[2], alloc_seq[3],
-        alloc_seq[4], alloc_seq[5], alloc_seq[6], alloc_seq[7]);
-    assign next_barrier_found = has_serializing_op && next_barrier_pick[3];
-    assign next_barrier_seq = alloc_seq[next_barrier_pick[2:0]];
+        alloc_seq[0],
+        alloc_seq[1],
+        alloc_seq[2],
+        alloc_seq[3],
+        alloc_seq[4],
+        alloc_seq[5],
+        alloc_seq[6],
+        alloc_seq[7]
+    );
+
+    assign next_barrier_found =
+        has_serializing_op &&
+        next_barrier_pick[3];
+
+    assign next_barrier_seq =
+        alloc_seq[next_barrier_pick[2:0]];
+
     assign barrier_blocks_new = barrier_active;
 
-    // The general issue path is an out-of-order scheduler path.  A ready
-    // branch, load/store, MDU or CSR uop does not wait for an older unresolved
-    // uop.  ROB commit order remains precise, while LSU/memory-order logic is
-    // responsible for load/store ordering.  Only the explicit serializing
-    // barrier state blocks younger entries.
-    wire [DQ_DEPTH-1:0] main_candidate = valid & slot_ready & ~barrier_blocked &
-        ~store_select_block & ~fast_hold_onehot & ~issue_pending_onehot &
+    wire [DQ_DEPTH-1:0] main_candidate =
+        valid &
+        slot_ready &
+        ~barrier_blocked &
+        ~store_select_block &
+        ~fast_hold_onehot &
+        ~issue_pending_onehot &
         ~fast_pending_onehot;
+
     wire [3:0] oldest_main_pick = pick_oldest8(
         main_candidate,
-        alloc_seq[0], alloc_seq[1], alloc_seq[2], alloc_seq[3],
-        alloc_seq[4], alloc_seq[5], alloc_seq[6], alloc_seq[7]);
+        alloc_seq[0],
+        alloc_seq[1],
+        alloc_seq[2],
+        alloc_seq[3],
+        alloc_seq[4],
+        alloc_seq[5],
+        alloc_seq[6],
+        alloc_seq[7]
+    );
 
-    // When the oldest ready uop can run on ALU1, prefer a second ready uop
-    // which requires lane0 (LSU/MDU/branch).  The fast selector below then
-    // chooses the original oldest ALU uop, so both issue in the same cycle.
-    // A lane0-only entry is disjoint from a slot_fast_eligible entry by the
-    // classification above (loads/stores and unrestricted ALU uops cannot be
-    // lane0-only).  Therefore the resource-pair case needs one selector; the
-    // previous eight exclusion scans replicated the whole age tournament.
-    wire [DQ_DEPTH-1:0] lane0_candidate = main_candidate & slot_lane0_only &
-                                           ~main_hold_onehot;
+    wire [DQ_DEPTH-1:0] lane0_candidate =
+        main_candidate &
+        slot_lane0_only &
+        ~main_hold_onehot;
+
     wire [3:0] lane0_pair_pick = pick_oldest8(
         lane0_candidate,
-        alloc_seq[0], alloc_seq[1], alloc_seq[2], alloc_seq[3],
-        alloc_seq[4], alloc_seq[5], alloc_seq[6], alloc_seq[7]);
-    wire [3:0] rr_main_pick = pick_round_robin8(main_candidate, main_rr_ptr);
-    wire use_resource_pair = RESOURCE_AWARE_PAIRING && !ROUND_ROBIN_SELECT &&
-                             !main_hold_valid &&
-                             oldest_main_pick[3] &&
-                             slot_fast_eligible[oldest_main_pick[2:0]] &&
-                             lane0_pair_pick[3];
-    wire [3:0] main_pick = ROUND_ROBIN_SELECT ? rr_main_pick :
-                            (use_resource_pair ? lane0_pair_pick :
-                                                 oldest_main_pick);
-    wire [DQ_DEPTH-1:0] main_refill_candidate = main_candidate &
-                                                 ~main_hold_onehot;
-    assign main_refill_pick = ROUND_ROBIN_SELECT ?
-        pick_round_robin8(main_refill_candidate, main_rr_ptr) :
-        pick_oldest8(main_refill_candidate,
-                     alloc_seq[0], alloc_seq[1], alloc_seq[2], alloc_seq[3],
-                     alloc_seq[4], alloc_seq[5], alloc_seq[6], alloc_seq[7]);
-    assign issue_found = main_hold_valid ?
-        (valid[main_hold_sel] && !issue_pending_onehot[main_hold_sel] &&
-         !fast_pending_onehot[main_hold_sel]) : main_pick[3];
-    assign issue_sel = main_hold_valid ? main_hold_sel : main_pick[2:0];
+        alloc_seq[0],
+        alloc_seq[1],
+        alloc_seq[2],
+        alloc_seq[3],
+        alloc_seq[4],
+        alloc_seq[5],
+        alloc_seq[6],
+        alloc_seq[7]
+    );
 
-    // Lane1 selects independently from lane0's live candidate/pick result.
-    // It consumes only lane0's registered select ownership.  If both lanes
-    // capture the same previously-unowned slot on one edge, the registered
-    // index comparison below gives ownership to lane0 and makes lane1 retry;
-    // no wide payload or slot state crosses that conflict boundary.
-    wire [DQ_DEPTH-1:0] fast_candidate = valid & slot_ready & ~barrier_blocked &
-        slot_fast_eligible & ~store_select_block & ~main_hold_onehot &
-        ~issue_pending_onehot & ~fast_pending_onehot;
+    wire [3:0] rr_main_pick =
+        pick_round_robin8(
+            main_candidate,
+            main_rr_ptr
+        );
+
+    wire use_resource_pair =
+        RESOURCE_AWARE_PAIRING &&
+        !ROUND_ROBIN_SELECT &&
+        !main_hold_valid &&
+        oldest_main_pick[3] &&
+        slot_fast_eligible[oldest_main_pick[2:0]] &&
+        lane0_pair_pick[3];
+
+    wire [3:0] main_pick =
+        ROUND_ROBIN_SELECT
+            ? rr_main_pick
+            : (
+                use_resource_pair
+                    ? lane0_pair_pick
+                    : oldest_main_pick
+            );
+
+    wire [DQ_DEPTH-1:0] main_refill_candidate =
+        main_candidate &
+        ~main_hold_onehot;
+
+    assign main_refill_pick =
+        ROUND_ROBIN_SELECT
+            ? pick_round_robin8(
+                main_refill_candidate,
+                main_rr_ptr
+            )
+            : pick_oldest8(
+                main_refill_candidate,
+                alloc_seq[0],
+                alloc_seq[1],
+                alloc_seq[2],
+                alloc_seq[3],
+                alloc_seq[4],
+                alloc_seq[5],
+                alloc_seq[6],
+                alloc_seq[7]
+            );
+
+    assign issue_found =
+        main_hold_valid
+            ? (
+                valid[main_hold_sel] &&
+                !issue_pending_onehot[main_hold_sel] &&
+                !fast_pending_onehot[main_hold_sel]
+            )
+            : main_pick[3];
+
+    assign issue_sel =
+        main_hold_valid
+            ? main_hold_sel
+            : main_pick[2:0];
+
+    wire [DQ_DEPTH-1:0] fast_candidate =
+        valid &
+        slot_ready &
+        ~barrier_blocked &
+        slot_fast_eligible &
+        ~store_select_block &
+        ~main_hold_onehot &
+        ~issue_pending_onehot &
+        ~fast_pending_onehot;
+
     wire [3:0] oldest_fast_pick = pick_oldest8(
         fast_candidate,
-        alloc_seq[0], alloc_seq[1], alloc_seq[2], alloc_seq[3],
-        alloc_seq[4], alloc_seq[5], alloc_seq[6], alloc_seq[7]);
-    wire [3:0] rr_fast_pick = pick_round_robin8(fast_candidate, fast_rr_ptr);
-    wire [3:0] fast_pick = ROUND_ROBIN_SELECT ? rr_fast_pick :
-                                               oldest_fast_pick;
-    wire registered_select_collision = main_hold_valid && fast_hold_valid &&
-                                       (main_hold_sel == fast_hold_sel);
-    assign fast_issue_found = fast_hold_valid ?
-        (valid[fast_hold_sel] && !issue_pending_onehot[fast_hold_sel] &&
-         !fast_pending_onehot[fast_hold_sel] &&
-         !registered_select_collision) : fast_pick[3];
-    assign fast_issue_sel = fast_hold_valid ? fast_hold_sel : fast_pick[2:0];
+        alloc_seq[0],
+        alloc_seq[1],
+        alloc_seq[2],
+        alloc_seq[3],
+        alloc_seq[4],
+        alloc_seq[5],
+        alloc_seq[6],
+        alloc_seq[7]
+    );
+
+    wire [3:0] rr_fast_pick =
+        pick_round_robin8(
+            fast_candidate,
+            fast_rr_ptr
+        );
+
+    wire [3:0] fast_pick =
+        ROUND_ROBIN_SELECT
+            ? rr_fast_pick
+            : oldest_fast_pick;
+
+    wire registered_select_collision =
+        main_hold_valid &&
+        fast_hold_valid &&
+        (main_hold_sel == fast_hold_sel);
+
+    assign fast_issue_found =
+        fast_hold_valid
+            ? (
+                valid[fast_hold_sel] &&
+                !issue_pending_onehot[fast_hold_sel] &&
+                !fast_pending_onehot[fast_hold_sel] &&
+                !registered_select_collision
+            )
+            : fast_pick[3];
+
+    assign fast_issue_sel =
+        fast_hold_valid
+            ? fast_hold_sel
+            : fast_pick[2:0];
+
     always @(*) begin
         enq_sel = 3'h0;
         enq1_sel = 3'h0;
         free_found = 1'b0;
         second_free_found = 1'b0;
+
         for (k = 0; k < DQ_DEPTH; k = k + 1) begin
-            // Enqueue only into slots that were already free at the start of
-            // the cycle.  Do not feed issue/age selection back into every
-            // queue data-register D input through same-cycle slot reuse.
             if (!valid[k]) begin
                 if (!free_found) begin
                     free_found = 1'b1;
                     enq_sel = k[2:0];
-                end else if (!second_free_found && (k[2:0] != enq_sel)) begin
+                end else if (
+                    !second_free_found &&
+                    (k[2:0] != enq_sel)
+                ) begin
                     second_free_found = 1'b1;
                     enq1_sel = k[2:0];
                 end
@@ -919,131 +1139,226 @@ module DispatchQueue #(
         end
     end
 
-    assign issue_fire = issue_valid[0] && issue_ready[0];
-    assign fast_issue_fire = issue_valid[1] && issue_ready[1];
-    assign enq_fire = enq_valid && enq_ready[0];
-    assign enq1_fire = enq1_valid && enq_ready[1];
+    assign issue_fire =
+        issue_valid[0] &&
+        issue_ready[0];
 
-    // Store authorization is a registered ownership transfer.  Scheduler's
-    // credit/admit feedback can stall draining the compact FIFO, but it cannot
-    // reach a wide payload/token register enable in the same cycle.  At most
-    // one waiting hold receives a grant per cycle.
-    wire main_hold_is_store = main_hold_valid && valid[main_hold_sel] &&
-                              is_ld_st[main_hold_sel] &&
-                              (ram_we[main_hold_sel] != `RAM_WE_N);
-    wire fast_hold_is_store = fast_hold_valid && valid[fast_hold_sel] &&
-                              is_ld_st[fast_hold_sel] &&
-                              (ram_we[fast_hold_sel] != `RAM_WE_N);
-    wire store_lane1_is_older = main_hold_is_store && fast_hold_is_store &&
-                                uop_is_younger(uop_id[main_hold_sel],
-                                               uop_id[fast_hold_sel]);
-    wire main_store_needs_grant = main_hold_is_store &&
-                                  !main_hold_store_grant_q;
-    wire fast_store_needs_grant = fast_hold_is_store &&
-                                  !fast_hold_store_grant_q;
+    assign fast_issue_fire =
+        issue_valid[1] &&
+        issue_ready[1];
 
-    // The common Store path reserves credit on the same edge that captures
-    // its select index.  Thus the existing select->payload pipeline depth is
-    // preserved; the registered grant, rather than a live admit signal, is
-    // what authorizes payload/token transfer on the following cycle.
-    wire main_new_store_candidate = !main_hold_valid && main_pick[3] &&
-                                    is_ld_st[main_pick[2:0]] &&
-                                    (ram_we[main_pick[2:0]] != `RAM_WE_N);
-    wire fast_new_store_candidate = !fast_hold_valid && fast_issue_found &&
-                                    is_ld_st[fast_pick[2:0]] &&
-                                    (ram_we[fast_pick[2:0]] != `RAM_WE_N);
-    wire new_store_lane1_is_older = main_new_store_candidate &&
-                                    fast_new_store_candidate &&
-                                    uop_is_younger(uop_id[main_pick[2:0]],
-                                                   uop_id[fast_pick[2:0]]);
-    wire new_store_grant_available = store_reservation_available &&
-                                     !main_store_needs_grant &&
-                                     !fast_store_needs_grant;
-    wire main_new_store_grant = main_new_store_candidate &&
-                                new_store_grant_available &&
-                                (!fast_new_store_candidate ||
-                                 !new_store_lane1_is_older);
-    wire fast_new_store_grant = fast_new_store_candidate &&
-                                new_store_grant_available &&
-                                (!main_new_store_candidate ||
-                                 new_store_lane1_is_older);
-    assign main_select_capture = !flush && !system_flush &&
-                                 !main_hold_valid && main_pick[3] &&
-                                 (!main_new_store_candidate ||
-                                  main_new_store_grant);
-    assign fast_select_capture = !flush && !system_flush &&
-                                 !fast_hold_valid && fast_issue_found &&
-                                 (!fast_new_store_candidate ||
-                                  fast_new_store_grant);
+    assign enq_fire =
+        enq_valid &&
+        enq_ready[0];
 
-    wire main_store_grant_set = store_reservation_available &&
-                                main_store_needs_grant &&
-                                (!fast_store_needs_grant ||
-                                 !store_lane1_is_older);
-    wire fast_store_grant_set = store_reservation_available &&
-                                fast_store_needs_grant &&
-                                (!main_store_needs_grant ||
-                                 store_lane1_is_older);
+    assign enq1_fire =
+        enq1_valid &&
+        enq_ready[1];
 
-    // The payload/token boundary is single-Store wide.  If both holds already
-    // own grants, the older Store transfers first; the younger grant remains
-    // attached to its hold for the following cycle.
-    wire main_store_payload_allow = main_hold_store_grant_q &&
-                                    (!fast_hold_store_grant_q ||
-                                     !fast_hold_is_store ||
-                                     !store_lane1_is_older);
-    wire fast_store_payload_allow = fast_hold_store_grant_q &&
-                                    (!main_hold_store_grant_q ||
-                                     !main_hold_is_store ||
-                                     store_lane1_is_older);
-    wire main_hold_store_blocked = main_hold_is_store &&
-                                   !main_hold_store_grant_q &&
-                                   !main_store_grant_set &&
-                                   !store_reservation_available;
-    wire fast_hold_store_blocked = fast_hold_is_store &&
-                                   !fast_hold_store_grant_q &&
-                                   !fast_store_grant_set &&
-                                   !store_reservation_available;
+    wire main_hold_is_store =
+        main_hold_valid &&
+        valid[main_hold_sel] &&
+        is_ld_st[main_hold_sel] &&
+        (ram_we[main_hold_sel] != `RAM_WE_N);
 
-    // A Store crosses the DQ ownership boundary together with its compact
-    // token.  Payload capture consults only the registered hold grant.
-    assign main_payload_space = !issue_payload_valid_q || issue_fire;
-    assign fast_payload_space = !fast_payload_valid_q || fast_issue_fire;
-    assign main_payload_capture = !flush && !system_flush &&
-        main_hold_valid && issue_found &&
+    wire fast_hold_is_store =
+        fast_hold_valid &&
+        valid[fast_hold_sel] &&
+        is_ld_st[fast_hold_sel] &&
+        (ram_we[fast_hold_sel] != `RAM_WE_N);
+
+    wire store_lane1_is_older =
+        main_hold_is_store &&
+        fast_hold_is_store &&
+        uop_is_younger(
+            uop_id[main_hold_sel],
+            uop_id[fast_hold_sel]
+        );
+
+    wire main_store_needs_grant =
+        main_hold_is_store &&
+        !main_hold_store_grant_q;
+
+    wire fast_store_needs_grant =
+        fast_hold_is_store &&
+        !fast_hold_store_grant_q;
+
+    wire main_new_store_candidate =
+        !main_hold_valid &&
+        main_pick[3] &&
+        is_ld_st[main_pick[2:0]] &&
+        (ram_we[main_pick[2:0]] != `RAM_WE_N);
+
+    wire fast_new_store_candidate =
+        !fast_hold_valid &&
+        fast_issue_found &&
+        is_ld_st[fast_pick[2:0]] &&
+        (ram_we[fast_pick[2:0]] != `RAM_WE_N);
+
+    wire new_store_lane1_is_older =
+        main_new_store_candidate &&
+        fast_new_store_candidate &&
+        uop_is_younger(
+            uop_id[main_pick[2:0]],
+            uop_id[fast_pick[2:0]]
+        );
+
+    wire new_store_grant_available =
+        store_reservation_available &&
+        !main_store_needs_grant &&
+        !fast_store_needs_grant;
+
+    wire main_new_store_grant =
+        main_new_store_candidate &&
+        new_store_grant_available &&
+        (
+            !fast_new_store_candidate ||
+            !new_store_lane1_is_older
+        );
+
+    wire fast_new_store_grant =
+        fast_new_store_candidate &&
+        new_store_grant_available &&
+        (
+            !main_new_store_candidate ||
+            new_store_lane1_is_older
+        );
+
+    assign main_select_capture =
+        !flush &&
+        !system_flush &&
+        !main_hold_valid &&
+        main_pick[3] &&
+        (
+            !main_new_store_candidate ||
+            main_new_store_grant
+        );
+
+    assign fast_select_capture =
+        !flush &&
+        !system_flush &&
+        !fast_hold_valid &&
+        fast_issue_found &&
+        (
+            !fast_new_store_candidate ||
+            fast_new_store_grant
+        );
+
+    wire main_store_grant_set =
+        store_reservation_available &&
+        main_store_needs_grant &&
+        (
+            !fast_store_needs_grant ||
+            !store_lane1_is_older
+        );
+
+    wire fast_store_grant_set =
+        store_reservation_available &&
+        fast_store_needs_grant &&
+        (
+            !main_store_needs_grant ||
+            store_lane1_is_older
+        );
+
+    wire main_store_payload_allow =
+        main_hold_store_grant_q &&
+        (
+            !fast_hold_store_grant_q ||
+            !fast_hold_is_store ||
+            !store_lane1_is_older
+        );
+
+    wire fast_store_payload_allow =
+        fast_hold_store_grant_q &&
+        (
+            !main_hold_store_grant_q ||
+            !main_hold_is_store ||
+            store_lane1_is_older
+        );
+
+    wire main_hold_store_blocked =
+        main_hold_is_store &&
+        !main_hold_store_grant_q &&
+        !main_store_grant_set &&
+        !store_reservation_available;
+
+    wire fast_hold_store_blocked =
+        fast_hold_is_store &&
+        !fast_hold_store_grant_q &&
+        !fast_store_grant_set &&
+        !store_reservation_available;
+
+    assign main_payload_space =
+        !issue_payload_valid_q ||
+        issue_fire;
+
+    assign fast_payload_space =
+        !fast_payload_valid_q ||
+        fast_issue_fire;
+
+    assign main_payload_capture =
+        !flush &&
+        !system_flush &&
+        main_hold_valid &&
+        issue_found &&
         main_payload_space &&
-        (!main_hold_is_store || main_store_payload_allow);
-    assign fast_payload_capture = !flush && !system_flush &&
-        fast_hold_valid && fast_issue_found &&
+        (
+            !main_hold_is_store ||
+            main_store_payload_allow
+        );
+
+    assign fast_payload_capture =
+        !flush &&
+        !system_flush &&
+        fast_hold_valid &&
+        fast_issue_found &&
         fast_payload_space &&
-        (!fast_hold_is_store || fast_store_payload_allow);
+        (
+            !fast_hold_is_store ||
+            fast_store_payload_allow
+        );
 
-    // Refill the select stage in the same edge as payload transfer for the
-    // common non-Store case.  Store refills are deliberately deferred one
-    // cycle so the single Store-token boundary remains unambiguous.
-    wire main_refill_selected_store = main_refill_pick[3] &&
-                                      is_ld_st[main_refill_pick[2:0]] &&
-                                      (ram_we[main_refill_pick[2:0]] != `RAM_WE_N);
-    wire fast_refill_selected_store = fast_refill_pick[3] &&
-                                      is_ld_st[fast_refill_pick[2:0]] &&
-                                      (ram_we[fast_refill_pick[2:0]] != `RAM_WE_N);
-    assign main_refill_valid = main_payload_capture &&
-                               !main_hold_is_store &&
-                               !main_refill_selected_store &&
-                               main_refill_pick[3];
-    assign fast_refill_valid = fast_payload_capture &&
-                               !fast_hold_is_store &&
-                               !fast_refill_selected_store &&
-                               fast_refill_pick[3];
+    wire main_refill_selected_store =
+        main_refill_pick[3] &&
+        is_ld_st[main_refill_pick[2:0]] &&
+        (ram_we[main_refill_pick[2:0]] != `RAM_WE_N);
 
-    wire issue_store_fire = main_payload_capture && main_hold_is_store;
-    wire fast_store_fire = fast_payload_capture && fast_hold_is_store;
-    wire store_token_push = issue_store_fire || fast_store_fire;
-    wire store_token_pop = (store_token_count_q != 2'd0) &&
-                           store_issue_pending_ready;
-    // A granted Store has already consumed local capacity.  Do not re-check
-    // Scheduler admit here; doing so would split payload and token ownership.
-    wire store_token_push_accept = store_token_push;
+    wire fast_refill_selected_store =
+        fast_refill_pick[3] &&
+        is_ld_st[fast_refill_pick[2:0]] &&
+        (ram_we[fast_refill_pick[2:0]] != `RAM_WE_N);
+
+    assign main_refill_valid =
+        main_payload_capture &&
+        !main_hold_is_store &&
+        !main_refill_selected_store &&
+        main_refill_pick[3];
+
+    assign fast_refill_valid =
+        fast_payload_capture &&
+        !fast_hold_is_store &&
+        !fast_refill_selected_store &&
+        fast_refill_pick[3];
+
+    wire issue_store_fire =
+        main_payload_capture &&
+        main_hold_is_store;
+
+    wire fast_store_fire =
+        fast_payload_capture &&
+        fast_hold_is_store;
+
+    wire store_token_push =
+        issue_store_fire ||
+        fast_store_fire;
+
+    wire store_token_pop =
+        (store_token_count_q != 2'd0) &&
+        store_issue_pending_ready;
+
+    wire store_token_push_accept =
+        store_token_push;
+
     store_token_t store_token_push_entry;
     integer token_recover_i;
     integer token_recover_count;
@@ -1052,30 +1367,67 @@ module DispatchQueue #(
 
     always @(*) begin
         store_token_push_entry = '0;
+
         if (issue_store_fire) begin
-            store_token_push_entry.uop_id = uop_id[main_hold_sel];
-            store_token_push_entry.pc = pc[main_hold_sel];
-            store_token_push_entry.store_mask = ram_we[main_hold_sel];
-            store_token_push_entry.src1_id = src1_id[main_hold_sel];
+            store_token_push_entry.uop_id =
+                uop_id[main_hold_sel];
+
+            store_token_push_entry.pc =
+                pc[main_hold_sel];
+
+            store_token_push_entry.store_mask =
+                ram_we[main_hold_sel];
+
+            store_token_push_entry.src1_id =
+                src1_id[main_hold_sel];
         end else if (fast_store_fire) begin
-            store_token_push_entry.uop_id = uop_id[fast_hold_sel];
-            store_token_push_entry.pc = pc[fast_hold_sel];
-            store_token_push_entry.store_mask = ram_we[fast_hold_sel];
-            store_token_push_entry.src1_id = src1_id[fast_hold_sel];
+            store_token_push_entry.uop_id =
+                uop_id[fast_hold_sel];
+
+            store_token_push_entry.pc =
+                pc[fast_hold_sel];
+
+            store_token_push_entry.store_mask =
+                ram_we[fast_hold_sel];
+
+            store_token_push_entry.src1_id =
+                src1_id[fast_hold_sel];
         end
 
         token_recover_count = 0;
         token_recover_entry0 = '0;
         token_recover_entry1 = '0;
-        for (token_recover_i = 0; token_recover_i < 2; token_recover_i = token_recover_i + 1) begin
-            if ((token_recover_i < store_token_count_q) &&
-                !uop_is_younger(store_token_fifo_q[store_token_head_q ^ token_recover_i[0]].uop_id,
-                                recover_id)) begin
+
+        for (
+            token_recover_i = 0;
+            token_recover_i < 2;
+            token_recover_i = token_recover_i + 1
+        ) begin
+            if (
+                (token_recover_i < store_token_count_q) &&
+                !uop_is_younger(
+                    store_token_fifo_q[
+                        store_token_head_q ^
+                        token_recover_i[0]
+                    ].uop_id,
+                    recover_id
+                )
+            ) begin
                 if (token_recover_count == 0)
-                    token_recover_entry0 = store_token_fifo_q[store_token_head_q ^ token_recover_i[0]];
+                    token_recover_entry0 =
+                        store_token_fifo_q[
+                            store_token_head_q ^
+                            token_recover_i[0]
+                        ];
                 else if (token_recover_count == 1)
-                    token_recover_entry1 = store_token_fifo_q[store_token_head_q ^ token_recover_i[0]];
-                token_recover_count = token_recover_count + 1;
+                    token_recover_entry1 =
+                        store_token_fifo_q[
+                            store_token_head_q ^
+                            token_recover_i[0]
+                        ];
+
+                token_recover_count =
+                    token_recover_count + 1;
             end
         end
     end
@@ -1087,220 +1439,418 @@ module DispatchQueue #(
             store_token_count_q <= 2'd0;
             store_token_fifo_q[0] <= '0;
             store_token_fifo_q[1] <= '0;
-        end else if (system_flush || (flush && !recover_valid)) begin
+        end else if (
+            system_flush ||
+            (flush && !recover_valid)
+        ) begin
             store_token_head_q <= 1'b0;
             store_token_tail_q <= 1'b0;
             store_token_count_q <= 2'd0;
         end else if (flush) begin
-            // A recover flush may retain an already-issued older Store.  Only
-            // the compact ownership records participate in recovery.
             store_token_head_q <= 1'b0;
-            // Normalized two-entry ring: tail is count modulo two.
             store_token_tail_q <= token_recover_count[0];
             store_token_count_q <= token_recover_count[1:0];
             store_token_fifo_q[0] <= token_recover_entry0;
             store_token_fifo_q[1] <= token_recover_entry1;
         end else begin
-            case ({store_token_push_accept, store_token_pop})
+            case ({
+                store_token_push_accept,
+                store_token_pop
+            })
                 2'b10: begin
-                    store_token_fifo_q[store_token_tail_q] <= store_token_push_entry;
-                    store_token_tail_q <= ~store_token_tail_q;
-                    store_token_count_q <= store_token_count_q + 2'd1;
+                    store_token_fifo_q[store_token_tail_q] <=
+                        store_token_push_entry;
+
+                    store_token_tail_q <=
+                        ~store_token_tail_q;
+
+                    store_token_count_q <=
+                        store_token_count_q + 2'd1;
                 end
+
                 2'b01: begin
-                    store_token_head_q <= ~store_token_head_q;
-                    store_token_count_q <= store_token_count_q - 2'd1;
+                    store_token_head_q <=
+                        ~store_token_head_q;
+
+                    store_token_count_q <=
+                        store_token_count_q - 2'd1;
                 end
+
                 2'b11: begin
-                    store_token_fifo_q[store_token_tail_q] <= store_token_push_entry;
-                    store_token_tail_q <= ~store_token_tail_q;
-                    store_token_head_q <= ~store_token_head_q;
+                    store_token_fifo_q[store_token_tail_q] <=
+                        store_token_push_entry;
+
+                    store_token_tail_q <=
+                        ~store_token_tail_q;
+
+                    store_token_head_q <=
+                        ~store_token_head_q;
                 end
-                default: begin end
+
+                default: begin
+                end
             endcase
         end
     end
 
-    // All entries already resident in the queue are older than a newly
-    // accepted dispatch packet.  Capture that fact when initializing the
-    // registered ordering masks; the second packet also sees a first-packet
-    // Store/branch accepted on the same edge.
-    wire enq_has_older_store = |live_store_mask;
-    wire enq_has_older_branch = |live_branch_mask;
-    wire enq_is_load = enq_is_ld_st && (enq_ram_we == `RAM_WE_N);
-    wire enq1_is_load = enq1_is_ld_st && (enq1_ram_we == `RAM_WE_N);
-    wire enq_is_store = enq_is_ld_st && (enq_ram_we != `RAM_WE_N);
-    wire enq1_is_store = enq1_is_ld_st && (enq1_ram_we != `RAM_WE_N);
-    wire enq_order_store_blocked = enq_is_load && enq_has_older_store;
-    wire enq1_order_store_blocked = enq1_is_load &&
-        (enq_has_older_store || (enq_fire && enq_is_store));
-    wire enq_order_branch_blocked = enq_is_br_jmp && enq_has_older_branch;
-    wire enq1_order_branch_blocked = enq1_is_br_jmp &&
-        (enq_has_older_branch || (enq_fire && enq_is_br_jmp));
+    always @(posedge clk or negedge rstn) begin
+        if (!rstn) begin
+            store_select_credit_q <= 1'b0;
+        end else if (flush || system_flush) begin
+            store_select_credit_q <= 1'b0;
+        end else begin
+            store_select_credit_q <=
+                store_issue_pending_admit &&
+                (store_reserved_count == 3'd0);
+        end
+    end
 
-    // Build the exact next registered Store-order mask.  It describes only
-    // live Loads which still have an older Store in the DQ.  The next-state
-    // view accounts for payload clears, recovery survivors, system flush, and
-    // both same-edge enqueue slots before the scalar reduction is registered.
-    // The selector consumes only that scalar register; the eight age bits and
-    // their reduction therefore terminate here instead of continuing through
-    // candidate/hold selection.
+    wire enq_has_older_store =
+        |live_store_mask;
+
+    wire enq_has_older_branch =
+        |live_branch_mask;
+
+    wire enq_is_load =
+        enq_is_ld_st &&
+        (enq_ram_we == `RAM_WE_N);
+
+    wire enq1_is_load =
+        enq1_is_ld_st &&
+        (enq1_ram_we == `RAM_WE_N);
+
+    wire enq_is_store =
+        enq_is_ld_st &&
+        (enq_ram_we != `RAM_WE_N);
+
+    wire enq1_is_store =
+        enq1_is_ld_st &&
+        (enq1_ram_we != `RAM_WE_N);
+
+    wire enq_order_store_blocked =
+        enq_is_load &&
+        enq_has_older_store;
+
+    wire enq1_order_store_blocked =
+        enq1_is_load &&
+        (
+            enq_has_older_store ||
+            (enq_fire && enq_is_store)
+        );
+
+    wire enq_order_branch_blocked =
+        enq_is_br_jmp &&
+        enq_has_older_branch;
+
+    wire enq1_order_branch_blocked =
+        enq1_is_br_jmp &&
+        (
+            enq_has_older_branch ||
+            (enq_fire && enq_is_br_jmp)
+        );
+
     reg [DQ_DEPTH-1:0] older_store_pending_refresh;
     reg [DQ_DEPTH-1:0] store_order_next_valid;
     reg [DQ_DEPTH-1:0] store_order_next_is_load;
     reg [DQ_DEPTH-1:0] store_order_next_is_store;
     reg [DQ_SEQ_W-1:0] store_order_next_seq [0:DQ_DEPTH-1];
-    wire older_store_any_refresh = |older_store_pending_refresh;
+    wire older_store_any_refresh =
+        |older_store_pending_refresh;
+
     integer store_next_q;
     integer store_next_old;
+
     always @(*) begin
-        older_store_pending_refresh = {DQ_DEPTH{1'b0}};
-        store_order_next_valid = valid;
-        store_order_next_is_load = {DQ_DEPTH{1'b0}};
-        store_order_next_is_store = {DQ_DEPTH{1'b0}};
-        for (store_next_q = 0; store_next_q < DQ_DEPTH;
-             store_next_q = store_next_q + 1) begin
-            store_order_next_seq[store_next_q] = alloc_seq[store_next_q];
+        older_store_pending_refresh =
+            {DQ_DEPTH{1'b0}};
+
+        store_order_next_valid =
+            valid;
+
+        store_order_next_is_load =
+            {DQ_DEPTH{1'b0}};
+
+        store_order_next_is_store =
+            {DQ_DEPTH{1'b0}};
+
+        for (
+            store_next_q = 0;
+            store_next_q < DQ_DEPTH;
+            store_next_q = store_next_q + 1
+        ) begin
+            store_order_next_seq[store_next_q] =
+                alloc_seq[store_next_q];
+
             store_order_next_is_load[store_next_q] =
-                valid[store_next_q] && is_ld_st[store_next_q] &&
+                valid[store_next_q] &&
+                is_ld_st[store_next_q] &&
                 (ram_we[store_next_q] == `RAM_WE_N);
+
             store_order_next_is_store[store_next_q] =
-                valid[store_next_q] && is_ld_st[store_next_q] &&
+                valid[store_next_q] &&
+                is_ld_st[store_next_q] &&
                 (ram_we[store_next_q] != `RAM_WE_N);
         end
 
         if (flush || system_flush) begin
-            store_order_next_valid = {DQ_DEPTH{1'b0}};
-            store_order_next_is_load = {DQ_DEPTH{1'b0}};
-            store_order_next_is_store = {DQ_DEPTH{1'b0}};
-            if (flush && recover_valid && !system_flush) begin
-                for (store_next_q = 0; store_next_q < DQ_DEPTH;
-                     store_next_q = store_next_q + 1) begin
-                    if (valid[store_next_q] &&
-                        !uop_is_younger(uop_id[store_next_q], recover_id)) begin
-                        store_order_next_valid[store_next_q] = 1'b1;
+            store_order_next_valid =
+                {DQ_DEPTH{1'b0}};
+
+            store_order_next_is_load =
+                {DQ_DEPTH{1'b0}};
+
+            store_order_next_is_store =
+                {DQ_DEPTH{1'b0}};
+
+            if (
+                flush &&
+                recover_valid &&
+                !system_flush
+            ) begin
+                for (
+                    store_next_q = 0;
+                    store_next_q < DQ_DEPTH;
+                    store_next_q = store_next_q + 1
+                ) begin
+                    if (
+                        valid[store_next_q] &&
+                        !uop_is_younger(
+                            uop_id[store_next_q],
+                            recover_id
+                        )
+                    ) begin
+                        store_order_next_valid[store_next_q] =
+                            1'b1;
+
                         store_order_next_is_load[store_next_q] =
                             is_ld_st[store_next_q] &&
-                            (ram_we[store_next_q] == `RAM_WE_N);
+                            (
+                                ram_we[store_next_q] ==
+                                `RAM_WE_N
+                            );
+
                         store_order_next_is_store[store_next_q] =
                             is_ld_st[store_next_q] &&
-                            (ram_we[store_next_q] != `RAM_WE_N);
+                            (
+                                ram_we[store_next_q] !=
+                                `RAM_WE_N
+                            );
                     end
                 end
             end
         end else begin
-            store_order_next_valid = valid & ~state_clear_vec;
-            store_order_next_is_load = store_order_next_is_load &
-                                        ~state_clear_vec;
-            store_order_next_is_store = store_order_next_is_store &
-                                         ~state_clear_vec;
             if (enq_fire) begin
-                store_order_next_valid[enq_sel] = 1'b1;
-                store_order_next_is_load[enq_sel] = enq_is_load;
-                store_order_next_is_store[enq_sel] = enq_is_store;
-                store_order_next_seq[enq_sel] = next_alloc_seq;
+                store_order_next_valid[enq_sel] =
+                    1'b1;
+
+                store_order_next_is_load[enq_sel] =
+                    enq_is_load;
+
+                store_order_next_is_store[enq_sel] =
+                    enq_is_store;
+
+                store_order_next_seq[enq_sel] =
+                    next_alloc_seq;
             end
+
             if (enq1_fire) begin
-                store_order_next_valid[enq1_sel] = 1'b1;
-                store_order_next_is_load[enq1_sel] = enq1_is_load;
-                store_order_next_is_store[enq1_sel] = enq1_is_store;
+                store_order_next_valid[enq1_sel] =
+                    1'b1;
+
+                store_order_next_is_load[enq1_sel] =
+                    enq1_is_load;
+
+                store_order_next_is_store[enq1_sel] =
+                    enq1_is_store;
+
                 store_order_next_seq[enq1_sel] =
                     next_alloc_seq + enq_fire;
             end
         end
 
-        for (store_next_q = 0; store_next_q < DQ_DEPTH;
-             store_next_q = store_next_q + 1) begin
-            for (store_next_old = 0; store_next_old < DQ_DEPTH;
-                 store_next_old = store_next_old + 1) begin
-                if (store_order_next_valid[store_next_q] &&
+        for (
+            store_next_q = 0;
+            store_next_q < DQ_DEPTH;
+            store_next_q = store_next_q + 1
+        ) begin
+            for (
+                store_next_old = 0;
+                store_next_old < DQ_DEPTH;
+                store_next_old = store_next_old + 1
+            ) begin
+                if (
+                    store_order_next_valid[store_next_q] &&
                     store_order_next_is_load[store_next_q] &&
                     store_order_next_valid[store_next_old] &&
                     store_order_next_is_store[store_next_old] &&
-                    seq_is_older(store_order_next_seq[store_next_old],
-                                 store_order_next_seq[store_next_q]))
-                    older_store_pending_refresh[store_next_q] = 1'b1;
+                    seq_is_older(
+                        store_order_next_seq[store_next_old],
+                        store_order_next_seq[store_next_q]
+                    )
+                )
+                    older_store_pending_refresh[store_next_q] =
+                        1'b1;
             end
         end
 
-        // Preserve the existing conservative admission rule for a Load
-        // accepted on the same edge as a resident Store leaves the DQ.  The
-        // overrides are applied before the registered scalar is reduced, so
-        // the mask and older_store_any_q cannot disagree.
         if (!flush && !system_flush) begin
             if (enq_fire)
                 older_store_pending_refresh[enq_sel] =
                     enq_order_store_blocked;
+
             if (enq1_fire)
                 older_store_pending_refresh[enq1_sel] =
                     enq1_order_store_blocked;
         end
     end
 
-    assign enq_ready[0] = free_found;
-    assign enq_ready[1] = free_found && second_free_found;
-    assign issue_valid[0] = issue_payload_valid_q && !flush && !system_flush;
-    assign issue_valid[1] = fast_payload_valid_q && !flush && !system_flush;
+    assign enq_ready[0] =
+        free_found;
+
+    assign enq_ready[1] =
+        free_found &&
+        second_free_found;
+
+    assign issue_valid[0] =
+        issue_payload_valid_q &&
+        !flush &&
+        !system_flush;
+
+    assign issue_valid[1] =
+        fast_payload_valid_q &&
+        !flush &&
+        !system_flush;
 
     always @(*) begin
         issue_selected_payload[0] = '0;
-        issue_selected_payload[0].uop_id = uop_id[issue_sel];
-        issue_selected_payload[0].pc = pc[issue_sel];
-        issue_selected_payload[0].src0_value = rD1[issue_sel];
-        // An unresolved Store-data operand is allowed to cross the DQ
-        // boundary with its producer ID.  Preserve a narrow completion
-        // bypass only at that payload boundary so a completion coincident
-        // with capture cannot be lost.  It does not feed slot_ready or either
-        // selector.
-        issue_selected_payload[0].src1_value = main_hold_is_store ?
-                                                src1_value_eff[issue_sel] :
-                                                rD2[issue_sel];
-        issue_selected_payload[0].src1_ready = main_hold_is_store ?
-                                                src1_ready_eff[issue_sel] :
-                                                src1_ready[issue_sel];
-        issue_selected_payload[0].src1_id = src1_id[issue_sel];
-        issue_selected_payload[0].arch_rs1 = rR1[issue_sel];
-        issue_selected_payload[0].arch_rs2 = rR2[issue_sel];
-        issue_selected_payload[0].src0_used = rR1_re[issue_sel];
-        issue_selected_payload[0].src1_used = rR2_re[issue_sel];
-        issue_selected_payload[0].imm = ext[issue_sel];
-        issue_selected_payload[0].npc_op = npc_op[issue_sel];
-        issue_selected_payload[0].reg_write = rf_we[issue_sel];
-        issue_selected_payload[0].arch_rd = wR[issue_sel];
-        issue_selected_payload[0].result_sel = wd_sel[issue_sel];
-        issue_selected_payload[0].alu_op = alu_op[issue_sel];
-        issue_selected_payload[0].src_a_sel = alua_sel[issue_sel];
-        issue_selected_payload[0].src_b_sel = alub_sel[issue_sel];
-        issue_selected_payload[0].store_mask = ram_we[issue_sel];
-        issue_selected_payload[0].load_ext_op = ram_ext_op[issue_sel];
-        issue_selected_payload[0].is_br_jmp = is_br_jmp[issue_sel];
-        issue_selected_payload[0].is_ld_st = is_ld_st[issue_sel];
-        issue_selected_payload[0].is_call = is_call[issue_sel];
-        issue_selected_payload[0].is_ret = is_ret[issue_sel];
-        issue_selected_payload[0].system_op = system_op_e'(system_op[issue_sel]);
-        issue_selected_payload[0].csr_num = csr_num[issue_sel];
-        issue_selected_payload[0].cacop_op = cacop_op[issue_sel];
-        issue_selected_payload[0].serializing = serializing[issue_sel];
-        issue_selected_payload[0].pred.ras_ptr = ras_ptr[issue_sel];
-        issue_selected_payload[0].pred.valid = pred_valid[issue_sel];
-        issue_selected_payload[0].pred.taken = pred_taken[issue_sel];
-        issue_selected_payload[0].pred.target = pred_target[issue_sel];
-        issue_selected_payload[0].pred.index = pred_index[issue_sel];
-        issue_selected_payload[0].pred.ras_sp_before = ras_sp_before[issue_sel];
-        issue_selected_payload[0].pred.ras_count_before = ras_count_before[issue_sel];
-        issue_selected_payload[0].pred.perf_btb_hit = perf_btb_hit[issue_sel];
+        issue_selected_payload[0].uop_id =
+            uop_id[issue_sel];
+        issue_selected_payload[0].pc =
+            pc[issue_sel];
+        issue_selected_payload[0].src0_value =
+            rD1[issue_sel];
+
+        issue_selected_payload[0].src1_value =
+            main_hold_is_store
+                ? src1_value_eff[issue_sel]
+                : rD2[issue_sel];
+
+        issue_selected_payload[0].src1_ready =
+            main_hold_is_store
+                ? src1_ready_eff[issue_sel]
+                : src1_ready[issue_sel];
+
+        issue_selected_payload[0].src1_id =
+            src1_id[issue_sel];
+
+        issue_selected_payload[0].arch_rs1 =
+            rR1[issue_sel];
+
+        issue_selected_payload[0].arch_rs2 =
+            rR2[issue_sel];
+
+        issue_selected_payload[0].src0_used =
+            rR1_re[issue_sel];
+
+        issue_selected_payload[0].src1_used =
+            rR2_re[issue_sel];
+
+        issue_selected_payload[0].imm =
+            ext[issue_sel];
+
+        issue_selected_payload[0].npc_op =
+            npc_op[issue_sel];
+
+        issue_selected_payload[0].reg_write =
+            rf_we[issue_sel];
+
+        issue_selected_payload[0].arch_rd =
+            wR[issue_sel];
+
+        issue_selected_payload[0].result_sel =
+            wd_sel[issue_sel];
+
+        issue_selected_payload[0].alu_op =
+            alu_op[issue_sel];
+
+        issue_selected_payload[0].src_a_sel =
+            alua_sel[issue_sel];
+
+        issue_selected_payload[0].src_b_sel =
+            alub_sel[issue_sel];
+
+        issue_selected_payload[0].store_mask =
+            ram_we[issue_sel];
+
+        issue_selected_payload[0].load_ext_op =
+            ram_ext_op[issue_sel];
+
+        issue_selected_payload[0].is_br_jmp =
+            is_br_jmp[issue_sel];
+
+        issue_selected_payload[0].is_ld_st =
+            is_ld_st[issue_sel];
+
+        issue_selected_payload[0].is_call =
+            is_call[issue_sel];
+
+        issue_selected_payload[0].is_ret =
+            is_ret[issue_sel];
+
+        issue_selected_payload[0].system_op =
+            system_op_e'(system_op[issue_sel]);
+
+        issue_selected_payload[0].csr_num =
+            csr_num[issue_sel];
+
+        issue_selected_payload[0].cacop_op =
+            cacop_op[issue_sel];
+
+        issue_selected_payload[0].serializing =
+            serializing[issue_sel];
+
+        issue_selected_payload[0].pred.ras_ptr =
+            ras_ptr[issue_sel];
+
+        issue_selected_payload[0].pred.valid =
+            pred_valid[issue_sel];
+
+        issue_selected_payload[0].pred.taken =
+            pred_taken[issue_sel];
+
+        issue_selected_payload[0].pred.target =
+            pred_target[issue_sel];
+
+        issue_selected_payload[0].pred.index =
+            pred_index[issue_sel];
+
+        issue_selected_payload[0].pred.ras_sp_before =
+            ras_sp_before[issue_sel];
+
+        issue_selected_payload[0].pred.ras_count_before =
+            ras_count_before[issue_sel];
+
+        issue_selected_payload[0].pred.perf_btb_hit =
+            perf_btb_hit[issue_sel];
 
 `ifndef SYNTHESIS
-        perf_true_source_wait       = 1'b0;
-        perf_source_wait_dep_load   = 1'b0;
+        perf_true_source_wait = 1'b0;
+        perf_source_wait_dep_load = 1'b0;
         perf_source_wait_dep_muldiv = 1'b0;
-        perf_source_wait_dep_alu    = 1'b0;
+        perf_source_wait_dep_alu = 1'b0;
         perf_source_wait_dep_branch = 1'b0;
         perf_source_wait_store_addr = 1'b0;
         perf_source_wait_store_data = 1'b0;
-        perf_iq_no_ready            = (valid != {DQ_DEPTH{1'b0}}) && ((valid & slot_ready) == {DQ_DEPTH{1'b0}});
-        perf_lsu_order              = 1'b0;
-        perf_serializing            = 1'b0;
+
+        perf_iq_no_ready =
+            (valid != {DQ_DEPTH{1'b0}}) &&
+            (
+                (valid & slot_ready) ==
+                {DQ_DEPTH{1'b0}}
+            );
+
+        perf_lsu_order = 1'b0;
+        perf_serializing = 1'b0;
 
         if (perf_oldest_is_valid) begin
             begin : PERF_SOURCE_WAIT_EVAL
@@ -1312,262 +1862,768 @@ module DispatchQueue #(
                 producer_type_e s0_p;
                 producer_type_e s1_p;
 
-                s0_wait = rR1_re[perf_oldest_idx] && (rR1[perf_oldest_idx] != 5'd0) && !src0_ready_eff[perf_oldest_idx];
-                s1_wait = rR2_re[perf_oldest_idx] && (rR2[perf_oldest_idx] != 5'd0) && !src1_ready_eff[perf_oldest_idx];
+                s0_wait =
+                    rR1_re[perf_oldest_idx] &&
+                    (rR1[perf_oldest_idx] != 5'd0) &&
+                    !src0_ready_eff[perf_oldest_idx];
 
-                s0_t = src0_id[perf_oldest_idx].rob_tag;
-                s1_t = src1_id[perf_oldest_idx].rob_tag;
+                s1_wait =
+                    rR2_re[perf_oldest_idx] &&
+                    (rR2[perf_oldest_idx] != 5'd0) &&
+                    !src1_ready_eff[perf_oldest_idx];
 
-                s0_p = (s0_wait && producer_table[s0_t].valid && (producer_table[s0_t].epoch == src0_id[perf_oldest_idx].epoch)) ?
-                       producer_table[s0_t].ptype : PROD_UNKNOWN;
-                s1_p = (s1_wait && producer_table[s1_t].valid && (producer_table[s1_t].epoch == src1_id[perf_oldest_idx].epoch)) ?
-                       producer_table[s1_t].ptype : PROD_UNKNOWN;
+                s0_t =
+                    src0_id[perf_oldest_idx].rob_tag;
 
-                is_store_oldest = is_ld_st[perf_oldest_idx] && (ram_we[perf_oldest_idx] != `RAM_WE_N);
-                perf_true_source_wait = is_store_oldest ? s0_wait : (s0_wait || s1_wait);
+                s1_t =
+                    src1_id[perf_oldest_idx].rob_tag;
+
+                s0_p =
+                    (
+                        s0_wait &&
+                        producer_table[s0_t].valid &&
+                        (
+                            producer_table[s0_t].epoch ==
+                            src0_id[perf_oldest_idx].epoch
+                        )
+                    )
+                        ? producer_table[s0_t].ptype
+                        : PROD_UNKNOWN;
+
+                s1_p =
+                    (
+                        s1_wait &&
+                        producer_table[s1_t].valid &&
+                        (
+                            producer_table[s1_t].epoch ==
+                            src1_id[perf_oldest_idx].epoch
+                        )
+                    )
+                        ? producer_table[s1_t].ptype
+                        : PROD_UNKNOWN;
+
+                is_store_oldest =
+                    is_ld_st[perf_oldest_idx] &&
+                    (
+                        ram_we[perf_oldest_idx] !=
+                        `RAM_WE_N
+                    );
+
+                perf_true_source_wait =
+                    is_store_oldest
+                        ? s0_wait
+                        : (s0_wait || s1_wait);
 
                 if (perf_true_source_wait) begin
                     if (is_store_oldest) begin
-                        perf_source_wait_dep_load   = (s0_p == PROD_LOAD);
-                        perf_source_wait_dep_muldiv = (s0_p == PROD_MULDIV);
-                        perf_source_wait_dep_alu    = (s0_p == PROD_ALU);
-                        perf_source_wait_dep_branch = (s0_p == PROD_BRANCH);
+                        perf_source_wait_dep_load =
+                            (s0_p == PROD_LOAD);
+
+                        perf_source_wait_dep_muldiv =
+                            (s0_p == PROD_MULDIV);
+
+                        perf_source_wait_dep_alu =
+                            (s0_p == PROD_ALU);
+
+                        perf_source_wait_dep_branch =
+                            (s0_p == PROD_BRANCH);
                     end else begin
-                        perf_source_wait_dep_load   = (s0_wait && (s0_p == PROD_LOAD))   || (s1_wait && (s1_p == PROD_LOAD));
-                        perf_source_wait_dep_muldiv = (s0_wait && (s0_p == PROD_MULDIV)) || (s1_wait && (s1_p == PROD_MULDIV));
-                        perf_source_wait_dep_alu    = (s0_wait && (s0_p == PROD_ALU))    || (s1_wait && (s1_p == PROD_ALU));
-                        perf_source_wait_dep_branch = (s0_wait && (s0_p == PROD_BRANCH)) || (s1_wait && (s1_p == PROD_BRANCH));
+                        perf_source_wait_dep_load =
+                            (
+                                s0_wait &&
+                                (s0_p == PROD_LOAD)
+                            ) ||
+                            (
+                                s1_wait &&
+                                (s1_p == PROD_LOAD)
+                            );
+
+                        perf_source_wait_dep_muldiv =
+                            (
+                                s0_wait &&
+                                (s0_p == PROD_MULDIV)
+                            ) ||
+                            (
+                                s1_wait &&
+                                (s1_p == PROD_MULDIV)
+                            );
+
+                        perf_source_wait_dep_alu =
+                            (
+                                s0_wait &&
+                                (s0_p == PROD_ALU)
+                            ) ||
+                            (
+                                s1_wait &&
+                                (s1_p == PROD_ALU)
+                            );
+
+                        perf_source_wait_dep_branch =
+                            (
+                                s0_wait &&
+                                (s0_p == PROD_BRANCH)
+                            ) ||
+                            (
+                                s1_wait &&
+                                (s1_p == PROD_BRANCH)
+                            );
                     end
                 end
+
                 if (is_store_oldest) begin
-                    perf_source_wait_store_addr = s0_wait;
-                    perf_source_wait_store_data = s1_wait;
+                    perf_source_wait_store_addr =
+                        s0_wait;
+
+                    perf_source_wait_store_data =
+                        s1_wait;
                 end
             end
 
-            perf_lsu_order = src0_ready_eff[perf_oldest_idx] && src1_ready_eff[perf_oldest_idx] &&
-                             is_ld_st[perf_oldest_idx] && (ram_we[perf_oldest_idx] == `RAM_WE_N) && older_store_pending[perf_oldest_idx];
-            perf_serializing = src0_ready_eff[perf_oldest_idx] && src1_ready_eff[perf_oldest_idx] &&
-                               slot_lane0_only[perf_oldest_idx] && (system_op[perf_oldest_idx] != 3'd0) &&
-                               (!rob_head_valid || !uop_id_equal(uop_id[perf_oldest_idx], rob_head_id));
+            perf_lsu_order =
+                src0_ready_eff[perf_oldest_idx] &&
+                src1_ready_eff[perf_oldest_idx] &&
+                is_ld_st[perf_oldest_idx] &&
+                (
+                    ram_we[perf_oldest_idx] ==
+                    `RAM_WE_N
+                ) &&
+                older_store_pending[perf_oldest_idx];
+
+            perf_serializing =
+                src0_ready_eff[perf_oldest_idx] &&
+                src1_ready_eff[perf_oldest_idx] &&
+                slot_lane0_only[perf_oldest_idx] &&
+                (
+                    system_op[perf_oldest_idx] !=
+                    3'd0
+                ) &&
+                (
+                    !rob_head_valid ||
+                    !uop_id_equal(
+                        uop_id[perf_oldest_idx],
+                        rob_head_id
+                    )
+                );
         end
 `endif
 
         issue_selected_payload[1] = '0;
-        issue_selected_payload[1].uop_id = uop_id[fast_issue_sel];
-        issue_selected_payload[1].pc = pc[fast_issue_sel];
-        issue_selected_payload[1].src0_value = rD1[fast_issue_sel];
-        issue_selected_payload[1].src1_value = fast_hold_is_store ?
-                                                src1_value_eff[fast_issue_sel] :
-                                                rD2[fast_issue_sel];
-        issue_selected_payload[1].src1_ready = fast_hold_is_store ?
-                                                src1_ready_eff[fast_issue_sel] :
-                                                src1_ready[fast_issue_sel];
-        issue_selected_payload[1].src1_id = src1_id[fast_issue_sel];
-        issue_selected_payload[1].imm = ext[fast_issue_sel];
-        issue_selected_payload[1].reg_write = rf_we[fast_issue_sel];
-        issue_selected_payload[1].arch_rd = wR[fast_issue_sel];
-        issue_selected_payload[1].result_sel = wd_sel[fast_issue_sel];
-        issue_selected_payload[1].alu_op = alu_op[fast_issue_sel];
-        issue_selected_payload[1].src_a_sel = alua_sel[fast_issue_sel];
-        issue_selected_payload[1].src_b_sel = alub_sel[fast_issue_sel];
-        issue_selected_payload[1].arch_rs1 = rR1[fast_issue_sel];
-        issue_selected_payload[1].arch_rs2 = rR2[fast_issue_sel];
-        issue_selected_payload[1].src0_used = rR1_re[fast_issue_sel];
-        issue_selected_payload[1].src1_used = rR2_re[fast_issue_sel];
-        issue_selected_payload[1].npc_op = npc_op[fast_issue_sel];
-        issue_selected_payload[1].store_mask = ram_we[fast_issue_sel];
-        issue_selected_payload[1].load_ext_op = ram_ext_op[fast_issue_sel];
-        issue_selected_payload[1].is_br_jmp = is_br_jmp[fast_issue_sel];
-        issue_selected_payload[1].is_ld_st = is_ld_st[fast_issue_sel];
-        issue_selected_payload[1].is_call = is_call[fast_issue_sel];
-        issue_selected_payload[1].is_ret = is_ret[fast_issue_sel];
-        issue_selected_payload[1].system_op = system_op_e'(system_op[fast_issue_sel]);
-        issue_selected_payload[1].csr_num = csr_num[fast_issue_sel];
-        issue_selected_payload[1].cacop_op = cacop_op[fast_issue_sel];
-        issue_selected_payload[1].serializing = serializing[fast_issue_sel];
-        issue_selected_payload[1].pred.ras_ptr = ras_ptr[fast_issue_sel];
-        issue_selected_payload[1].pred.valid = pred_valid[fast_issue_sel];
-        issue_selected_payload[1].pred.taken = pred_taken[fast_issue_sel];
-        issue_selected_payload[1].pred.target = pred_target[fast_issue_sel];
-        issue_selected_payload[1].pred.index = pred_index[fast_issue_sel];
-        issue_selected_payload[1].pred.ras_sp_before = ras_sp_before[fast_issue_sel];
-        issue_selected_payload[1].pred.ras_count_before = ras_count_before[fast_issue_sel];
-        issue_selected_payload[1].pred.perf_btb_hit = perf_btb_hit[fast_issue_sel];
+
+        issue_selected_payload[1].uop_id =
+            uop_id[fast_issue_sel];
+
+        issue_selected_payload[1].pc =
+            pc[fast_issue_sel];
+
+        issue_selected_payload[1].src0_value =
+            rD1[fast_issue_sel];
+
+        issue_selected_payload[1].src1_value =
+            fast_hold_is_store
+                ? src1_value_eff[fast_issue_sel]
+                : rD2[fast_issue_sel];
+
+        issue_selected_payload[1].src1_ready =
+            fast_hold_is_store
+                ? src1_ready_eff[fast_issue_sel]
+                : src1_ready[fast_issue_sel];
+
+        issue_selected_payload[1].src1_id =
+            src1_id[fast_issue_sel];
+
+        issue_selected_payload[1].imm =
+            ext[fast_issue_sel];
+
+        issue_selected_payload[1].reg_write =
+            rf_we[fast_issue_sel];
+
+        issue_selected_payload[1].arch_rd =
+            wR[fast_issue_sel];
+
+        issue_selected_payload[1].result_sel =
+            wd_sel[fast_issue_sel];
+
+        issue_selected_payload[1].alu_op =
+            alu_op[fast_issue_sel];
+
+        issue_selected_payload[1].src_a_sel =
+            alua_sel[fast_issue_sel];
+
+        issue_selected_payload[1].src_b_sel =
+            alub_sel[fast_issue_sel];
+
+        issue_selected_payload[1].arch_rs1 =
+            rR1[fast_issue_sel];
+
+        issue_selected_payload[1].arch_rs2 =
+            rR2[fast_issue_sel];
+
+        issue_selected_payload[1].src0_used =
+            rR1_re[fast_issue_sel];
+
+        issue_selected_payload[1].src1_used =
+            rR2_re[fast_issue_sel];
+
+        issue_selected_payload[1].npc_op =
+            npc_op[fast_issue_sel];
+
+        issue_selected_payload[1].store_mask =
+            ram_we[fast_issue_sel];
+
+        issue_selected_payload[1].load_ext_op =
+            ram_ext_op[fast_issue_sel];
+
+        issue_selected_payload[1].is_br_jmp =
+            is_br_jmp[fast_issue_sel];
+
+        issue_selected_payload[1].is_ld_st =
+            is_ld_st[fast_issue_sel];
+
+        issue_selected_payload[1].is_call =
+            is_call[fast_issue_sel];
+
+        issue_selected_payload[1].is_ret =
+            is_ret[fast_issue_sel];
+
+        issue_selected_payload[1].system_op =
+            system_op_e'(system_op[fast_issue_sel]);
+
+        issue_selected_payload[1].csr_num =
+            csr_num[fast_issue_sel];
+
+        issue_selected_payload[1].cacop_op =
+            cacop_op[fast_issue_sel];
+
+        issue_selected_payload[1].serializing =
+            serializing[fast_issue_sel];
+
+        issue_selected_payload[1].pred.ras_ptr =
+            ras_ptr[fast_issue_sel];
+
+        issue_selected_payload[1].pred.valid =
+            pred_valid[fast_issue_sel];
+
+        issue_selected_payload[1].pred.taken =
+            pred_taken[fast_issue_sel];
+
+        issue_selected_payload[1].pred.target =
+            pred_target[fast_issue_sel];
+
+        issue_selected_payload[1].pred.index =
+            pred_index[fast_issue_sel];
+
+        issue_selected_payload[1].pred.ras_sp_before =
+            ras_sp_before[fast_issue_sel];
+
+        issue_selected_payload[1].pred.ras_count_before =
+            ras_count_before[fast_issue_sel];
+
+        issue_selected_payload[1].pred.perf_btb_hit =
+            perf_btb_hit[fast_issue_sel];
     end
 
-    wire [DQ_DEPTH-1:0] fast_refill_candidate = fast_candidate &
-                                                 ~fast_hold_onehot;
-    assign fast_refill_pick = ROUND_ROBIN_SELECT ?
-        pick_round_robin8(fast_refill_candidate, fast_rr_ptr) :
-        pick_oldest8(fast_refill_candidate,
-                     alloc_seq[0], alloc_seq[1], alloc_seq[2], alloc_seq[3],
-                     alloc_seq[4], alloc_seq[5], alloc_seq[6], alloc_seq[7]);
+    wire [DQ_DEPTH-1:0] fast_refill_candidate =
+        fast_candidate &
+        ~fast_hold_onehot;
 
-    // The execution lanes see only the payload ownership registers.  The
-    // selection/index stage is never exposed on this interface, so a stalled
-    // lane cannot cause the DQ mux to change underneath it.
+    assign fast_refill_pick =
+        ROUND_ROBIN_SELECT
+            ? pick_round_robin8(
+                fast_refill_candidate,
+                fast_rr_ptr
+            )
+            : pick_oldest8(
+                fast_refill_candidate,
+                alloc_seq[0],
+                alloc_seq[1],
+                alloc_seq[2],
+                alloc_seq[3],
+                alloc_seq[4],
+                alloc_seq[5],
+                alloc_seq[6],
+                alloc_seq[7]
+            );
+
     always_comb begin
         issue[0] = '0;
         issue[1] = '0;
+
         if (issue_payload_valid_q && !flush)
             issue[0] = issue_payload_q[0];
+
         if (fast_payload_valid_q && !flush)
             issue[1] = issue_payload_q[1];
     end
-    // Independent two-entry ownership boundary.  The delayed issue-clear slot
-    // is intentionally unrelated to this FIFO; a Store remains represented
-    // until Scheduler accepts the token.
-    assign store_issue_pending_valid = (store_token_count_q != 2'd0);
+
+    assign store_issue_pending_valid =
+        (store_token_count_q != 2'd0);
+
     always @(*) begin
         store_issue_pending = '0;
+
         if (store_token_count_q != 2'd0) begin
-            store_issue_pending.uop_id = store_token_fifo_q[store_token_head_q].uop_id;
-            store_issue_pending.pc = store_token_fifo_q[store_token_head_q].pc;
-            store_issue_pending.store_mask = store_token_fifo_q[store_token_head_q].store_mask;
-            store_issue_pending.src1_id = store_token_fifo_q[store_token_head_q].src1_id;
+            store_issue_pending.uop_id =
+                store_token_fifo_q[
+                    store_token_head_q
+                ].uop_id;
+
+            store_issue_pending.pc =
+                store_token_fifo_q[
+                    store_token_head_q
+                ].pc;
+
+            store_issue_pending.store_mask =
+                store_token_fifo_q[
+                    store_token_head_q
+                ].store_mask;
+
+            store_issue_pending.src1_id =
+                store_token_fifo_q[
+                    store_token_head_q
+                ].src1_id;
         end
     end
-    // Grants are already-owned Store reservations, so expose them together
-    // with written tokens.  This keeps credit conserved across grant->token.
-    assign store_issue_pending_occupancy = store_reserved_count[1:0];
 
-    // `count` tracks the DQ-slot transfer protocol, while payload ownership
-    // may legally survive a flush outside the slot array.  Derive the public
-    // occupancy from the authoritative valid bits so a preserved payload
-    // cannot make a stale decrement wrap the four-bit counter to 15 and lock
-    // the frontend's full/credit logic.
+    assign store_issue_pending_occupancy =
+        store_reserved_count[1:0];
+
     reg [3:0] valid_occupancy;
     reg [2:0] valid_clear_count;
+
     always @(*) begin
         valid_occupancy = 4'd0;
         valid_clear_count = 3'd0;
-        for (occupancy_i = 0; occupancy_i < DQ_DEPTH; occupancy_i = occupancy_i + 1) begin
-            valid_occupancy = valid_occupancy + valid[occupancy_i];
-            valid_clear_count = valid_clear_count + state_clear_vec[occupancy_i];
+
+        for (
+            occupancy_i = 0;
+            occupancy_i < DQ_DEPTH;
+            occupancy_i = occupancy_i + 1
+        ) begin
+            valid_occupancy =
+                valid_occupancy +
+                valid[occupancy_i];
+
+            valid_clear_count =
+                valid_clear_count +
+                state_clear_vec[occupancy_i];
         end
     end
-    assign occupancy = valid_occupancy;
 
-    // Preserve a result when the producer and dependent are accepted on the
-    // same edge.  The held rename value is not sufficient in that case,
-    // because the completion/commit value is the newest value.
-    // Only unresolved sources may consume a tag-matched bypass.  A ready
-    // source already carries the authoritative rename/RF value; its tag bits
-    // are don't-care and may equal an unrelated completion after ROB wrap.
-    wire enq_src0_real = enq_rR1_re && (enq_rR1 != 5'h0) &&
-                         !enq_src0_ready;
-    wire enq_src1_real = enq_rR2_re && (enq_rR2 != 5'h0) &&
-                         !enq_src1_ready;
-    wire enq1_src0_real = enq1_rR1_re && (enq1_rR1 != 5'h0) &&
-                          !enq1_src0_ready;
-    wire enq1_src1_real = enq1_rR2_re && (enq1_rR2 != 5'h0) &&
-                          !enq1_src1_ready;
+    assign occupancy =
+        valid_occupancy;
 
-    wire c0_enq_s0 = uop_id_equal(wakeup0_id, enq_src0_id);
-    wire c1_enq_s0 = uop_id_equal(wakeup1_id, enq_src0_id);
-    wire cs_enq_s0 = uop_id_equal(system_wakeup_id, enq_src0_id);
-    wire k0_enq_s0 = uop_id_equal(commit_id, enq_src0_id);
-    wire k1_enq_s0 = uop_id_equal(commit1_id, enq_src0_id);
-    wire c0_enq_s1 = uop_id_equal(wakeup0_id, enq_src1_id);
-    wire c1_enq_s1 = uop_id_equal(wakeup1_id, enq_src1_id);
-    wire cs_enq_s1 = uop_id_equal(system_wakeup_id, enq_src1_id);
-    wire k0_enq_s1 = uop_id_equal(commit_id, enq_src1_id);
-    wire k1_enq_s1 = uop_id_equal(commit1_id, enq_src1_id);
-    wire c0_enq1_s0 = uop_id_equal(wakeup0_id, enq1_src0_id);
-    wire c1_enq1_s0 = uop_id_equal(wakeup1_id, enq1_src0_id);
-    wire cs_enq1_s0 = uop_id_equal(system_wakeup_id, enq1_src0_id);
-    wire k0_enq1_s0 = uop_id_equal(commit_id, enq1_src0_id);
-    wire k1_enq1_s0 = uop_id_equal(commit1_id, enq1_src0_id);
-    wire c0_enq1_s1 = uop_id_equal(wakeup0_id, enq1_src1_id);
-    wire c1_enq1_s1 = uop_id_equal(wakeup1_id, enq1_src1_id);
-    wire cs_enq1_s1 = uop_id_equal(system_wakeup_id, enq1_src1_id);
-    wire k0_enq1_s1 = uop_id_equal(commit_id, enq1_src1_id);
-    wire k1_enq1_s1 = uop_id_equal(commit1_id, enq1_src1_id);
+    wire enq_src0_real =
+        enq_rR1_re &&
+        (enq_rR1 != 5'h0) &&
+        !enq_src0_ready;
 
-    wire enq_src0_complete = enq_src0_real &&
-                             ((wakeup0_valid && wakeup0_rf_we && c0_enq_s0) ||
-                              (wakeup1_valid && wakeup1_rf_we && c1_enq_s0) ||
-                              (system_wakeup_valid && system_wakeup_rf_we && cs_enq_s0));
-    wire enq_src1_complete = enq_src1_real &&
-                             ((wakeup0_valid && wakeup0_rf_we && c0_enq_s1) ||
-                              (wakeup1_valid && wakeup1_rf_we && c1_enq_s1) ||
-                              (system_wakeup_valid && system_wakeup_rf_we && cs_enq_s1));
-    wire enq_src0_commit = enq_src0_real &&
-                           ((commit_valid && commit_rf_we && k0_enq_s0) ||
-                            (commit1_valid && commit1_rf_we && k1_enq_s0));
-    wire enq_src1_commit = enq_src1_real &&
-                           ((commit_valid && commit_rf_we && k0_enq_s1) ||
-                            (commit1_valid && commit1_rf_we && k1_enq_s1));
-    wire enq1_src0_complete = enq1_src0_real &&
-                              ((wakeup0_valid && wakeup0_rf_we && c0_enq1_s0) ||
-                               (wakeup1_valid && wakeup1_rf_we && c1_enq1_s0) ||
-                               (system_wakeup_valid && system_wakeup_rf_we && cs_enq1_s0));
-    wire enq1_src1_complete = enq1_src1_real &&
-                              ((wakeup0_valid && wakeup0_rf_we && c0_enq1_s1) ||
-                               (wakeup1_valid && wakeup1_rf_we && c1_enq1_s1) ||
-                               (system_wakeup_valid && system_wakeup_rf_we && cs_enq1_s1));
-    wire enq1_src0_commit = enq1_src0_real &&
-                            ((commit_valid && commit_rf_we && k0_enq1_s0) ||
-                             (commit1_valid && commit1_rf_we && k1_enq1_s0));
-    wire enq1_src1_commit = enq1_src1_real &&
-                            ((commit_valid && commit_rf_we && k0_enq1_s1) ||
-                             (commit1_valid && commit1_rf_we && k1_enq1_s1));
+    wire enq_src1_real =
+        enq_rR2_re &&
+        (enq_rR2 != 5'h0) &&
+        !enq_src1_ready;
+
+    wire enq1_src0_real =
+        enq1_rR1_re &&
+        (enq1_rR1 != 5'h0) &&
+        !enq1_src0_ready;
+
+    wire enq1_src1_real =
+        enq1_rR2_re &&
+        (enq1_rR2 != 5'h0) &&
+        !enq1_src1_ready;
+
+    wire c0_enq_s0 =
+        uop_id_equal(
+            wakeup0_id,
+            enq_src0_id
+        );
+
+    wire c1_enq_s0 =
+        uop_id_equal(
+            wakeup1_id,
+            enq_src0_id
+        );
+
+    wire cs_enq_s0 =
+        uop_id_equal(
+            system_wakeup_id,
+            enq_src0_id
+        );
+
+    wire k0_enq_s0 =
+        uop_id_equal(
+            commit_id,
+            enq_src0_id
+        );
+
+    wire k1_enq_s0 =
+        uop_id_equal(
+            commit1_id,
+            enq_src0_id
+        );
+
+    wire c0_enq_s1 =
+        uop_id_equal(
+            wakeup0_id,
+            enq_src1_id
+        );
+
+    wire c1_enq_s1 =
+        uop_id_equal(
+            wakeup1_id,
+            enq_src1_id
+        );
+
+    wire cs_enq_s1 =
+        uop_id_equal(
+            system_wakeup_id,
+            enq_src1_id
+        );
+
+    wire k0_enq_s1 =
+        uop_id_equal(
+            commit_id,
+            enq_src1_id
+        );
+
+    wire k1_enq_s1 =
+        uop_id_equal(
+            commit1_id,
+            enq_src1_id
+        );
+
+    wire c0_enq1_s0 =
+        uop_id_equal(
+            wakeup0_id,
+            enq1_src0_id
+        );
+
+    wire c1_enq1_s0 =
+        uop_id_equal(
+            wakeup1_id,
+            enq1_src0_id
+        );
+
+    wire cs_enq1_s0 =
+        uop_id_equal(
+            system_wakeup_id,
+            enq1_src0_id
+        );
+
+    wire k0_enq1_s0 =
+        uop_id_equal(
+            commit_id,
+            enq1_src0_id
+        );
+
+    wire k1_enq1_s0 =
+        uop_id_equal(
+            commit1_id,
+            enq1_src0_id
+        );
+
+    wire c0_enq1_s1 =
+        uop_id_equal(
+            wakeup0_id,
+            enq1_src1_id
+        );
+
+    wire c1_enq1_s1 =
+        uop_id_equal(
+            wakeup1_id,
+            enq1_src1_id
+        );
+
+    wire cs_enq1_s1 =
+        uop_id_equal(
+            system_wakeup_id,
+            enq1_src1_id
+        );
+
+    wire k0_enq1_s1 =
+        uop_id_equal(
+            commit_id,
+            enq1_src1_id
+        );
+
+    wire k1_enq1_s1 =
+        uop_id_equal(
+            commit1_id,
+            enq1_src1_id
+        );
+
+    wire enq_src0_complete =
+        enq_src0_real &&
+        (
+            (
+                wakeup0_valid &&
+                wakeup0_rf_we &&
+                c0_enq_s0
+            ) ||
+            (
+                wakeup1_valid &&
+                wakeup1_rf_we &&
+                c1_enq_s0
+            ) ||
+            (
+                system_wakeup_valid &&
+                system_wakeup_rf_we &&
+                cs_enq_s0
+            )
+        );
+
+    wire enq_src1_complete =
+        enq_src1_real &&
+        (
+            (
+                wakeup0_valid &&
+                wakeup0_rf_we &&
+                c0_enq_s1
+            ) ||
+            (
+                wakeup1_valid &&
+                wakeup1_rf_we &&
+                c1_enq_s1
+            ) ||
+            (
+                system_wakeup_valid &&
+                system_wakeup_rf_we &&
+                cs_enq_s1
+            )
+        );
+
+    wire enq_src0_commit =
+        enq_src0_real &&
+        (
+            (
+                commit_valid &&
+                commit_rf_we &&
+                k0_enq_s0
+            ) ||
+            (
+                commit1_valid &&
+                commit1_rf_we &&
+                k1_enq_s0
+            )
+        );
+
+    wire enq_src1_commit =
+        enq_src1_real &&
+        (
+            (
+                commit_valid &&
+                commit_rf_we &&
+                k0_enq_s1
+            ) ||
+            (
+                commit1_valid &&
+                commit1_rf_we &&
+                k1_enq_s1
+            )
+        );
+
+    wire enq1_src0_complete =
+        enq1_src0_real &&
+        (
+            (
+                wakeup0_valid &&
+                wakeup0_rf_we &&
+                c0_enq1_s0
+            ) ||
+            (
+                wakeup1_valid &&
+                wakeup1_rf_we &&
+                c1_enq1_s0
+            ) ||
+            (
+                system_wakeup_valid &&
+                system_wakeup_rf_we &&
+                cs_enq1_s0
+            )
+        );
+
+    wire enq1_src1_complete =
+        enq1_src1_real &&
+        (
+            (
+                wakeup0_valid &&
+                wakeup0_rf_we &&
+                c0_enq1_s1
+            ) ||
+            (
+                wakeup1_valid &&
+                wakeup1_rf_we &&
+                c1_enq1_s1
+            ) ||
+            (
+                system_wakeup_valid &&
+                system_wakeup_rf_we &&
+                cs_enq1_s1
+            )
+        );
+
+    wire enq1_src0_commit =
+        enq1_src0_real &&
+        (
+            (
+                commit_valid &&
+                commit_rf_we &&
+                k0_enq1_s0
+            ) ||
+            (
+                commit1_valid &&
+                commit1_rf_we &&
+                k1_enq1_s0
+            )
+        );
+
+    wire enq1_src1_commit =
+        enq1_src1_real &&
+        (
+            (
+                commit_valid &&
+                commit_rf_we &&
+                k0_enq1_s1
+            ) ||
+            (
+                commit1_valid &&
+                commit1_rf_we &&
+                k1_enq1_s1
+            )
+        );
 
     wire [31:0] enq_src0_bypass_value =
-        (enq_src0_real && wakeup0_valid && wakeup0_rf_we && c0_enq_s0) ?
-            wakeup0_value :
-        (enq_src0_real && wakeup1_valid && wakeup1_rf_we && c1_enq_s0) ?
-            wakeup1_value :
-        (enq_src0_real && system_wakeup_valid && system_wakeup_rf_we && cs_enq_s0) ?
-            system_wakeup_value :
-        (enq_src0_real && commit_valid && commit_rf_we && k0_enq_s0) ?
-            commit_value :
-        (enq_src0_real && commit1_valid && commit1_rf_we && k1_enq_s0) ?
-            commit1_value : enq_rD1;
-    wire [31:0] enq_src1_bypass_value =
-        (enq_src1_real && wakeup0_valid && wakeup0_rf_we && c0_enq_s1) ?
-            wakeup0_value :
-        (enq_src1_real && wakeup1_valid && wakeup1_rf_we && c1_enq_s1) ?
-            wakeup1_value :
-        (enq_src1_real && system_wakeup_valid && system_wakeup_rf_we && cs_enq_s1) ?
-            system_wakeup_value :
-        (enq_src1_real && commit_valid && commit_rf_we && k0_enq_s1) ?
-            commit_value :
-        (enq_src1_real && commit1_valid && commit1_rf_we && k1_enq_s1) ?
-            commit1_value : enq_rD2;
-    wire [31:0] enq1_src0_bypass_value =
-        (enq1_src0_real && wakeup0_valid && wakeup0_rf_we && c0_enq1_s0) ?
-            wakeup0_value :
-        (enq1_src0_real && wakeup1_valid && wakeup1_rf_we && c1_enq1_s0) ?
-            wakeup1_value :
-        (enq1_src0_real && system_wakeup_valid && system_wakeup_rf_we && cs_enq1_s0) ?
-            system_wakeup_value :
-        (enq1_src0_real && commit_valid && commit_rf_we && k0_enq1_s0) ?
-            commit_value :
-        (enq1_src0_real && commit1_valid && commit1_rf_we && k1_enq1_s0) ?
-            commit1_value : enq1_rD1;
-    wire [31:0] enq1_src1_bypass_value =
-        (enq1_src1_real && wakeup0_valid && wakeup0_rf_we && c0_enq1_s1) ?
-            wakeup0_value :
-        (enq1_src1_real && wakeup1_valid && wakeup1_rf_we && c1_enq1_s1) ?
-            wakeup1_value :
-        (enq1_src1_real && system_wakeup_valid && system_wakeup_rf_we && cs_enq1_s1) ?
-            system_wakeup_value :
-        (enq1_src1_real && commit_valid && commit_rf_we && k0_enq1_s1) ?
-            commit_value :
-        (enq1_src1_real && commit1_valid && commit1_rf_we && k1_enq1_s1) ?
-            commit1_value : enq1_rD2;
+        (
+            enq_src0_real &&
+            wakeup0_valid &&
+            wakeup0_rf_we &&
+            c0_enq_s0
+        ) ? wakeup0_value :
+        (
+            enq_src0_real &&
+            wakeup1_valid &&
+            wakeup1_rf_we &&
+            c1_enq_s0
+        ) ? wakeup1_value :
+        (
+            enq_src0_real &&
+            system_wakeup_valid &&
+            system_wakeup_rf_we &&
+            cs_enq_s0
+        ) ? system_wakeup_value :
+        (
+            enq_src0_real &&
+            commit_valid &&
+            commit_rf_we &&
+            k0_enq_s0
+        ) ? commit_value :
+        (
+            enq_src0_real &&
+            commit1_valid &&
+            commit1_rf_we &&
+            k1_enq_s0
+        ) ? commit1_value :
+        enq_rD1;
 
-    // Operand storage is intentionally independent of flush/enq_valid.
-    //
-    // A free slot is architecturally invalid, so its data bits are don't-care
-    // until valid is set.  Prewriting the held rename operands into free slots
-    // removes the long EX branch-compare -> flush -> enq_fire -> 64-bit operand
-    // register-D path seen with Vivado 2019.2.  Flush still clears valid/ready
-    // in the state block below; a speculative data write on a flush cycle is
-    // therefore harmless.  Completion writes only target valid slots, so they
-    // cannot conflict with a free-slot prewrite.
+    wire [31:0] enq_src1_bypass_value =
+        (
+            enq_src1_real &&
+            wakeup0_valid &&
+            wakeup0_rf_we &&
+            c0_enq_s1
+        ) ? wakeup0_value :
+        (
+            enq_src1_real &&
+            wakeup1_valid &&
+            wakeup1_rf_we &&
+            c1_enq_s1
+        ) ? wakeup1_value :
+        (
+            enq_src1_real &&
+            system_wakeup_valid &&
+            system_wakeup_rf_we &&
+            cs_enq_s1
+        ) ? system_wakeup_value :
+        (
+            enq_src1_real &&
+            commit_valid &&
+            commit_rf_we &&
+            k0_enq_s1
+        ) ? commit_value :
+        (
+            enq_src1_real &&
+            commit1_valid &&
+            commit1_rf_we &&
+            k1_enq_s1
+        ) ? commit1_value :
+        enq_rD2;
+
+    wire [31:0] enq1_src0_bypass_value =
+        (
+            enq1_src0_real &&
+            wakeup0_valid &&
+            wakeup0_rf_we &&
+            c0_enq1_s0
+        ) ? wakeup0_value :
+        (
+            enq1_src0_real &&
+            wakeup1_valid &&
+            wakeup1_rf_we &&
+            c1_enq1_s0
+        ) ? wakeup1_value :
+        (
+            enq1_src0_real &&
+            system_wakeup_valid &&
+            system_wakeup_rf_we &&
+            cs_enq1_s0
+        ) ? system_wakeup_value :
+        (
+            enq1_src0_real &&
+            commit_valid &&
+            commit_rf_we &&
+            k0_enq1_s0
+        ) ? commit_value :
+        (
+            enq1_src0_real &&
+            commit1_valid &&
+            commit1_rf_we &&
+            k1_enq1_s0
+        ) ? commit1_value :
+        enq1_rD1;
+
+    wire [31:0] enq1_src1_bypass_value =
+        (
+            enq1_src1_real &&
+            wakeup0_valid &&
+            wakeup0_rf_we &&
+            c0_enq1_s1
+        ) ? wakeup0_value :
+        (
+            enq1_src1_real &&
+            wakeup1_valid &&
+            wakeup1_rf_we &&
+            c1_enq1_s1
+        ) ? wakeup1_value :
+        (
+            enq1_src1_real &&
+            system_wakeup_valid &&
+            system_wakeup_rf_we &&
+            cs_enq1_s1
+        ) ? system_wakeup_value :
+        (
+            enq1_src1_real &&
+            commit_valid &&
+            commit_rf_we &&
+            k0_enq1_s1
+        ) ? commit_value :
+        (
+            enq1_src1_real &&
+            commit1_valid &&
+            commit1_rf_we &&
+            k1_enq1_s1
+        ) ? commit1_value :
+        enq1_rD2;
+
     always @(posedge clk or negedge rstn) begin
         if (!rstn) begin
             for (j = 0; j < DQ_DEPTH; j = j + 1) begin
@@ -1575,8 +2631,13 @@ module DispatchQueue #(
                 rD2[j] <= 32'h0;
             end
         end else begin
-            if (wakeup0_valid || wakeup1_valid || system_wakeup_valid ||
-                commit_valid || commit1_valid) begin
+            if (
+                wakeup0_valid ||
+                wakeup1_valid ||
+                system_wakeup_valid ||
+                commit_valid ||
+                commit1_valid
+            ) begin
                 for (j = 0; j < DQ_DEPTH; j = j + 1) begin
                     if (wake_src0_vec[j]) begin
                         if (wake0_src0_vec[j])
@@ -1590,6 +2651,7 @@ module DispatchQueue #(
                         else if (wake3_src0_vec[j])
                             rD1[j] <= commit1_value;
                     end
+
                     if (wake_src1_vec[j]) begin
                         if (wake0_src1_vec[j])
                             rD2[j] <= wakeup0_value;
@@ -1606,51 +2668,89 @@ module DispatchQueue #(
             end
 
             if (free_found) begin
-                rD1[enq_sel] <= (enq_src0_complete || enq_src0_commit) ?
-                                enq_src0_bypass_value : enq_rD1;
-                rD2[enq_sel] <= (enq_src1_complete || enq_src1_commit) ?
-                                enq_src1_bypass_value : enq_rD2;
+                rD1[enq_sel] <=
+                    (
+                        enq_src0_complete ||
+                        enq_src0_commit
+                    )
+                        ? enq_src0_bypass_value
+                        : enq_rD1;
+
+                rD2[enq_sel] <=
+                    (
+                        enq_src1_complete ||
+                        enq_src1_commit
+                    )
+                        ? enq_src1_bypass_value
+                        : enq_rD2;
             end
+
             if (second_free_found) begin
-                rD1[enq1_sel] <= (enq1_src0_complete || enq1_src0_commit) ?
-                                 enq1_src0_bypass_value : enq1_rD1;
-                rD2[enq1_sel] <= (enq1_src1_complete || enq1_src1_commit) ?
-                                 enq1_src1_bypass_value : enq1_rD2;
+                rD1[enq1_sel] <=
+                    (
+                        enq1_src0_complete ||
+                        enq1_src0_commit
+                    )
+                        ? enq1_src0_bypass_value
+                        : enq1_rD1;
+
+                rD2[enq1_sel] <=
+                    (
+                        enq1_src1_complete ||
+                        enq1_src1_commit
+                    )
+                        ? enq1_src1_bypass_value
+                        : enq1_rD2;
             end
         end
     end
 
-    // Payload ownership stage.  A payload is stable while its lane is
-    // backpressured; the corresponding DQ slot has already been cleared by
-    // state_clear_vec at the capture edge.
     always @(posedge clk or negedge rstn) begin
         if (!rstn) begin
-            issue_payload_valid_q      <= 1'b0;
-            fast_payload_valid_q       <= 1'b0;
-            issue_payload_q[0]         <= '0;
-            issue_payload_q[1]         <= '0;
+            issue_payload_valid_q <= 1'b0;
+            fast_payload_valid_q <= 1'b0;
+            issue_payload_q[0] <= '0;
+            issue_payload_q[1] <= '0;
         end else if (system_flush) begin
-            issue_payload_valid_q      <= 1'b0;
-            fast_payload_valid_q       <= 1'b0;
+            issue_payload_valid_q <= 1'b0;
+            fast_payload_valid_q <= 1'b0;
         end else if (flush) begin
-            if (!(recover_valid && issue_payload_valid_q &&
-                  !uop_is_younger(issue_payload_q[0].uop_id, recover_id))) begin
+            if (
+                !(
+                    recover_valid &&
+                    issue_payload_valid_q &&
+                    !uop_is_younger(
+                        issue_payload_q[0].uop_id,
+                        recover_id
+                    )
+                )
+            )
                 issue_payload_valid_q <= 1'b0;
-            end
-            if (!(recover_valid && fast_payload_valid_q &&
-                  !uop_is_younger(issue_payload_q[1].uop_id, recover_id))) begin
+
+            if (
+                !(
+                    recover_valid &&
+                    fast_payload_valid_q &&
+                    !uop_is_younger(
+                        issue_payload_q[1].uop_id,
+                        recover_id
+                    )
+                )
+            )
                 fast_payload_valid_q <= 1'b0;
-            end
         end else begin
             if (main_payload_capture) begin
                 issue_payload_valid_q <= 1'b1;
-                issue_payload_q[0]    <= issue_selected_payload[0];
+                issue_payload_q[0] <=
+                    issue_selected_payload[0];
             end else if (issue_fire) begin
                 issue_payload_valid_q <= 1'b0;
             end
+
             if (fast_payload_capture) begin
                 fast_payload_valid_q <= 1'b1;
-                issue_payload_q[1]   <= issue_selected_payload[1];
+                issue_payload_q[1] <=
+                    issue_selected_payload[1];
             end else if (fast_issue_fire) begin
                 fast_payload_valid_q <= 1'b0;
             end
@@ -1684,6 +2784,7 @@ module DispatchQueue #(
             fast_pending_sel <= 3'h0;
             count <= 4'h0;
             next_alloc_seq <= {DQ_SEQ_W{1'b0}};
+
             for (i = 0; i < DQ_DEPTH; i = i + 1) begin
                 uop_id[i] <= '0;
                 alloc_seq[i] <= {DQ_SEQ_W{1'b0}};
@@ -1721,22 +2822,33 @@ module DispatchQueue #(
                 ras_count_before[i] <= 4'h0;
                 perf_btb_hit[i] <= 1'b0;
             end
-            for (i = 0; i < (1<<`ROB_TAG_W); i = i + 1) begin
+
+            for (
+                i = 0;
+                i < (1 << `ROB_TAG_W);
+                i = i + 1
+            ) begin
                 producer_table[i] <= '0;
             end
         end else if (flush || system_flush) begin
             recover_count = 0;
+
             for (i = 0; i < DQ_DEPTH; i = i + 1) begin
-                if (valid[i] && !system_flush && recover_valid &&
-                    !uop_is_younger(uop_id[i], recover_id)) begin
-                    recover_count = recover_count + 1;
-                    // A surviving consumer must not miss an older producer
-                    // which completes on the recovery edge.  Data capture is
-                    // handled by the independent rD block; retain the matching
-                    // ready state here while the normal state-update branch is
-                    // bypassed by flush.
+                if (
+                    valid[i] &&
+                    !system_flush &&
+                    recover_valid &&
+                    !uop_is_younger(
+                        uop_id[i],
+                        recover_id
+                    )
+                ) begin
+                    recover_count =
+                        recover_count + 1;
+
                     if (wake_src0_vec[i])
                         src0_ready[i] <= 1'b1;
+
                     if (wake_src1_vec[i])
                         src1_ready[i] <= 1'b1;
                 end else begin
@@ -1746,126 +2858,160 @@ module DispatchQueue #(
                     barrier_blocked[i] <= 1'b0;
                 end
             end
+
             barrier_active <= 1'b0;
             barrier_release_reg <= 1'b0;
             main_rr_ptr <= 3'h0;
             fast_rr_ptr <= 3'h0;
             main_ownership_transfer_q <= 1'b0;
             fast_ownership_transfer_q <= 1'b0;
-            // Branch recovery keeps only the surviving age relations; a
-            // system flush leaves no DQ Store/Load relation.  The registered
-            // Store scalar is therefore exact at the recovery edge as well.
             older_branch_pending_q <= {DQ_DEPTH{1'b1}};
             older_store_pending_q <= older_store_pending_refresh;
             older_store_any_q <= older_store_any_refresh;
-            // Preserve a selected index only when its DQ slot survives the
-            // recovery.  Payload ownership is handled by the separate
-            // payload-stage register above.
-            if (recover_valid && !system_flush && main_hold_valid &&
+
+            if (
+                recover_valid &&
+                !system_flush &&
+                main_hold_valid &&
                 valid[main_hold_sel] &&
-                !uop_is_younger(uop_id[main_hold_sel], recover_id)) begin
+                !uop_is_younger(
+                    uop_id[main_hold_sel],
+                    recover_id
+                )
+            ) begin
                 main_hold_valid <= 1'b1;
             end else begin
                 main_hold_valid <= 1'b0;
                 main_hold_sel <= 3'h0;
                 main_hold_store_grant_q <= 1'b0;
             end
-            if (recover_valid && !system_flush && fast_hold_valid &&
+
+            if (
+                recover_valid &&
+                !system_flush &&
+                fast_hold_valid &&
                 valid[fast_hold_sel] &&
-                !uop_is_younger(uop_id[fast_hold_sel], recover_id)) begin
+                !uop_is_younger(
+                    uop_id[fast_hold_sel],
+                    recover_id
+                )
+            ) begin
                 fast_hold_valid <= 1'b1;
             end else begin
                 fast_hold_valid <= 1'b0;
                 fast_hold_sel <= 3'h0;
                 fast_hold_store_grant_q <= 1'b0;
             end
-            // Legacy pending selects are retained only for compatibility with
-            // out-of-tree users; the Scheduler uses ownership clear (below).
-            if (recover_valid && !system_flush && issue_pending_valid &&
+
+            if (
+                recover_valid &&
+                !system_flush &&
+                issue_pending_valid &&
                 valid[issue_pending_sel] &&
-                !uop_is_younger(uop_id[issue_pending_sel], recover_id)) begin
+                !uop_is_younger(
+                    uop_id[issue_pending_sel],
+                    recover_id
+                )
+            ) begin
                 issue_pending_valid <= 1'b1;
             end else begin
                 issue_pending_valid <= 1'b0;
                 issue_pending_sel <= 3'h0;
             end
-            if (recover_valid && !system_flush && fast_pending_valid &&
+
+            if (
+                recover_valid &&
+                !system_flush &&
+                fast_pending_valid &&
                 valid[fast_pending_sel] &&
-                !uop_is_younger(uop_id[fast_pending_sel], recover_id)) begin
+                !uop_is_younger(
+                    uop_id[fast_pending_sel],
+                    recover_id
+                )
+            ) begin
                 fast_pending_valid <= 1'b1;
             end else begin
                 fast_pending_valid <= 1'b0;
                 fast_pending_sel <= 3'h0;
             end
+
             count <= recover_count;
+
             if (system_flush)
-                next_alloc_seq <= {DQ_SEQ_W{1'b0}};
+                next_alloc_seq <=
+                    {DQ_SEQ_W{1'b0}};
         end else begin
-            // Record only the narrow ownership event.  RR state consumes this
-            // registered pulse on the following edge, which cuts candidate,
-            // Store-age and selected-index feedback from the pointer D cone.
-            main_ownership_transfer_q <= main_select_capture ||
-                                         main_refill_valid;
-            fast_ownership_transfer_q <= fast_select_capture ||
-                                         fast_refill_valid;
-            // Sample the privilege/system release response.  The registered
-            // value is consumed on the next edge, keeping release off the
-            // same-cycle issue/selection cone.
-            barrier_release_reg <= barrier_release;
-            // Select-index stage.  It is independent of the payload stage:
-            // while a payload is being consumed, a new index can be captured
-            // without exposing a changing DQ mux to the execution lane.
+            main_ownership_transfer_q <=
+                main_select_capture ||
+                main_refill_valid;
+
+            fast_ownership_transfer_q <=
+                fast_select_capture ||
+                fast_refill_valid;
+
+            barrier_release_reg <=
+                barrier_release;
+
             if (main_payload_capture) begin
                 main_hold_store_grant_q <= 1'b0;
+
                 if (main_refill_valid) begin
                     main_hold_valid <= 1'b1;
-                    main_hold_sel <= main_refill_pick[2:0];
+                    main_hold_sel <=
+                        main_refill_pick[2:0];
                 end else begin
                     main_hold_valid <= 1'b0;
                     main_hold_sel <= 3'h0;
                 end
-            end else if (main_hold_valid &&
-                         (!valid[main_hold_sel] ||
-                          main_hold_store_blocked)) begin
-                // The DQ slot remains valid.  Relinquish only the speculative
-                // select owner so another ready non-Store can use the lane.
+            end else if (
+                main_hold_valid &&
+                (
+                    !valid[main_hold_sel] ||
+                    main_hold_store_blocked
+                )
+            ) begin
                 main_hold_valid <= 1'b0;
                 main_hold_sel <= 3'h0;
                 main_hold_store_grant_q <= 1'b0;
             end else if (main_select_capture) begin
                 main_hold_valid <= 1'b1;
                 main_hold_sel <= main_pick[2:0];
-                main_hold_store_grant_q <= main_new_store_grant;
+                main_hold_store_grant_q <=
+                    main_new_store_grant;
             end else if (main_store_grant_set) begin
                 main_hold_store_grant_q <= 1'b1;
             end
+
             if (registered_select_collision) begin
-                // Both proposals were registered before either lane could see
-                // the other's new ownership.  Lane0 wins; lane1 retries from
-                // the next registered candidate evaluation.  The slot remains
-                // live until lane0 captures its payload.
                 fast_hold_valid <= 1'b0;
                 fast_hold_sel <= 3'h0;
                 fast_hold_store_grant_q <= 1'b0;
             end else if (fast_payload_capture) begin
                 fast_hold_store_grant_q <= 1'b0;
+
                 if (fast_refill_valid) begin
                     fast_hold_valid <= 1'b1;
-                    fast_hold_sel <= fast_refill_pick[2:0];
+                    fast_hold_sel <=
+                        fast_refill_pick[2:0];
                 end else begin
                     fast_hold_valid <= 1'b0;
                     fast_hold_sel <= 3'h0;
                 end
-            end else if (fast_hold_valid &&
-                         (!valid[fast_hold_sel] ||
-                          fast_hold_store_blocked)) begin
+            end else if (
+                fast_hold_valid &&
+                (
+                    !valid[fast_hold_sel] ||
+                    fast_hold_store_blocked
+                )
+            ) begin
                 fast_hold_valid <= 1'b0;
                 fast_hold_sel <= 3'h0;
                 fast_hold_store_grant_q <= 1'b0;
             end else if (fast_select_capture) begin
                 fast_hold_valid <= 1'b1;
                 fast_hold_sel <= fast_pick[2:0];
-                fast_hold_store_grant_q <= fast_new_store_grant;
+                fast_hold_store_grant_q <=
+                    fast_new_store_grant;
             end else if (fast_store_grant_set) begin
                 fast_hold_store_grant_q <= 1'b1;
             end
@@ -1874,30 +3020,42 @@ module DispatchQueue #(
                 issue_pending_valid <= 1'b0;
                 fast_pending_valid <= 1'b0;
             end else begin
-                // Fairness state advances only when ownership is registered.
-                // The D input depends solely on the pointer's old value and a
-                // narrow transfer enable, never on the selected slot index.
                 if (main_ownership_transfer_q)
-                    main_rr_ptr <= main_rr_ptr + 3'd1;
-                if (fast_ownership_transfer_q && !registered_select_collision)
-                    fast_rr_ptr <= fast_rr_ptr + 3'd1;
+                    main_rr_ptr <=
+                        main_rr_ptr + 3'd1;
+
+                if (
+                    fast_ownership_transfer_q &&
+                    !registered_select_collision
+                )
+                    fast_rr_ptr <=
+                        fast_rr_ptr + 3'd1;
             end
 
             if (REGISTERED_ORDER_SELECT) begin
-                older_branch_pending_q <= older_branch_pending;
-                older_store_pending_q <= older_store_pending_refresh;
-                older_store_any_q <= older_store_any_refresh;
+                older_branch_pending_q <=
+                    older_branch_pending;
+
+                older_store_pending_q <=
+                    older_store_pending_refresh;
+
+                older_store_any_q <=
+                    older_store_any_refresh;
             end
 
-            if (wakeup0_valid || wakeup1_valid || system_wakeup_valid ||
-                commit_valid || commit1_valid) begin
+            if (
+                wakeup0_valid ||
+                wakeup1_valid ||
+                system_wakeup_valid ||
+                commit_valid ||
+                commit1_valid
+            ) begin
                 for (i = 0; i < DQ_DEPTH; i = i + 1) begin
-                    if (wake_src0_vec[i]) begin
+                    if (wake_src0_vec[i])
                         src0_ready[i] <= 1'b1;
-                    end
-                    if (wake_src1_vec[i]) begin
+
+                    if (wake_src1_vec[i])
                         src1_ready[i] <= 1'b1;
-                    end
                 end
             end
 
@@ -1906,13 +3064,10 @@ module DispatchQueue #(
                     valid[i] <= 1'b0;
             end
 
-            // Entries younger than a released barrier retain their block bit
-            // until the last serializing entry is actually gone.  No age
-            // tournament is needed here: allocation order makes the retained
-            // set a superset of the next barrier's younger set.  The only
-            // stale state is removed once the queue contains no barrier.
             if (!has_serializing_op) begin
-                barrier_blocked <= {DQ_DEPTH{1'b0}};
+                barrier_blocked <=
+                    {DQ_DEPTH{1'b0}};
+
                 barrier_active <= 1'b0;
             end else if (barrier_release_reg) begin
                 barrier_active <= 1'b1;
@@ -1920,16 +3075,28 @@ module DispatchQueue #(
 
             if (enq_fire) begin
                 valid[enq_sel] <= 1'b1;
+
                 if (REGISTERED_ORDER_SELECT) begin
-                    older_branch_pending_q[enq_sel] <= enq_order_branch_blocked;
-                    older_store_pending_q[enq_sel] <= enq_order_store_blocked;
+                    older_branch_pending_q[enq_sel] <=
+                        enq_order_branch_blocked;
+
+                    older_store_pending_q[enq_sel] <=
+                        enq_order_store_blocked;
                 end
+
                 uop_id[enq_sel] <= enq_uop_id;
                 alloc_seq[enq_sel] <= next_alloc_seq;
-                src0_ready[enq_sel] <= enq_src0_ready || enq_src0_complete ||
-                                       enq_src0_commit;
-                src1_ready[enq_sel] <= enq_src1_ready || enq_src1_complete ||
-                                       enq_src1_commit;
+
+                src0_ready[enq_sel] <=
+                    enq_src0_ready ||
+                    enq_src0_complete ||
+                    enq_src0_commit;
+
+                src1_ready[enq_sel] <=
+                    enq_src1_ready ||
+                    enq_src1_complete ||
+                    enq_src1_commit;
+
                 src0_id[enq_sel] <= enq_src0_id;
                 src1_id[enq_sel] <= enq_src1_id;
                 pc[enq_sel] <= enq_pc;
@@ -1955,36 +3122,84 @@ module DispatchQueue #(
                 csr_num[enq_sel] <= enq_csr_num;
                 cacop_op[enq_sel] <= enq_cacop_op;
                 serializing[enq_sel] <= enq_serializing;
-                barrier_blocked[enq_sel] <= barrier_blocks_new;
-                if (enq_serializing && (enq_system_op != 3'd0))
+                barrier_blocked[enq_sel] <=
+                    barrier_blocks_new;
+
+                if (
+                    enq_serializing &&
+                    (enq_system_op != 3'd0)
+                )
                     barrier_active <= 1'b1;
+
                 ras_ptr[enq_sel] <= enq_ras_ptr;
                 pred_valid[enq_sel] <= enq_pred_valid;
                 pred_taken[enq_sel] <= enq_pred_taken;
                 pred_target[enq_sel] <= enq_pred_target;
                 pred_index[enq_sel] <= enq_pred_index;
-                ras_sp_before[enq_sel] <= enq_ras_sp_before;
-                ras_count_before[enq_sel] <= enq_ras_count_before;
-                perf_btb_hit[enq_sel] <= enq_perf_btb_hit;
-                producer_table[enq_uop_id.rob_tag].valid <= 1'b1;
-                producer_table[enq_uop_id.rob_tag].epoch <= enq_uop_id.epoch;
-                producer_table[enq_uop_id.rob_tag].ptype <= (enq_is_ld_st && (enq_ram_we == `RAM_WE_N)) ? PROD_LOAD :
-                    (((enq_alu_op == `ALU_MULL) || (enq_alu_op == `ALU_MULH) || (enq_alu_op == `ALU_UMUL)) ? PROD_MULDIV :
-                    (enq_is_br_jmp ? PROD_BRANCH : PROD_ALU));
+                ras_sp_before[enq_sel] <=
+                    enq_ras_sp_before;
+                ras_count_before[enq_sel] <=
+                    enq_ras_count_before;
+                perf_btb_hit[enq_sel] <=
+                    enq_perf_btb_hit;
+
+                producer_table[
+                    enq_uop_id.rob_tag
+                ].valid <= 1'b1;
+
+                producer_table[
+                    enq_uop_id.rob_tag
+                ].epoch <= enq_uop_id.epoch;
+
+                producer_table[
+                    enq_uop_id.rob_tag
+                ].ptype <=
+                    (
+                        enq_is_ld_st &&
+                        (enq_ram_we == `RAM_WE_N)
+                    )
+                        ? PROD_LOAD
+                        : (
+                            (
+                                (enq_alu_op == `ALU_MULL) ||
+                                (enq_alu_op == `ALU_MULH) ||
+                                (enq_alu_op == `ALU_UMUL)
+                            )
+                                ? PROD_MULDIV
+                                : (
+                                    enq_is_br_jmp
+                                        ? PROD_BRANCH
+                                        : PROD_ALU
+                                )
+                        );
             end
 
             if (enq1_fire) begin
                 valid[enq1_sel] <= 1'b1;
+
                 if (REGISTERED_ORDER_SELECT) begin
-                    older_branch_pending_q[enq1_sel] <= enq1_order_branch_blocked;
-                    older_store_pending_q[enq1_sel] <= enq1_order_store_blocked;
+                    older_branch_pending_q[enq1_sel] <=
+                        enq1_order_branch_blocked;
+
+                    older_store_pending_q[enq1_sel] <=
+                        enq1_order_store_blocked;
                 end
+
                 uop_id[enq1_sel] <= enq1_uop_id;
-                alloc_seq[enq1_sel] <= next_alloc_seq + enq_fire;
-                src0_ready[enq1_sel] <= enq1_src0_ready || enq1_src0_complete ||
-                                        enq1_src0_commit;
-                src1_ready[enq1_sel] <= enq1_src1_ready || enq1_src1_complete ||
-                                        enq1_src1_commit;
+
+                alloc_seq[enq1_sel] <=
+                    next_alloc_seq + enq_fire;
+
+                src0_ready[enq1_sel] <=
+                    enq1_src0_ready ||
+                    enq1_src0_complete ||
+                    enq1_src0_commit;
+
+                src1_ready[enq1_sel] <=
+                    enq1_src1_ready ||
+                    enq1_src1_complete ||
+                    enq1_src1_commit;
+
                 src0_id[enq1_sel] <= enq1_src0_id;
                 src1_id[enq1_sel] <= enq1_src1_id;
                 pc[enq1_sel] <= enq1_pc;
@@ -2010,76 +3225,164 @@ module DispatchQueue #(
                 csr_num[enq1_sel] <= enq1_csr_num;
                 cacop_op[enq1_sel] <= enq1_cacop_op;
                 serializing[enq1_sel] <= enq1_serializing;
-                barrier_blocked[enq1_sel] <= barrier_blocks_new ||
-                    (enq_fire && enq_serializing && (enq_system_op != 3'd0));
-                if (enq1_serializing && (enq1_system_op != 3'd0))
+
+                barrier_blocked[enq1_sel] <=
+                    barrier_blocks_new ||
+                    (
+                        enq_fire &&
+                        enq_serializing &&
+                        (enq_system_op != 3'd0)
+                    );
+
+                if (
+                    enq1_serializing &&
+                    (enq1_system_op != 3'd0)
+                )
                     barrier_active <= 1'b1;
+
                 ras_ptr[enq1_sel] <= enq1_ras_ptr;
                 pred_valid[enq1_sel] <= enq1_pred_valid;
                 pred_taken[enq1_sel] <= enq1_pred_taken;
                 pred_target[enq1_sel] <= enq1_pred_target;
                 pred_index[enq1_sel] <= enq1_pred_index;
-                ras_sp_before[enq1_sel] <= enq1_ras_sp_before;
-                ras_count_before[enq1_sel] <= enq1_ras_count_before;
-                perf_btb_hit[enq1_sel] <= enq1_perf_btb_hit;
-                producer_table[enq1_uop_id.rob_tag].valid <= 1'b1;
-                producer_table[enq1_uop_id.rob_tag].epoch <= enq1_uop_id.epoch;
-                producer_table[enq1_uop_id.rob_tag].ptype <= (enq1_is_ld_st && (enq1_ram_we == `RAM_WE_N)) ? PROD_LOAD :
-                    (((enq1_alu_op == `ALU_MULL) || (enq1_alu_op == `ALU_MULH) || (enq1_alu_op == `ALU_UMUL)) ? PROD_MULDIV :
-                    (enq1_is_br_jmp ? PROD_BRANCH : PROD_ALU));
+                ras_sp_before[enq1_sel] <=
+                    enq1_ras_sp_before;
+                ras_count_before[enq1_sel] <=
+                    enq1_ras_count_before;
+                perf_btb_hit[enq1_sel] <=
+                    enq1_perf_btb_hit;
+
+                producer_table[
+                    enq1_uop_id.rob_tag
+                ].valid <= 1'b1;
+
+                producer_table[
+                    enq1_uop_id.rob_tag
+                ].epoch <= enq1_uop_id.epoch;
+
+                producer_table[
+                    enq1_uop_id.rob_tag
+                ].ptype <=
+                    (
+                        enq1_is_ld_st &&
+                        (enq1_ram_we == `RAM_WE_N)
+                    )
+                        ? PROD_LOAD
+                        : (
+                            (
+                                (enq1_alu_op == `ALU_MULL) ||
+                                (enq1_alu_op == `ALU_MULH) ||
+                                (enq1_alu_op == `ALU_UMUL)
+                            )
+                                ? PROD_MULDIV
+                                : (
+                                    enq1_is_br_jmp
+                                        ? PROD_BRANCH
+                                        : PROD_ALU
+                                )
+                        );
             end
 
-            // Keep the internal credit counter derived from the same slot
-            // ownership event as `valid`.  The old delta used payload-capture
-            // as a proxy for a clear and could drift across flush/recovery,
-            // eventually reporting a full queue while fewer than DQ_DEPTH
-            // valid slots remained.
-            count <= valid_occupancy + enq_fire + enq1_fire -
-                     valid_clear_count;
-            next_alloc_seq <= next_alloc_seq + enq_fire + enq1_fire;
+            count <=
+                valid_occupancy +
+                enq_fire +
+                enq1_fire -
+                valid_clear_count;
+
+            next_alloc_seq <=
+                next_alloc_seq +
+                enq_fire +
+                enq1_fire;
         end
     end
 
 `ifndef SYNTHESIS
-    // An independently selected same-slot proposal is legal for one registered
-    // arbitration cycle, but it must never cross lane1's payload boundary.
     always @(posedge clk) begin
-        if (rstn && !flush && !system_flush &&
-            registered_select_collision && fast_payload_capture)
-            $fatal(1,
-                   "DispatchQueue registered select collision reached lane1 payload");
-        if (rstn && !flush && !system_flush) begin
+        if (
+            rstn &&
+            !flush &&
+            !system_flush &&
+            registered_select_collision &&
+            fast_payload_capture
+        )
+            $fatal(
+                1,
+                "DispatchQueue registered select collision reached lane1 payload"
+            );
+
+        if (
+            rstn &&
+            !flush &&
+            !system_flush
+        ) begin
             if (store_reserved_count > 3'd2)
-                $fatal(1,
-                       "DispatchQueue Store ownership overflow: tokens=%0d main_grant=%0d fast_grant=%0d",
-                       store_token_count_q, main_hold_store_grant_q,
-                       fast_hold_store_grant_q);
-            if (store_token_push && (store_token_count_q == 2'd2) &&
-                !store_token_pop)
-                $fatal(1,
-                       "DispatchQueue granted Store pushed into a full token FIFO");
-            if (issue_store_fire && !main_hold_store_grant_q)
-                $fatal(1,
-                       "DispatchQueue lane0 Store crossed without ownership grant");
-            if (fast_store_fire && !fast_hold_store_grant_q)
-                $fatal(1,
-                       "DispatchQueue lane1 Store crossed without ownership grant");
-            if (main_hold_store_grant_q && !main_hold_is_store)
-                $fatal(1, "DispatchQueue lane0 Store grant lost its owner");
-            if (fast_hold_store_grant_q && !fast_hold_is_store)
-                $fatal(1, "DispatchQueue lane1 Store grant lost its owner");
+                $fatal(
+                    1,
+                    "DispatchQueue Store ownership overflow: tokens=%0d main_grant=%0d fast_grant=%0d",
+                    store_token_count_q,
+                    main_hold_store_grant_q,
+                    fast_hold_store_grant_q
+                );
+
+            if (
+                store_token_push &&
+                (store_token_count_q == 2'd2) &&
+                !store_token_pop
+            )
+                $fatal(
+                    1,
+                    "DispatchQueue granted Store pushed into a full token FIFO"
+                );
+
+            if (
+                issue_store_fire &&
+                !main_hold_store_grant_q
+            )
+                $fatal(
+                    1,
+                    "DispatchQueue lane0 Store crossed without ownership grant"
+                );
+
+            if (
+                fast_store_fire &&
+                !fast_hold_store_grant_q
+            )
+                $fatal(
+                    1,
+                    "DispatchQueue lane1 Store crossed without ownership grant"
+                );
+
+            if (
+                main_hold_store_grant_q &&
+                !main_hold_is_store
+            )
+                $fatal(
+                    1,
+                    "DispatchQueue lane0 Store grant lost its owner"
+                );
+
+            if (
+                fast_hold_store_grant_q &&
+                !fast_hold_is_store
+            )
+                $fatal(
+                    1,
+                    "DispatchQueue lane1 Store grant lost its owner"
+                );
         end
-        // This is the real single-token boundary: the DQ FIFO has one push
-        // port, therefore no cycle may transfer two Store slots into payload
-        // ownership.  Later dual-AGU execution of two previously tokenized
-        // Stores is legal and is checked separately in Scheduler.
-        if (rstn && !flush && !system_flush &&
-            issue_store_fire && fast_store_fire) begin
-            $fatal(1,
-                   "DispatchQueue dual Store capture crossed single-push token boundary");
-        end
+
+        if (
+            rstn &&
+            !flush &&
+            !system_flush &&
+            issue_store_fire &&
+            fast_store_fire
+        )
+            $fatal(
+                1,
+                "DispatchQueue dual Store capture crossed single-push token boundary"
+            );
     end
 `endif
-
 
 endmodule

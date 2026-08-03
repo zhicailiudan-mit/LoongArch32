@@ -139,6 +139,28 @@ module StoreQueue #(
     logic release_owner_next_valid;
     logic [INDEX_W-1:0] release_owner_next_sel;
 
+    typedef struct packed {
+        logic valid;
+        uop_id_t id;
+        logic [INDEX_W-1:0] sel;
+    } owner_candidate_t;
+
+    function automatic owner_candidate_t pick_older_owner(
+        input owner_candidate_t a,
+        input owner_candidate_t b
+    );
+        begin
+            if (!a.valid)
+                pick_older_owner = b;
+            else if (!b.valid)
+                pick_older_owner = a;
+            else if (uop_is_younger(a.id, b.id))
+                pick_older_owner = b;
+            else
+                pick_older_owner = a;
+        end
+    endfunction
+
     // The externally visible capped free-slot credit and ready signals account
     // for an actual same-cycle release below.
     logic release_candidate_valid;
@@ -516,66 +538,75 @@ module StoreQueue #(
     // a release, and newly accepted reservations are included so a release
     // followed by a reserve can present the next owner on the very next cycle.
     always_comb begin : release_owner_next_logic
-        logic candidate_valid;
-        uop_id_t candidate_id;
-        logic [INDEX_W-1:0] candidate_sel;
-        logic [INDEX_W-1:0] mapped_sel;
-        logic [COUNT_W-1:0] new_base;
-        logic [INDEX_W-1:0] new_sel;
+        owner_candidate_t e0;
+        owner_candidate_t e1;
+        owner_candidate_t e2;
+        owner_candidate_t e3;
+        owner_candidate_t n0;
+        owner_candidate_t n1;
+        owner_candidate_t win01;
+        owner_candidate_t win23;
+        owner_candidate_t win_new;
+        owner_candidate_t win03;
+        owner_candidate_t winner;
 
-        candidate_valid = 1'b0;
-        candidate_id = '0;
-        candidate_sel = '0;
-        mapped_sel = '0;
-        new_base = count - (release_do ? 1'b1 : 1'b0);
-        new_sel = '0;
+        e0 = '0;
+        e1 = '0;
+        e2 = '0;
+        e3 = '0;
+        n0 = '0;
+        n1 = '0;
+        win01 = '0;
+        win23 = '0;
+        win_new = '0;
+        win03 = '0;
+        winner = '0;
+
+        e0.valid = (count > 0) && entries[0].valid;
+        e0.id = entries[0].uop_id;
+        e0.sel = 0;
+
+        e1.valid = (count > 1) && entries[1].valid;
+        e1.id = entries[1].uop_id;
+        e1.sel = 1;
+
+        e2.valid = (count > 2) && entries[2].valid;
+        e2.id = entries[2].uop_id;
+        e2.sel = 2;
+
+        e3.valid = (count > 3) && entries[3].valid;
+        e3.id = entries[3].uop_id;
+        e3.sel = 3;
+
+        n0.valid = r0_do;
+        n0.id = r0_uop_id;
+        n0.sel = count + ((r1_do && r1_older) ? 1 : 0);
+
+        n1.valid = r1_do;
+        n1.id = r1_uop_id;
+        n1.sel = count + ((r0_do && !r1_older) ? 1 : 0);
 
         if (!flush) begin
-            // A valid but stalled release owns the queue entry until the
-            // downstream handshake; do not let same-cycle reservations retag
-            // the ready/valid payload.
-            if (release_candidate_valid && !release_fire) begin
-                candidate_valid = 1'b1;
-                candidate_id = entries[release_owner_sel_q].uop_id;
-                candidate_sel = release_owner_sel_q;
-            end else begin
-                for (owner_scan = 0; owner_scan < DEPTH; owner_scan = owner_scan + 1) begin
-                    if ((owner_scan < count) && entries[owner_scan].valid &&
-                        !(release_do && release_owner_valid_q &&
-                          (owner_scan == release_owner_sel_q))) begin
-                        mapped_sel = owner_scan;
-                        if (release_do && (owner_scan > release_owner_sel_q))
-                            mapped_sel = owner_scan - 1'b1;
-                        if (!candidate_valid ||
-                            uop_is_younger(candidate_id, entries[owner_scan].uop_id)) begin
-                            candidate_valid = 1'b1;
-                            candidate_id = entries[owner_scan].uop_id;
-                            candidate_sel = mapped_sel;
-                        end
-                    end
-                end
+            if (release_do && release_owner_valid_q) begin
+                winner = '0;
+            end else if (release_owner_valid_q) begin
+                winner.valid = 1'b1;
+                winner.id = entries[release_owner_sel_q].uop_id;
+                winner.sel = release_owner_sel_q;
 
-                if (r0_do) begin
-                    new_sel = new_base + ((r1_do && r1_older) ? 1 : 0);
-                    if (!candidate_valid || uop_is_younger(candidate_id, r0_uop_id)) begin
-                        candidate_valid = 1'b1;
-                        candidate_id = r0_uop_id;
-                        candidate_sel = new_sel;
-                    end
-                end
-                if (r1_do) begin
-                    new_sel = new_base + ((r0_do && !r1_older) ? 1 : 0);
-                    if (!candidate_valid || uop_is_younger(candidate_id, r1_uop_id)) begin
-                        candidate_valid = 1'b1;
-                        candidate_id = r1_uop_id;
-                        candidate_sel = new_sel;
-                    end
-                end
+                winner = pick_older_owner(winner, n0);
+                winner = pick_older_owner(winner, n1);
+            end else begin
+                win01 = pick_older_owner(e0, e1);
+                win23 = pick_older_owner(e2, e3);
+                win_new = pick_older_owner(n0, n1);
+                win03 = pick_older_owner(win01, win23);
+                winner = pick_older_owner(win03, win_new);
             end
         end
 
-        release_owner_next_valid = candidate_valid;
-        release_owner_next_sel = candidate_sel;
+        release_owner_next_valid = winner.valid;
+        release_owner_next_sel = winner.sel;
     end
 
     always_ff @(posedge clk or negedge rstn) begin
