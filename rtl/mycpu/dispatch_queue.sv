@@ -106,9 +106,13 @@ module DispatchQueue #(
     reg [2:0] fast_rr_ptr;
     reg main_ownership_transfer_q;
     reg fast_ownership_transfer_q;
+    // Candidate masks are the first ownership stage.  The hold registers
+    // below consume only these registered masks; the wide slot predicates
+    // therefore cannot run directly into fast_hold_sel/main_hold_sel D.
+    reg [DQ_DEPTH-1:0] main_candidate_q;
+    reg [DQ_DEPTH-1:0] fast_candidate_q;
     reg [DQ_DEPTH-1:0] older_branch_pending_q;
     reg [DQ_DEPTH-1:0] older_store_pending_q;
-    reg older_store_any_q;
 
     issue_uop_t issue_payload_q [0:1];
     logic issue_payload_valid_q;
@@ -129,6 +133,11 @@ module DispatchQueue #(
     logic store_token_head_q;
     logic store_token_tail_q;
     logic [1:0] store_token_count_q;
+    // Narrow token capture is separated from the wide issue payload.  A
+    // granted Store records only the token fields here; the FIFO write is
+    // driven by the registered issue event on the following cycle.
+    store_token_t store_token_pending_q [0:1];
+    logic [1:0] store_token_pending_valid_q;
     logic store_select_credit_q;
 
     reg [2:0] ras_ptr [0:DQ_DEPTH-1];
@@ -533,8 +542,26 @@ module DispatchQueue #(
 
     wire [DQ_DEPTH-1:0] store_pending_for_select =
         REGISTERED_ORDER_SELECT
-            ? {DQ_DEPTH{older_store_any_q}}
+            // Keep the per-load ordering mask on the registered side of the
+            // selector.  Broadcasting older_store_any_q made one scalar
+            // Store-presence bit fan out through every candidate and was the
+            // Scheduler -> main_hold_sel timing endpoint.  The vector is
+            // already captured with each DQ slot and preserves the exact
+            // same-line Store/Load ordering decision without globally
+            // blocking unrelated loads.
+            ? older_store_pending_q
             : older_store_pending;
+
+    // A younger Store must not consume the last SQ credit while an older
+    // Store is still waiting in the DQ.  Otherwise the older Store can reach
+    // the head of the ROB with a full SQ containing only younger Stores and
+    // neither side can make progress.  The same age mask is already computed
+    // for load ordering; applying it only to Store candidates keeps the
+    // registered candidate/ownership boundary intact and leaves loads and
+    // non-memory ALU issue selection unchanged.
+    wire [DQ_DEPTH-1:0] store_age_blocked =
+        older_store_pending &
+        live_store_mask;
 
     wire [2:0] store_reserved_count =
         {1'b0, store_token_count_q} +
@@ -662,7 +689,7 @@ module DispatchQueue #(
                     valid[store_old] &&
                     is_store[store_old] &&
                     valid[store_q] &&
-                    is_load[store_q] &&
+                    (is_load[store_q] || is_store[store_q]) &&
                     seq_is_older(
                         alloc_seq[store_old],
                         alloc_seq[store_q]
@@ -874,7 +901,6 @@ module DispatchQueue #(
                 is_ld_st[q] ||
                 is_call[q] ||
                 is_ret[q] ||
-                pred_taken[q] ||
                 (system_op[q] != 3'd0);
 
             assign slot_fast_eligible[q] =
@@ -963,29 +989,26 @@ module DispatchQueue #(
         slot_ready &
         ~barrier_blocked &
         ~store_select_block &
+        ~store_age_blocked &
         ~fast_hold_onehot &
         ~issue_pending_onehot &
         ~fast_pending_onehot;
 
-    wire [3:0] oldest_main_pick = pick_oldest8(
-        main_candidate,
-        alloc_seq[0],
-        alloc_seq[1],
-        alloc_seq[2],
-        alloc_seq[3],
-        alloc_seq[4],
-        alloc_seq[5],
-        alloc_seq[6],
-        alloc_seq[7]
-    );
+    wire [DQ_DEPTH-1:0] main_refill_candidate =
+        main_candidate &
+        ~main_hold_onehot;
 
     wire [DQ_DEPTH-1:0] lane0_candidate =
         main_candidate &
         slot_lane0_only &
         ~main_hold_onehot;
 
+    wire [DQ_DEPTH-1:0] main_candidate_q_lane0 =
+        main_candidate_q &
+        slot_lane0_only;
+
     wire [3:0] lane0_pair_pick = pick_oldest8(
-        lane0_candidate,
+        main_candidate_q_lane0,
         alloc_seq[0],
         alloc_seq[1],
         alloc_seq[2],
@@ -996,41 +1019,14 @@ module DispatchQueue #(
         alloc_seq[7]
     );
 
-    wire [3:0] rr_main_pick =
-        pick_round_robin8(
-            main_candidate,
-            main_rr_ptr
-        );
-
-    wire use_resource_pair =
-        RESOURCE_AWARE_PAIRING &&
-        !ROUND_ROBIN_SELECT &&
-        !main_hold_valid &&
-        oldest_main_pick[3] &&
-        slot_fast_eligible[oldest_main_pick[2:0]] &&
-        lane0_pair_pick[3];
-
-    wire [3:0] main_pick =
-        ROUND_ROBIN_SELECT
-            ? rr_main_pick
-            : (
-                use_resource_pair
-                    ? lane0_pair_pick
-                    : oldest_main_pick
-            );
-
-    wire [DQ_DEPTH-1:0] main_refill_candidate =
-        main_candidate &
-        ~main_hold_onehot;
-
-    assign main_refill_pick =
+    wire [3:0] registered_main_pick =
         ROUND_ROBIN_SELECT
             ? pick_round_robin8(
-                main_refill_candidate,
+                main_candidate_q,
                 main_rr_ptr
             )
             : pick_oldest8(
-                main_refill_candidate,
+                main_candidate_q,
                 alloc_seq[0],
                 alloc_seq[1],
                 alloc_seq[2],
@@ -1041,19 +1037,38 @@ module DispatchQueue #(
                 alloc_seq[7]
             );
 
-    assign issue_found =
-        main_hold_valid
-            ? (
-                valid[main_hold_sel] &&
-                !issue_pending_onehot[main_hold_sel] &&
-                !fast_pending_onehot[main_hold_sel]
+    wire use_resource_pair =
+        RESOURCE_AWARE_PAIRING &&
+        !ROUND_ROBIN_SELECT &&
+        !main_hold_valid &&
+        registered_main_pick[3] &&
+        |(
+            (
+                ({DQ_DEPTH{1'b0}} |
+                 ({{(DQ_DEPTH-1){1'b0}}, 1'b1} <<
+                    registered_main_pick[2:0])) &
+                slot_fast_eligible
             )
-            : main_pick[3];
+        ) &&
+        lane0_pair_pick[3];
 
-    assign issue_sel =
-        main_hold_valid
-            ? main_hold_sel
-            : main_pick[2:0];
+    wire [3:0] main_pick =
+        use_resource_pair
+            ? lane0_pair_pick
+            : registered_main_pick;
+
+    wire [DQ_DEPTH-1:0] main_pick_onehot =
+        main_pick[3]
+            ? ({{(DQ_DEPTH-1){1'b0}}, 1'b1} << main_pick[2:0])
+            : {DQ_DEPTH{1'b0}};
+
+    // The live decision is now made from the registered ownership mask.  A
+    // one-bit validity check is retained for a slot cleared on the same edge;
+    // the wide system/store predicates no longer feed the hold-index D path.
+    wire main_pick_live =
+        main_pick[3] &&
+        valid[main_pick[2:0]] &&
+        !(main_pick_onehot & fast_hold_onehot);
 
     wire [DQ_DEPTH-1:0] fast_candidate =
         valid &
@@ -1061,37 +1076,99 @@ module DispatchQueue #(
         ~barrier_blocked &
         slot_fast_eligible &
         ~store_select_block &
+        ~store_age_blocked &
         ~main_hold_onehot &
         ~issue_pending_onehot &
         ~fast_pending_onehot;
 
-    wire [3:0] oldest_fast_pick = pick_oldest8(
-        fast_candidate,
-        alloc_seq[0],
-        alloc_seq[1],
-        alloc_seq[2],
-        alloc_seq[3],
-        alloc_seq[4],
-        alloc_seq[5],
-        alloc_seq[6],
-        alloc_seq[7]
-    );
+    wire [DQ_DEPTH-1:0] fast_refill_candidate =
+        fast_candidate &
+        ~fast_hold_onehot;
 
-    wire [3:0] rr_fast_pick =
-        pick_round_robin8(
-            fast_candidate,
-            fast_rr_ptr
-        );
+    wire [3:0] registered_fast_pick =
+        ROUND_ROBIN_SELECT
+            ? pick_round_robin8(
+                fast_candidate_q,
+                fast_rr_ptr
+            )
+            : pick_oldest8(
+                fast_candidate_q,
+                alloc_seq[0],
+                alloc_seq[1],
+                alloc_seq[2],
+                alloc_seq[3],
+                alloc_seq[4],
+                alloc_seq[5],
+                alloc_seq[6],
+                alloc_seq[7]
+            );
 
     wire [3:0] fast_pick =
-        ROUND_ROBIN_SELECT
-            ? rr_fast_pick
-            : oldest_fast_pick;
+        registered_fast_pick;
+
+    wire [DQ_DEPTH-1:0] fast_pick_onehot =
+        fast_pick[3]
+            ? ({{(DQ_DEPTH-1){1'b0}}, 1'b1} << fast_pick[2:0])
+            : {DQ_DEPTH{1'b0}};
+
+    wire fast_pick_live =
+        fast_pick[3] &&
+        valid[fast_pick[2:0]] &&
+        !(fast_pick_onehot & main_hold_onehot);
+
+    wire new_registered_select_collision =
+        !main_hold_valid &&
+        !fast_hold_valid &&
+        main_pick_live &&
+        fast_pick_live &&
+        (main_pick[2:0] == fast_pick[2:0]);
+
+    wire [DQ_DEPTH-1:0] main_prefetch_source =
+        main_hold_valid
+            ? main_refill_candidate
+            : main_candidate;
+
+    wire [DQ_DEPTH-1:0] fast_prefetch_source =
+        fast_hold_valid
+            ? fast_refill_candidate
+            : fast_candidate;
+
+    wire [DQ_DEPTH-1:0] main_prefetch_drop =
+        (main_select_capture || main_refill_valid)
+            ? main_pick_onehot
+            : {DQ_DEPTH{1'b0}};
+
+    wire [DQ_DEPTH-1:0] fast_prefetch_drop =
+        (fast_select_capture || fast_refill_valid)
+            ? fast_pick_onehot
+            : {DQ_DEPTH{1'b0}};
+
+    wire [DQ_DEPTH-1:0] main_candidate_next_q =
+        main_prefetch_source &
+        ~main_prefetch_drop;
+
+    wire [DQ_DEPTH-1:0] fast_candidate_next_q =
+        fast_prefetch_source &
+        ~fast_prefetch_drop;
 
     wire registered_select_collision =
         main_hold_valid &&
         fast_hold_valid &&
         (main_hold_sel == fast_hold_sel);
+
+    assign issue_found =
+        main_hold_valid
+            ? (
+                valid[main_hold_sel] &&
+                !issue_pending_onehot[main_hold_sel] &&
+                !fast_pending_onehot[main_hold_sel]
+            )
+            : main_pick_live;
+
+    assign issue_sel =
+        main_hold_valid
+            ? main_hold_sel
+            : main_pick[2:0];
 
     assign fast_issue_found =
         fast_hold_valid
@@ -1101,12 +1178,15 @@ module DispatchQueue #(
                 !fast_pending_onehot[fast_hold_sel] &&
                 !registered_select_collision
             )
-            : fast_pick[3];
+            : fast_pick_live;
 
     assign fast_issue_sel =
         fast_hold_valid
             ? fast_hold_sel
             : fast_pick[2:0];
+
+    assign main_refill_pick =
+        main_pick;
 
     always @(*) begin
         enq_sel = 3'h0;
@@ -1174,13 +1254,14 @@ module DispatchQueue #(
 
     wire main_new_store_candidate =
         !main_hold_valid &&
-        main_pick[3] &&
-        is_store[main_pick[2:0]];
+        main_pick_live &&
+        |(main_pick_onehot & live_store_mask);
 
     wire fast_new_store_candidate =
         !fast_hold_valid &&
-        fast_issue_found &&
-        is_store[fast_pick[2:0]];
+        !new_registered_select_collision &&
+        fast_pick_live &&
+        |(fast_pick_onehot & live_store_mask);
 
     wire new_store_lane1_is_older =
         main_new_store_candidate &&
@@ -1215,7 +1296,7 @@ module DispatchQueue #(
         !flush &&
         !system_flush &&
         !main_hold_valid &&
-        main_pick[3] &&
+        main_pick_live &&
         (
             !main_new_store_candidate ||
             main_new_store_grant
@@ -1225,7 +1306,8 @@ module DispatchQueue #(
         !flush &&
         !system_flush &&
         !fast_hold_valid &&
-        fast_issue_found &&
+        !new_registered_select_collision &&
+        fast_pick_live &&
         (
             !fast_new_store_candidate ||
             fast_new_store_grant
@@ -1305,25 +1387,37 @@ module DispatchQueue #(
             fast_store_payload_allow
         );
 
-    wire main_refill_selected_store =
+    wire main_refill_pick_live =
         main_refill_pick[3] &&
-        is_store[main_refill_pick[2:0]];
+        valid[main_refill_pick[2:0]] &&
+        !(main_pick_onehot & main_hold_onehot) &&
+        !(main_pick_onehot & fast_hold_onehot);
+
+    wire fast_refill_pick_live =
+        fast_refill_pick[3] &&
+        valid[fast_refill_pick[2:0]] &&
+        !(fast_pick_onehot & fast_hold_onehot) &&
+        !(fast_pick_onehot & main_hold_onehot);
+
+    wire main_refill_selected_store =
+        main_refill_pick_live &&
+        |(main_pick_onehot & live_store_mask);
 
     wire fast_refill_selected_store =
-        fast_refill_pick[3] &&
-        is_store[fast_refill_pick[2:0]];
+        fast_refill_pick_live &&
+        |(fast_pick_onehot & live_store_mask);
 
     assign main_refill_valid =
         main_payload_capture &&
         !main_hold_is_store &&
         !main_refill_selected_store &&
-        main_refill_pick[3];
+        main_refill_pick_live;
 
     assign fast_refill_valid =
         fast_payload_capture &&
         !fast_hold_is_store &&
         !fast_refill_selected_store &&
-        fast_refill_pick[3];
+        fast_refill_pick_live;
 
     wire issue_store_fire =
         main_payload_capture &&
@@ -1333,9 +1427,18 @@ module DispatchQueue #(
         fast_payload_capture &&
         fast_hold_is_store;
 
+    wire store_token_push_main =
+        issue_store_fire &&
+        store_token_pending_valid_q[0];
+
+    wire store_token_push_fast =
+        !store_token_push_main &&
+        fast_store_fire &&
+        store_token_pending_valid_q[1];
+
     wire store_token_push =
-        issue_store_fire ||
-        fast_store_fire;
+        store_token_push_main ||
+        store_token_push_fast;
 
     wire store_token_pop =
         (store_token_count_q != 2'd0) &&
@@ -1353,30 +1456,12 @@ module DispatchQueue #(
     always @(*) begin
         store_token_push_entry = '0;
 
-        if (issue_store_fire) begin
-            store_token_push_entry.uop_id =
-                uop_id[main_hold_sel];
-
-            store_token_push_entry.pc =
-                pc[main_hold_sel];
-
-            store_token_push_entry.store_mask =
-                ram_we[main_hold_sel];
-
-            store_token_push_entry.src1_id =
-                src1_id[main_hold_sel];
-        end else if (fast_store_fire) begin
-            store_token_push_entry.uop_id =
-                uop_id[fast_hold_sel];
-
-            store_token_push_entry.pc =
-                pc[fast_hold_sel];
-
-            store_token_push_entry.store_mask =
-                ram_we[fast_hold_sel];
-
-            store_token_push_entry.src1_id =
-                src1_id[fast_hold_sel];
+        if (store_token_push_main) begin
+            store_token_push_entry =
+                store_token_pending_q[0];
+        end else if (store_token_push_fast) begin
+            store_token_push_entry =
+                store_token_pending_q[1];
         end
 
         token_recover_count = 0;
@@ -1478,6 +1563,120 @@ module DispatchQueue #(
         end
     end
 
+    wire main_store_token_capture =
+        (
+            main_select_capture &&
+            main_new_store_grant
+        ) || (
+            main_store_grant_set &&
+            !store_token_pending_valid_q[0]
+        );
+
+    wire fast_store_token_capture =
+        (
+            fast_select_capture &&
+            fast_new_store_grant
+        ) || (
+            fast_store_grant_set &&
+            !store_token_pending_valid_q[1]
+        );
+
+    always @(posedge clk or negedge rstn) begin
+        if (!rstn) begin
+            store_token_pending_valid_q <= 2'b00;
+            store_token_pending_q[0] <= '0;
+            store_token_pending_q[1] <= '0;
+        end else if (
+            system_flush ||
+            (flush && !recover_valid)
+        ) begin
+            store_token_pending_valid_q <= 2'b00;
+            store_token_pending_q[0] <= '0;
+            store_token_pending_q[1] <= '0;
+        end else if (flush) begin
+            if (
+                recover_valid &&
+                store_token_pending_valid_q[0] &&
+                !uop_is_younger(
+                    store_token_pending_q[0].uop_id,
+                    recover_id
+                )
+            ) begin
+                store_token_pending_valid_q[0] <= 1'b1;
+            end else begin
+                store_token_pending_valid_q[0] <= 1'b0;
+            end
+
+            if (
+                recover_valid &&
+                store_token_pending_valid_q[1] &&
+                !uop_is_younger(
+                    store_token_pending_q[1].uop_id,
+                    recover_id
+                )
+            ) begin
+                store_token_pending_valid_q[1] <= 1'b1;
+            end else begin
+                store_token_pending_valid_q[1] <= 1'b0;
+            end
+        end else begin
+            if (store_token_push_main) begin
+                store_token_pending_valid_q[0] <= 1'b0;
+            end
+
+            if (store_token_push_fast) begin
+                store_token_pending_valid_q[1] <= 1'b0;
+            end
+
+            if (main_store_token_capture) begin
+                store_token_pending_valid_q[0] <= 1'b1;
+                if (main_select_capture) begin
+                    store_token_pending_q[0].uop_id <=
+                        uop_id[main_pick[2:0]];
+                    store_token_pending_q[0].pc <=
+                        pc[main_pick[2:0]];
+                    store_token_pending_q[0].store_mask <=
+                        ram_we[main_pick[2:0]];
+                    store_token_pending_q[0].src1_id <=
+                        src1_id[main_pick[2:0]];
+                end else begin
+                    store_token_pending_q[0].uop_id <=
+                        uop_id[main_hold_sel];
+                    store_token_pending_q[0].pc <=
+                        pc[main_hold_sel];
+                    store_token_pending_q[0].store_mask <=
+                        ram_we[main_hold_sel];
+                    store_token_pending_q[0].src1_id <=
+                        src1_id[main_hold_sel];
+                end
+            end
+
+            if (fast_store_token_capture) begin
+                store_token_pending_valid_q[1] <= 1'b1;
+                if (fast_select_capture) begin
+                    store_token_pending_q[1].uop_id <=
+                        uop_id[fast_pick[2:0]];
+                    store_token_pending_q[1].pc <=
+                        pc[fast_pick[2:0]];
+                    store_token_pending_q[1].store_mask <=
+                        ram_we[fast_pick[2:0]];
+                    store_token_pending_q[1].src1_id <=
+                        src1_id[fast_pick[2:0]];
+                end else begin
+                    store_token_pending_q[1].uop_id <=
+                        uop_id[fast_hold_sel];
+                    store_token_pending_q[1].pc <=
+                        pc[fast_hold_sel];
+                    store_token_pending_q[1].store_mask <=
+                        ram_we[fast_hold_sel];
+                    store_token_pending_q[1].src1_id <=
+                        src1_id[fast_hold_sel];
+                end
+            end
+
+        end
+    end
+
     always @(posedge clk or negedge rstn) begin
         if (!rstn) begin
             store_select_credit_q <= 1'b0;
@@ -1539,9 +1738,6 @@ module DispatchQueue #(
     reg [DQ_DEPTH-1:0] store_order_next_is_load;
     reg [DQ_DEPTH-1:0] store_order_next_is_store;
     reg [DQ_SEQ_W-1:0] store_order_next_seq [0:DQ_DEPTH-1];
-    wire older_store_any_refresh =
-        |older_store_pending_refresh;
-
     integer store_next_q;
     integer store_next_old;
 
@@ -2089,27 +2285,8 @@ module DispatchQueue #(
             perf_btb_hit[fast_issue_sel];
     end
 
-    wire [DQ_DEPTH-1:0] fast_refill_candidate =
-        fast_candidate &
-        ~fast_hold_onehot;
-
     assign fast_refill_pick =
-        ROUND_ROBIN_SELECT
-            ? pick_round_robin8(
-                fast_refill_candidate,
-                fast_rr_ptr
-            )
-            : pick_oldest8(
-                fast_refill_candidate,
-                alloc_seq[0],
-                alloc_seq[1],
-                alloc_seq[2],
-                alloc_seq[3],
-                alloc_seq[4],
-                alloc_seq[5],
-                alloc_seq[6],
-                alloc_seq[7]
-            );
+        fast_pick;
 
     always_comb begin
         issue[0] = '0;
@@ -2742,9 +2919,10 @@ module DispatchQueue #(
             fast_rr_ptr <= 3'h0;
             main_ownership_transfer_q <= 1'b0;
             fast_ownership_transfer_q <= 1'b0;
+            main_candidate_q <= {DQ_DEPTH{1'b0}};
+            fast_candidate_q <= {DQ_DEPTH{1'b0}};
             older_branch_pending_q <= {DQ_DEPTH{1'b0}};
             older_store_pending_q <= {DQ_DEPTH{1'b0}};
-            older_store_any_q <= 1'b0;
             issue_pending_valid <= 1'b0;
             issue_pending_sel <= 3'h0;
             fast_pending_valid <= 1'b0;
@@ -2834,9 +3012,10 @@ module DispatchQueue #(
             fast_rr_ptr <= 3'h0;
             main_ownership_transfer_q <= 1'b0;
             fast_ownership_transfer_q <= 1'b0;
+            main_candidate_q <= {DQ_DEPTH{1'b0}};
+            fast_candidate_q <= {DQ_DEPTH{1'b0}};
             older_branch_pending_q <= {DQ_DEPTH{1'b1}};
             older_store_pending_q <= older_store_pending_refresh;
-            older_store_any_q <= older_store_any_refresh;
 
             if (
                 recover_valid &&
@@ -2910,6 +3089,13 @@ module DispatchQueue #(
                 next_alloc_seq <=
                     {DQ_SEQ_W{1'b0}};
         end else begin
+            // Stage 1 of lane ownership.  Exclude only a token that will be
+            // consumed/refilled on this edge; otherwise retain the mask so a
+            // held lane can refill every cycle without rebuilding a priority
+            // tree in the hold-register D cone.
+            main_candidate_q <= main_candidate_next_q;
+            fast_candidate_q <= fast_candidate_next_q;
+
             main_ownership_transfer_q <=
                 main_select_capture ||
                 main_refill_valid;
@@ -3007,9 +3193,6 @@ module DispatchQueue #(
 
                 older_store_pending_q <=
                     older_store_pending_refresh;
-
-                older_store_any_q <=
-                    older_store_any_refresh;
             end
 
             if (

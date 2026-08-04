@@ -185,7 +185,13 @@ module FetchUnit (
     // IBUF count plus F1 and every accepted outstanding packet
     // are all reserved entries. This prevents a returned instruction from
     // overflowing IBUF while the backend is stalled.
-    wire fetch_dual_candidate = !pred_taken && (fetch_pc[4:2] != 3'd7);
+    // A redirect is a single-packet recovery transaction.  Keep its dual
+    // decision on the registered PC stream; redirect_pc therefore cannot
+    // fan into the F1 valid/CE network.
+    wire fetch_dual_candidate =
+        !redirect_pending &&
+        !pred_taken &&
+        (pc_reg[4:2] != 3'd7);
     wire [IBUF_PTR_W+1:0] ibuf_reserved =
         {1'b0, ibuf_count} +
         pending_slots +

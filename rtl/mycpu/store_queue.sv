@@ -122,10 +122,22 @@ module StoreQueue #(
 
     logic [COUNT_W-1:0] count;
 
+    // Keep the owner as a one-hot token.  The previous binary index was
+    // used both for variable entry reads and for the post-release reselect;
+    // that made owner_q -> owner_q a wide mux/compare feedback loop.  A
+    // one-hot token lets slot reuse and owner clearing stay bit-local.  The
+    // binary index below is a read-only decode for the payload view.
+    logic [DEPTH-1:0] release_owner_oh_q;
     logic release_owner_valid_q;
     logic [INDEX_W-1:0] release_owner_sel_q;
+    logic [DEPTH-1:0] release_owner_next_oh;
     logic release_owner_next_valid;
     logic [INDEX_W-1:0] release_owner_next_sel;
+    // Release acceptance is sampled before the age tree is allowed to
+    // reselect.  This removes store_data_ready from the owner register D
+    // cone; the one-cycle token boundary is local to SQ and does not stall
+    // the rest of the LSU.
+    logic release_do_q;
 `ifndef SYNTHESIS
     logic release_stall_q;
     logic release_owner_valid_prev_q;
@@ -146,6 +158,27 @@ module StoreQueue #(
     integer byte_i;
     integer alloc_scan;
     integer flush_dst;
+    integer owner_decode_i;
+
+    always_comb begin
+        release_owner_sel_q = '0;
+        release_owner_valid_q = 1'b0;
+        for (
+            owner_decode_i = 0;
+            owner_decode_i < DEPTH;
+            owner_decode_i = owner_decode_i + 1
+        ) begin
+            if (release_owner_oh_q[owner_decode_i]) begin
+                release_owner_sel_q =
+                    owner_decode_i[INDEX_W-1:0];
+                // Keep the valid bit tied to the same decoded slot as the
+                // binary view.  This remains safe even if a transient
+                // multi-hot token is observed during recovery.
+                release_owner_valid_q =
+                    entries[owner_decode_i].valid;
+            end
+        end
+    end
 
     function automatic [3:0] compute_store_wen(
         input [3:0] raw_mask,
@@ -700,9 +733,8 @@ module StoreQueue #(
         !release_fire;
 
     wire release_owner_reselect =
-        !release_owner_hold &&
         (
-            release_do ||
+            release_do_q ||
             r0_do ||
             r1_do ||
             (
@@ -744,11 +776,7 @@ module StoreQueue #(
                 !entries[alloc_scan].valid ||
                 (
                     release_do &&
-                    release_owner_valid_q &&
-                    (
-                        release_owner_sel_q ==
-                        alloc_scan
-                    )
+                    release_owner_oh_q[alloc_scan]
                 );
 
             if (alloc_free_mask[alloc_scan]) begin
@@ -978,6 +1006,23 @@ module StoreQueue #(
         logic [DEPTH-1:0] next_slot_valid;
         uop_id_t          next_slot_uop_id [0:DEPTH-1];
 
+        // The production StoreQueue depth is four.  Use a balanced
+        // tournament for the owner decision instead of the all-pairs
+        // has_older matrix followed by a priority encoder.  The latter
+        // replicated the age compare and encoded every physical slot in one
+        // long cone ending at release_owner_sel_q.D.
+        logic             pair01_valid;
+        logic             pair23_valid;
+        logic             root_valid;
+        logic [INDEX_W-1:0] pair01_sel;
+        logic [INDEX_W-1:0] pair23_sel;
+        logic [INDEX_W-1:0] root_sel;
+        uop_id_t           pair01_id;
+        uop_id_t           pair23_id;
+        uop_id_t           root_id;
+
+        // Retain a generic fallback for focused parameterized testbenches;
+        // DEPTH=4 takes only the balanced path above.
         logic [DEPTH-1:0] has_older;
         logic [DEPTH-1:0] oldest_onehot;
 
@@ -1000,16 +1045,23 @@ module StoreQueue #(
         end
 
         if (
-            release_do &&
-            release_owner_valid_q
+            release_do_q &&
+            release_owner_valid_q &&
+            !entries[release_owner_sel_q].valid
         ) begin
-            next_slot_valid[
-                release_owner_sel_q
-            ] = 1'b0;
-
-            next_slot_uop_id[
-                release_owner_sel_q
-            ] = '0;
+            // Clear the released slot bitwise.  Do not feed the decoded
+            // binary index back through a variable array read on the owner
+            // reselect path.
+            for (
+                owner_i = 0;
+                owner_i < DEPTH;
+                owner_i = owner_i + 1
+            ) begin
+                if (release_owner_oh_q[owner_i]) begin
+                    next_slot_valid[owner_i] = 1'b0;
+                    next_slot_uop_id[owner_i] = '0;
+                end
+            end
         end
 
         if (r0_do) begin
@@ -1037,78 +1089,149 @@ module StoreQueue #(
             ] = r1_uop_id;
         end
 
-        has_older = '0;
+        release_owner_next_oh = '0;
+        pair01_valid = 1'b0;
+        pair23_valid = 1'b0;
+        root_valid = 1'b0;
+        pair01_sel = '0;
+        pair23_sel = '0;
+        root_sel = '0;
+        pair01_id = '0;
+        pair23_id = '0;
+        root_id = '0;
 
-        for (
-            owner_i = 0;
-            owner_i < DEPTH;
-            owner_i = owner_i + 1
-        ) begin
-            for (
-                owner_j = 0;
-                owner_j < DEPTH;
-                owner_j = owner_j + 1
-            ) begin
-                if (
-                    (owner_i != owner_j) &&
-                    next_slot_valid[owner_i] &&
-                    next_slot_valid[owner_j] &&
+        if (DEPTH == 4) begin
+            // First level: oldest of physical slots 0/1.
+            if (next_slot_valid[0]) begin
+                pair01_valid = 1'b1;
+                pair01_sel = '0;
+                pair01_id = next_slot_uop_id[0];
+            end
+            if (next_slot_valid[1]) begin
+                if (!pair01_valid ||
                     uop_is_younger(
-                        next_slot_uop_id[owner_i],
-                        next_slot_uop_id[owner_j]
-                    )
-                ) begin
-                    has_older[owner_i] = 1'b1;
+                        pair01_id,
+                        next_slot_uop_id[1]
+                    )) begin
+                    pair01_valid = 1'b1;
+                    pair01_sel = 1;
+                    pair01_id = next_slot_uop_id[1];
                 end
             end
-        end
 
-        for (
-            owner_i = 0;
-            owner_i < DEPTH;
-            owner_i = owner_i + 1
-        ) begin
-            oldest_onehot[owner_i] =
-                next_slot_valid[owner_i] &&
-                !has_older[owner_i];
-        end
+            // First level: oldest of physical slots 2/3.
+            if (next_slot_valid[2]) begin
+                pair23_valid = 1'b1;
+                pair23_sel = 2;
+                pair23_id = next_slot_uop_id[2];
+            end
+            if (next_slot_valid[3]) begin
+                if (!pair23_valid ||
+                    uop_is_younger(
+                        pair23_id,
+                        next_slot_uop_id[3]
+                    )) begin
+                    pair23_valid = 1'b1;
+                    pair23_sel = 3;
+                    pair23_id = next_slot_uop_id[3];
+                end
+            end
 
-        release_owner_next_valid = 1'b0;
-        release_owner_next_sel = '0;
-        select_found = 1'b0;
+            // Second level: oldest winner of the two pairs.
+            if (pair01_valid) begin
+                root_valid = 1'b1;
+                root_sel = pair01_sel;
+                root_id = pair01_id;
+            end
+            if (pair23_valid) begin
+                if (!root_valid ||
+                    uop_is_younger(
+                        root_id,
+                        pair23_id
+                    )) begin
+                    root_valid = 1'b1;
+                    root_sel = pair23_sel;
+                    root_id = pair23_id;
+                end
+            end
 
-        if (!flush) begin
+            release_owner_next_valid =
+                !flush && root_valid;
+            release_owner_next_sel =
+                root_sel;
+            if (!flush && root_valid)
+                release_owner_next_oh[root_sel] = 1'b1;
+        end else begin
+            // Generic fallback for non-production queue depths.
+            has_older = '0;
             for (
                 owner_i = 0;
                 owner_i < DEPTH;
                 owner_i = owner_i + 1
             ) begin
-                if (
-                    oldest_onehot[owner_i] &&
-                    !select_found
+                for (
+                    owner_j = 0;
+                    owner_j < DEPTH;
+                    owner_j = owner_j + 1
                 ) begin
-                    release_owner_next_valid =
-                        1'b1;
-
-                    release_owner_next_sel =
-                        owner_i[INDEX_W-1:0];
-
-                    select_found = 1'b1;
+                    if (
+                        (owner_i != owner_j) &&
+                        next_slot_valid[owner_i] &&
+                        next_slot_valid[owner_j] &&
+                        uop_is_younger(
+                            next_slot_uop_id[owner_i],
+                            next_slot_uop_id[owner_j]
+                        )
+                    ) begin
+                        has_older[owner_i] = 1'b1;
+                    end
                 end
             end
+
+            oldest_onehot = '0;
+            for (
+                owner_i = 0;
+                owner_i < DEPTH;
+                owner_i = owner_i + 1
+            ) begin
+                oldest_onehot[owner_i] =
+                    next_slot_valid[owner_i] &&
+                    !has_older[owner_i];
+            end
+
+            release_owner_next_valid = 1'b0;
+            release_owner_next_sel = '0;
+            select_found = 1'b0;
+            if (!flush) begin
+                for (
+                    owner_i = 0;
+                    owner_i < DEPTH;
+                    owner_i = owner_i + 1
+                ) begin
+                    if (oldest_onehot[owner_i] && !select_found) begin
+                        release_owner_next_valid = 1'b1;
+                        release_owner_next_sel =
+                            owner_i[INDEX_W-1:0];
+                        select_found = 1'b1;
+                    end
+                end
+            end
+
+            if (release_owner_next_valid)
+                release_owner_next_oh[release_owner_next_sel] = 1'b1;
         end
     end
 
     always_ff @(posedge clk or negedge rstn) begin
         if (!rstn || flush) begin
-            release_owner_valid_q <= 1'b0;
-            release_owner_sel_q <= '0;
+            release_owner_oh_q <= '0;
+            release_do_q <= 1'b0;
         end else if (release_owner_reselect) begin
-            release_owner_valid_q <=
-                release_owner_next_valid;
-
-            release_owner_sel_q <=
-                release_owner_next_sel;
+            release_owner_oh_q <=
+                release_owner_next_oh;
+            release_do_q <= release_do;
+        end else begin
+            release_do_q <= release_do;
         end
     end
 
