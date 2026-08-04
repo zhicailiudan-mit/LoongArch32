@@ -565,8 +565,8 @@ module DispatchQueue #(
 
     wire [2:0] store_reserved_count =
         {1'b0, store_token_count_q} +
-        main_hold_store_grant_q +
-        fast_hold_store_grant_q;
+        {2'b0, store_token_pending_valid_q[0]} +
+        {2'b0, store_token_pending_valid_q[1]};
 
     wire store_reservation_available = store_select_credit_q;
 
@@ -870,8 +870,8 @@ module DispatchQueue #(
                 wake3_src1_vec[q] ? commit1_value :
                 rD2[q];
 
-            assign src0_select_ready[q] = src0_ready[q];
-            assign src1_select_ready[q] = src1_ready[q];
+            assign src0_select_ready[q] = src0_ready_eff[q];
+            assign src1_select_ready[q] = src1_ready_eff[q];
 
             assign slot_ready[q] =
                 src0_select_ready[q] &&
@@ -1419,30 +1419,41 @@ module DispatchQueue #(
         !fast_refill_selected_store &&
         fast_refill_pick_live;
 
-    wire issue_store_fire =
-        main_payload_capture &&
-        main_hold_is_store;
+    wire store_token_pop =
+        (store_token_count_q != 2'd0) &&
+        store_issue_pending_ready;
 
-    wire fast_store_fire =
-        fast_payload_capture &&
-        fast_hold_is_store;
+    wire store_token_fifo_space =
+        (store_token_count_q != 2'd2) ||
+        store_token_pop;
+
+    // The token transfer is decoupled from the issue event.  A granted
+    // Store enters the token FIFO as soon as space exists, so the
+    // Scheduler intent pipeline and the SQ reservation are fed from the
+    // grant boundary instead of the execution-lane issue path (which
+    // reached the FIFO clock enable through the issue_ready cone).  The
+    // two pending slots are pushed in age order so the FIFO stays globally
+    // ordered; the SQ remains the hard backstop through the credit gate.
+    wire pending0_is_older =
+        !store_token_pending_valid_q[1] ||
+        !uop_is_younger(
+            store_token_pending_q[0].uop_id,
+            store_token_pending_q[1].uop_id
+        );
 
     wire store_token_push_main =
-        issue_store_fire &&
-        store_token_pending_valid_q[0];
+        store_token_fifo_space &&
+        store_token_pending_valid_q[0] &&
+        pending0_is_older;
 
     wire store_token_push_fast =
-        !store_token_push_main &&
-        fast_store_fire &&
-        store_token_pending_valid_q[1];
+        store_token_fifo_space &&
+        store_token_pending_valid_q[1] &&
+        !store_token_push_main;
 
     wire store_token_push =
         store_token_push_main ||
         store_token_push_fast;
-
-    wire store_token_pop =
-        (store_token_count_q != 2'd0) &&
-        store_issue_pending_ready;
 
     wire store_token_push_accept =
         store_token_push;
@@ -3474,10 +3485,10 @@ module DispatchQueue #(
             if (store_reserved_count > 3'd2)
                 $fatal(
                     1,
-                    "DispatchQueue Store ownership overflow: tokens=%0d main_grant=%0d fast_grant=%0d",
+                    "DispatchQueue Store ownership overflow: tokens=%0d pending0=%0d pending1=%0d",
                     store_token_count_q,
-                    main_hold_store_grant_q,
-                    fast_hold_store_grant_q
+                    store_token_pending_valid_q[0],
+                    store_token_pending_valid_q[1]
                 );
 
             if (
@@ -3491,7 +3502,8 @@ module DispatchQueue #(
                 );
 
             if (
-                issue_store_fire &&
+                main_payload_capture &&
+                main_hold_is_store &&
                 !main_hold_store_grant_q
             )
                 $fatal(
@@ -3500,7 +3512,8 @@ module DispatchQueue #(
                 );
 
             if (
-                fast_store_fire &&
+                fast_payload_capture &&
+                fast_hold_is_store &&
                 !fast_hold_store_grant_q
             )
                 $fatal(
@@ -3526,18 +3539,6 @@ module DispatchQueue #(
                     "DispatchQueue lane1 Store grant lost its owner"
                 );
         end
-
-        if (
-            rstn &&
-            !flush &&
-            !system_flush &&
-            issue_store_fire &&
-            fast_store_fire
-        )
-            $fatal(
-                1,
-                "DispatchQueue dual Store capture crossed single-push token boundary"
-            );
     end
 `endif
 
