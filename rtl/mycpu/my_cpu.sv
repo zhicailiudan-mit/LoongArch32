@@ -1015,6 +1015,52 @@ module MyCpu (
                     end
                 end
                 $display("----------------------------------------------------------");
+                $display("SQ PROBE: release_candidate_valid=%b release_fire=%b release_do=%b owner_valid_q=%b owner_sel=%0d",
+                         u_load_store_unit.u_store_queue.release_candidate_valid,
+                         u_load_store_unit.u_store_queue.release_fire,
+                         u_load_store_unit.u_store_queue.release_do,
+                         u_load_store_unit.u_store_queue.release_owner_valid_q,
+                         u_load_store_unit.u_store_queue.release_owner_sel_q);
+                for (int ss = 0; ss < 4; ss = ss + 1) begin
+                    $display("  SQ[%0d]: addr_ready=%b unaligned=%b valid=%b",
+                             ss,
+                             u_load_store_unit.u_store_queue.entries[ss].addr_ready,
+                             u_load_store_unit.u_store_queue.entries[ss].unaligned,
+                             u_load_store_unit.u_store_queue.entries[ss].valid);
+                end
+                $display("  reserve0_valid=%b reserve0_ready=%b reserve1_valid=%b reserve1_ready=%b intent_cnt=%0d",
+                         u_ooo_backend.u_scheduler.reserve0_valid,
+                         u_load_store_unit.u_store_queue.reserve0_ready,
+                         u_ooo_backend.u_scheduler.reserve1_valid,
+                         u_load_store_unit.u_store_queue.reserve1_ready,
+                         u_ooo_backend.u_scheduler.store_intent_count_q);
+                $display("  tok_cnt=%0d tok_pend0=%b tok_pend1=%b age_blocked=%b sel_block=%b credit_q=%b",
+                         u_ooo_backend.u_scheduler.u_dispatch_queue.store_token_count_q,
+                         u_ooo_backend.u_scheduler.u_dispatch_queue.store_token_pending_valid_q[0],
+                         u_ooo_backend.u_scheduler.u_dispatch_queue.store_token_pending_valid_q[1],
+                         |u_ooo_backend.u_scheduler.u_dispatch_queue.store_age_blocked,
+                         |u_ooo_backend.u_scheduler.u_dispatch_queue.store_select_block,
+                         u_ooo_backend.u_scheduler.u_dispatch_queue.store_select_credit_q);
+                $display("  issue_v0=%b issue_r0=%b issue_v1=%b issue_r1=%b store0_raw=%b store1_raw=%b sys_inflight=%b",
+                         u_ooo_backend.u_scheduler.issue0_valid,
+                         u_ooo_backend.u_scheduler.issue0_ready,
+                         u_ooo_backend.u_scheduler.issue1_valid,
+                         u_ooo_backend.u_scheduler.issue1_ready,
+                         u_load_store_unit.store0_raw, u_load_store_unit.store1_raw,
+                         u_ooo_backend.u_scheduler.system_inflight);
+                $display("  ack0=%b ack0_q=%b au0_valid=%b au0_q_valid=%b",
+                         u_load_store_unit.u_store_queue.addr_update0_ack,
+                         u_load_store_unit.addr_update0_ack_q,
+                         u_load_store_unit.addr_update0_valid,
+                         u_load_store_unit.u_store_queue.addr_update0_q_valid);
+                $display("  dq_issue_valid0=%b dq_issue_valid1=%b issue_found=%b",
+                         u_ooo_backend.u_scheduler.dq_issue_valid[0],
+                         u_ooo_backend.u_scheduler.dq_issue_valid[1],
+                         u_ooo_backend.u_scheduler.u_dispatch_queue.issue_found);
+                $display("  older_store_pending=%b live_store_mask=%b",
+                         |u_ooo_backend.u_scheduler.u_dispatch_queue.older_store_pending,
+                         |u_ooo_backend.u_scheduler.u_dispatch_queue.live_store_mask);
+                $display("----------------------------------------------------------");
                 $display("STORE QUEUE (SQ): occupancy=%0d", u_load_store_unit.u_store_queue.count);
                 for (int s = 0; s < 4; s = s + 1) begin
                     if (s < u_load_store_unit.u_store_queue.count) begin

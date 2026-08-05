@@ -47,6 +47,18 @@ module PrivilegeSystem (
     logic [1:0] pending_mode;
     logic [31:0] pending_addr;
 
+    // The cache maintenance handshake (maint_valid -> cache -> maint_done)
+    // crosses into the dcache/L2 whose flush/refill burst machinery forms a
+    // deep combinational chain (FSM -> invalidate -> burst counters -> BRAM
+    // address).  The valid is registered at the boundary so the maintenance
+    // FSM's combinational output terminates at a register; the handshake is
+    // level-based and the FSM advances only on the registered valid, so the
+    // +1 latency on the (rare, serialized) maintenance op changes nothing.
+    logic icache_maint_valid_c;
+    logic dcache_maint_valid_c;
+    logic icache_maint_valid_q;
+    logic dcache_maint_valid_q;
+
     logic [31:0] csr_old_value;
     logic [31:0] csr_write_mask;
     logic [31:0] csr_exchange_mask;
@@ -111,13 +123,16 @@ module PrivilegeSystem (
     end
 
     always_comb begin
-        icache_maint_valid = (ps_state == PS_SEND) && need_icache && !icache_sent;
-        dcache_maint_valid = (ps_state == PS_SEND) && need_dcache && !dcache_sent;
+        icache_maint_valid_c = (ps_state == PS_SEND) && need_icache && !icache_sent;
+        dcache_maint_valid_c = (ps_state == PS_SEND) && need_dcache && !dcache_sent;
         cache_maint_all = pending_all;
         cache_maint_mode = pending_mode;
         cache_maint_addr = pending_addr;
         cache_maint_ctag = state_r.ctag;
     end
+
+    assign icache_maint_valid = icache_maint_valid_q;
+    assign dcache_maint_valid = dcache_maint_valid_q;
 
     always_ff @(posedge cpu_clk or negedge cpu_rstn) begin
         if (!cpu_rstn) begin
@@ -146,8 +161,12 @@ module PrivilegeSystem (
             pending_all <= 1'b0;
             pending_mode <= 2'b00;
             pending_addr <= 32'h0000_0000;
+            icache_maint_valid_q <= 1'b0;
+            dcache_maint_valid_q <= 1'b0;
         end else begin
             rsp_r <= '0;
+            icache_maint_valid_q <= icache_maint_valid_c;
+            dcache_maint_valid_q <= dcache_maint_valid_c;
 
             case (ps_state)
                 PS_IDLE: begin

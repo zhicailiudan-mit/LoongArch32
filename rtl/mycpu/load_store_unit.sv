@@ -347,12 +347,12 @@ module LoadStoreUnit #(
         direct_valid = execute_result.valid && !flush &&
                        (!execute_result.is_ld_st || execute_result.ldst_unalign ||
                         (store0_raw &&
-                         (DECOUPLED_STORE_RESERVATION ? addr_update0_ack :
+                         (DECOUPLED_STORE_RESERVATION ? addr_update0_ack_q :
                                                        store0_accept)));
         direct1_valid = execute_result1.valid && !flush &&
                         (execute_result1.ldst_unalign ||
                          (store1_raw &&
-                          (DECOUPLED_STORE_RESERVATION ? addr_update1_ack :
+                          (DECOUPLED_STORE_RESERVATION ? addr_update1_ack_q :
                                                         store1_accept)));
 
         load_entry = '0;
@@ -418,11 +418,45 @@ module LoadStoreUnit #(
 
     end
 
+    // ---------------------------------------------------------------------
+    // Registered LSU acceptance boundary.  The lane issue handshake is the
+    // CPU-wide critical feedback loop: the LSU's acceptance (LQ ready, SQ
+    // address-update ack) used to be consumed *combinationally* by the lanes'
+    // suspend (result_stall), which fed issue_ready back into the DQ
+    // payload/hold registers through the execution-lane result cone (ALU /
+    // muldiv / unalign / LQ state), the reported 27-level mycpu_top path.
+    //
+    // Registering the acceptance signals here moves that cone behind a
+    // flip-flop.  The lanes stall on the *registered* ready/ack and fire one
+    // cycle after the queues actually accepted their result on the previous
+    // edge.  The queues still accept combinationally against their own state,
+    // so the one-cycle lag is a pure latency increase: no throughput loss
+    // (the lane fires every cycle in steady state) and no overflow (a lane
+    // only fires for a result the queue already took).
+    logic load_ready_q;
+    logic load1_ready_q;
+    logic addr_update0_ack_q;
+    logic addr_update1_ack_q;
+
+    always_ff @(posedge cpu_clk or negedge cpu_rstn) begin
+        if (!cpu_rstn) begin
+            load_ready_q       <= 1'b0;
+            load1_ready_q      <= 1'b0;
+            addr_update0_ack_q <= 1'b0;
+            addr_update1_ack_q <= 1'b0;
+        end else begin
+            load_ready_q       <= load_ready;
+            load1_ready_q      <= load1_ready;
+            addr_update0_ack_q <= addr_update0_ack;
+            addr_update1_ack_q <= addr_update1_ack;
+        end
+    end
+
     always @(*) begin
         for (order_i = 0; order_i < SQ_DEPTH; order_i = order_i + 1)
             store_order_valid[order_i] = store_valid_vec[order_i] &&
                 !uop_is_younger(store_uop_id_flat[order_i*`UOP_ID_W +: `UOP_ID_W],
-                                load_head.uop_id);
+                                lq_entries[load_order_idx_q].uop_id);
 
         // Reservation intents have no address yet, but only intents older
         // than the current Load may block it.  Treating every reservation as
@@ -444,7 +478,9 @@ module LoadStoreUnit #(
         order_uop_id_flat = {reserve1_uop_id, reserve0_uop_id, buffer_uop_id_flat, store_uop_id_flat};
         order_byte_uop_id_flat = {{4{reserve1_uop_id}}, {4{reserve0_uop_id}}, buffer_byte_uop_id_flat, store_byte_uop_id_flat};
 
-        load_ren = make_load_ren(load_head.load_ext_op, load_head.address[1:0]);
+        load_ren = make_load_ren(
+            lq_entries[load_order_idx_q].load_ext_op,
+            lq_entries[load_order_idx_q].address[1:0]);
         load_forward_mask = 4'b0;
         load_forward_data = 32'b0;
         load_forward_id_flat = '0;
@@ -503,7 +539,7 @@ module LoadStoreUnit #(
             for (order_i = 0; order_i < STORE_SLOTS; order_i = order_i + 1) begin
                 if (order_valid[order_i] && order_addr_ready[order_i] &&
                     ((order_addr_flat[order_i*32 +: 32] & 32'hffff_fffc) ==
-                     (load_head.address & 32'hffff_fffc))) begin
+                     (lq_entries[load_order_idx_q].address & 32'hffff_fffc))) begin
                     for (order_byte = 0; order_byte < 4; order_byte = order_byte + 1) begin
                         if (order_wen_flat[order_i*4 + order_byte] &&
                             (!ref_cand_valid[order_byte] ||
@@ -548,14 +584,14 @@ module LoadStoreUnit #(
                              ((load_forward_mask & load_ren) == load_ren);
 
         ldst_suspend = !flush &&
-                       ((load0_raw && !load_ready) ||
+                       ((load0_raw && !load_ready_q) ||
                         (store0_raw &&
-                         !(DECOUPLED_STORE_RESERVATION ? addr_update0_ack :
+                         !(DECOUPLED_STORE_RESERVATION ? addr_update0_ack_q :
                                                            store_ready)));
         ldst1_suspend = !flush &&
-                        ((load1_raw && !load1_ready) ||
+                        ((load1_raw && !load1_ready_q) ||
                          (store1_raw &&
-                          !(DECOUPLED_STORE_RESERVATION ? addr_update1_ack :
+                          !(DECOUPLED_STORE_RESERVATION ? addr_update1_ack_q :
                                                             store1_ready)));
         perf_lq_occupancy = lq_occupancy;
         perf_sq_occupancy = sq_occupancy;
@@ -710,7 +746,7 @@ module LoadStoreUnit #(
     assign store_release_fire = store_release_valid && buffer_ready && !flush;
 
     MemoryOrderChecker #(.STORE_SLOTS(STORE_SLOTS)) u_memory_order_checker (
-        .load_valid(load_head_valid), .load_addr(load_head.address),
+        .load_valid(load_head_valid), .load_addr(lq_entries[load_order_idx_q].address),
         .load_ren(load_ren), .store_valid(order_valid),
         .store_addr_ready(order_addr_ready),
         .store_addr_flat(order_addr_flat), .store_wen_flat(order_wen_flat),
@@ -784,7 +820,14 @@ module LoadStoreUnit #(
             // ownership.  This resamples Store address/data readiness and the
             // forwarding tree, while the post-pop index still names the
             // pre-pop selected Load in the compacted LoadQueue view.
-            load_order_head_q       <= load_head;
+            // The head snapshot is read through the *registered* index
+            // (lq_entries[load_order_idx_q]) instead of the combinational
+            // priority selection: the selection's cone (unissued vector,
+            // MMIO/ROB-head checks, issue side-effects) used to land in
+            // load_order_head_q/D through a variable-indexed wide mux, the
+            // reported LSU critical path.
+            load_order_head_q <=
+                lq_entries[load_order_idx_q];
             load_order_head_valid_q <= load_head_valid;
             load_order_idx_q        <= selected_lq_idx_after_pop;
             load_order_ren_q        <= load_ren;

@@ -2,12 +2,23 @@ import subprocess
 import os
 import re
 import time
+import sys
 import concurrent.futures
 
 REPO_ROOT = r"C:\Users\wanlinc\Desktop\Me\Loogn cpu v1\func_test\soc_verify"
 TCL_SCRIPT = os.path.join(REPO_ROOT, "run_vivado", "run_ooc_probe.tcl")
 OUT_ROOT = os.path.join(REPO_ROOT, "run_vivado", "probe_results")
-VIVADO_BIN = r"D:\vavido\Vivado\2023.2\bin\vivado.bat"
+# Toolchain selection: override with the VIVADO_BIN environment variable,
+# e.g.  PowerShell:  $env:VIVADO_BIN="D:\wanlinc\Xilinx_Vivado_2019.2_1106_2127\Vivado\2019.2\bin\vivado.bat"
+#       git-bash:    VIVADO_BIN=... python run_probe6.py
+# or pass it as the first command-line argument:  python run_probe6.py <path-to-vivado.bat>
+_DEFAULT_VIVADO_BIN = r"D:\vavido\Vivado\2023.2\bin\vivado.bat"
+VIVADO_BIN = (
+    os.environ.get("VIVADO_BIN")
+    or (sys.argv[1] if len(sys.argv) > 1 else None)
+    or _DEFAULT_VIVADO_BIN
+)
+print(f"=== Probe toolchain: {VIVADO_BIN} ===", flush=True)
 
 MODULES_OOC_80 = [
     ("DispatchQueue", "dispatch_queue_80"),

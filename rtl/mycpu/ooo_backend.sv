@@ -88,7 +88,12 @@ module OooBackend (
 
     wire decoded_uop_t decode_uop [0:1];
     wire dispatch_uop_t dispatch [0:1];
+    wire dispatch_uop_t dispatch_q [0:1];
     wire [1:0] dispatch_valid;
+    wire dispatch0_fire_q;
+    wire dispatch1_fire_q;
+    wire dispatch0_fire_comb;
+    wire dispatch1_fire_comb;
     wire [1:0] scheduler_dispatch_ready;
     wire [1:0] rob_alloc_ready;
     wire uop_id_t rob_alloc_id [0:1];
@@ -152,7 +157,12 @@ module OooBackend (
         .rob_query_value          (rob_query_value),
         .rob_query_id             (rob_query_id),
         .complete                 (complete),
-        .dispatch                 (dispatch)
+        .dispatch                 (dispatch),
+        .dispatch_q               (dispatch_q),
+        .dispatch0_fire_q         (dispatch0_fire_q),
+        .dispatch1_fire_q         (dispatch1_fire_q),
+        .dispatch0_fire_comb      (dispatch0_fire_comb),
+        .dispatch1_fire_comb      (dispatch1_fire_comb)
     );
 
     assign dispatch_valid[0] = dispatch[0].valid;
@@ -168,20 +178,20 @@ module OooBackend (
         .system_flush         (system_flush),
         .recover_id           (recover_id),
         .barrier_release      (system_complete.valid),
-        .dispatch0_valid      (dispatch[0].valid),
+        .dispatch0_valid      (dispatch0_fire_q),
         .dispatch0_ready      (scheduler_dispatch_ready[0]),
-        .dispatch0_uop        (dispatch[0].uop),
-        .dispatch0_src0_ready (dispatch[0].src0_ready),
-        .dispatch0_src0_id    (dispatch[0].src0_id),
-        .dispatch0_src1_ready (dispatch[0].src1_ready),
-        .dispatch0_src1_id    (dispatch[0].src1_id),
-        .dispatch1_valid      (dispatch[1].valid),
+        .dispatch0_uop        (dispatch_q[0].uop),
+        .dispatch0_src0_ready (dispatch_q[0].src0_ready),
+        .dispatch0_src0_id    (dispatch_q[0].src0_id),
+        .dispatch0_src1_ready (dispatch_q[0].src1_ready),
+        .dispatch0_src1_id    (dispatch_q[0].src1_id),
+        .dispatch1_valid      (dispatch1_fire_q),
         .dispatch1_ready      (scheduler_dispatch_ready[1]),
-        .dispatch1_uop        (dispatch[1].uop),
-        .dispatch1_src0_ready (dispatch[1].src0_ready),
-        .dispatch1_src0_id    (dispatch[1].src0_id),
-        .dispatch1_src1_ready (dispatch[1].src1_ready),
-        .dispatch1_src1_id    (dispatch[1].src1_id),
+        .dispatch1_uop        (dispatch_q[1].uop),
+        .dispatch1_src0_ready (dispatch_q[1].src0_ready),
+        .dispatch1_src0_id    (dispatch_q[1].src0_id),
+        .dispatch1_src1_ready (dispatch_q[1].src1_ready),
+        .dispatch1_src1_id    (dispatch_q[1].src1_id),
         .complete0            (scheduler_complete0),
         .complete1            (complete[1]),
         .system_complete      (scheduler_system_complete),
@@ -247,7 +257,7 @@ module OooBackend (
         .rstn         (rstn),
         .recover_valid(recover_valid),
         .recover_id   (recover_id),
-        .alloc_valid  (dispatch_valid),
+        .alloc_valid  ({dispatch1_fire_comb, dispatch0_fire_comb}),
         .alloc_ready  (rob_alloc_ready),
         .alloc_id     (rob_alloc_id),
         .alloc_uop    (alloc_uop),

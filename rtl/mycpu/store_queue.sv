@@ -104,6 +104,24 @@ module StoreQueue #(
     completion_t commit_data_wakeup0_q;
     completion_t commit_data_wakeup1_q;
 
+    // Allocation payload registers.  Reservation only writes the narrow
+    // entry header; the wide store data (value + readiness) is captured
+    // into these two fixed registers on the reservation edge and written
+    // back into the physical raw_store_data array on the following cycle
+    // by uop_id match.  This removes the variable-indexed wide write from
+    // the reservation D cone (credit loop -> alloc select -> raw_store_data
+    // write port).  The effective_* bypass below keeps release and
+    // forwarding visibility unchanged.
+    typedef struct packed {
+        logic        valid;
+        uop_id_t     uop_id;
+        logic        data_ready;
+        logic [31:0] data_value;
+    } sq_alloc_data_t;
+
+    sq_alloc_data_t alloc_data0_q;
+    sq_alloc_data_t alloc_data1_q;
+
     logic addr_update0_q_valid;
     uop_id_t addr_update0_q_uop_id;
     logic [31:0] addr_update0_q_address;
@@ -238,6 +256,12 @@ module StoreQueue #(
         input logic au1_q_valid,
         input uop_id_t au1_q_uop_id,
         input logic au1_q_data_ready,
+        input logic ad0_q_valid,
+        input uop_id_t ad0_q_uop_id,
+        input logic ad0_q_data_ready,
+        input logic ad1_q_valid,
+        input uop_id_t ad1_q_uop_id,
+        input logic ad1_q_data_ready,
         input completion_t c0,
         input completion_t c1,
         input completion_t k0,
@@ -262,6 +286,24 @@ module StoreQueue #(
                     au1_q_uop_id
                 ) &&
                 au1_q_data_ready
+            ) begin
+                update_sq_data_ready = 1'b1;
+            end else if (
+                ad0_q_valid &&
+                uop_id_equal(
+                    cur_entry_uop_id,
+                    ad0_q_uop_id
+                ) &&
+                ad0_q_data_ready
+            ) begin
+                update_sq_data_ready = 1'b1;
+            end else if (
+                ad1_q_valid &&
+                uop_id_equal(
+                    cur_entry_uop_id,
+                    ad1_q_uop_id
+                ) &&
+                ad1_q_data_ready
             ) begin
                 update_sq_data_ready = 1'b1;
             end else if (
@@ -307,6 +349,14 @@ module StoreQueue #(
         input uop_id_t au1_q_uop_id,
         input logic au1_q_data_ready,
         input logic [31:0] au1_q_data_value,
+        input logic ad0_q_valid,
+        input uop_id_t ad0_q_uop_id,
+        input logic ad0_q_data_ready,
+        input logic [31:0] ad0_q_data_value,
+        input logic ad1_q_valid,
+        input uop_id_t ad1_q_uop_id,
+        input logic ad1_q_data_ready,
+        input logic [31:0] ad1_q_data_value,
         input completion_t c0,
         input completion_t c1,
         input completion_t k0,
@@ -335,6 +385,26 @@ module StoreQueue #(
             ) begin
                 update_sq_data_value =
                     au1_q_data_value;
+            end else if (
+                ad0_q_valid &&
+                uop_id_equal(
+                    cur_entry_uop_id,
+                    ad0_q_uop_id
+                ) &&
+                ad0_q_data_ready
+            ) begin
+                update_sq_data_value =
+                    ad0_q_data_value;
+            end else if (
+                ad1_q_valid &&
+                uop_id_equal(
+                    cur_entry_uop_id,
+                    ad1_q_uop_id
+                ) &&
+                ad1_q_data_ready
+            ) begin
+                update_sq_data_value =
+                    ad1_q_data_value;
             end else if (
                 c0.valid &&
                 c0.reg_write &&
@@ -767,8 +837,23 @@ module StoreQueue #(
             alloc_scan = alloc_scan + 1
         ) begin
             alloc_free_mask[alloc_scan] =
-                !entries[alloc_scan].valid ||
                 (
+                    !entries[alloc_scan].valid &&
+                    !(
+                        reserve0_payload_q.valid &&
+                        (
+                            reserve0_payload_q.alloc_sel ==
+                            alloc_scan[INDEX_W-1:0]
+                        )
+                    ) &&
+                    !(
+                        reserve1_payload_q.valid &&
+                        (
+                            reserve1_payload_q.alloc_sel ==
+                            alloc_scan[INDEX_W-1:0]
+                        )
+                    )
+                ) || (
                     release_do &&
                     release_owner_oh_q[alloc_scan]
                 );
@@ -865,6 +950,83 @@ module StoreQueue #(
         end
     end
 
+`ifndef SYNTHESIS
+    // Deadlock-diagnosis trace: store address pipeline events.
+    always @(posedge clk) begin
+        if (rstn && !flush) begin
+            if (r0_do)
+                $display("[SQ-TRACE %0t] r0_do uop={ep:%0d,tag:%0d} has_addr=%b addr=%x ack=%b",
+                         $time, r0_uop_id.epoch, r0_uop_id.rob_tag, r0_has_addr, r0_addr, addr_update0_ack);
+            if (r1_do)
+                $display("[SQ-TRACE %0t] r1_do uop={ep:%0d,tag:%0d} has_addr=%b addr=%x ack=%b",
+                         $time, r1_uop_id.epoch, r1_uop_id.rob_tag, r1_has_addr, r1_addr, addr_update1_ack);
+            if (addr_update0_valid)
+                $display("[SQ-TRACE %0t] au0 uop={ep:%0d,tag:%0d} addr=%x ack=%b",
+                         $time, addr_update0_uop_id.epoch, addr_update0_uop_id.rob_tag, addr_update0_address, addr_update0_ack);
+            if (addr_update1_valid)
+                $display("[SQ-TRACE %0t] au1 uop={ep:%0d,tag:%0d} addr=%x ack=%b",
+                         $time, addr_update1_uop_id.epoch, addr_update1_uop_id.rob_tag, addr_update1_address, addr_update1_ack);
+            if (addr_update0_q_valid)
+                $display("[SQ-TRACE %0t] au0_q uop={ep:%0d,tag:%0d} addr=%x",
+                         $time, addr_update0_q_uop_id.epoch, addr_update0_q_uop_id.rob_tag, addr_update0_q_address);
+            if (addr_update1_q_valid)
+                $display("[SQ-TRACE %0t] au1_q uop={ep:%0d,tag:%0d} addr=%x",
+                         $time, addr_update1_q_uop_id.epoch, addr_update1_q_uop_id.rob_tag, addr_update1_q_address);
+            if (release_do)
+                $display("[SQ-TRACE %0t] release uop={ep:%0d,tag:%0d} addr=%x",
+                         $time, entries[release_owner_sel_q].uop_id.epoch,
+                         entries[release_owner_sel_q].uop_id.rob_tag,
+                         entries[release_owner_sel_q].address);
+        end
+    end
+`endif
+
+    // Registered allocation-payload bypass.  A store reserved with its data
+    // already present is captured into alloc_data*_q on the reservation
+    // edge and written into the physical array one cycle later.  Until that
+    // write-back lands, release, store-to-load forwarding and the memory
+    // order checker must observe the effective value (registered payload
+    // matched by uop_id), not the stale array contents.  This keeps the
+    // data visible in the same cycle as before the split.
+    logic [DEPTH-1:0] alloc_data0_match;
+    logic [DEPTH-1:0] alloc_data1_match;
+    logic [DEPTH-1:0] effective_store_data_ready;
+    logic [DEPTH*32-1:0] effective_raw_store_data;
+
+    always_comb begin
+        for (integer eff_i = 0; eff_i < DEPTH; eff_i = eff_i + 1) begin
+            alloc_data0_match[eff_i] =
+                alloc_data0_q.valid &&
+                entries[eff_i].valid &&
+                uop_id_equal(
+                    entries[eff_i].uop_id,
+                    alloc_data0_q.uop_id
+                );
+
+            alloc_data1_match[eff_i] =
+                alloc_data1_q.valid &&
+                entries[eff_i].valid &&
+                uop_id_equal(
+                    entries[eff_i].uop_id,
+                    alloc_data1_q.uop_id
+                );
+
+            effective_store_data_ready[eff_i] =
+                store_data_ready[eff_i] ||
+                alloc_data0_match[eff_i] ||
+                alloc_data1_match[eff_i];
+
+            effective_raw_store_data[
+                eff_i*32 +: 32
+            ] =
+                alloc_data0_match[eff_i] ?
+                    alloc_data0_q.data_value :
+                alloc_data1_match[eff_i] ?
+                    alloc_data1_q.data_value :
+                    raw_store_data[eff_i];
+        end
+    end
+
     always_comb begin
         release_candidate_valid =
             !flush &&
@@ -873,6 +1035,13 @@ module StoreQueue #(
             !entries[release_owner_sel_q].unaligned &&
             committed[release_owner_sel_q] &&
             entries[release_owner_sel_q].addr_ready &&
+            // Array data-ready only, not the alloc-data bypass: the release
+            // is bound by the owner's address (the addr_update travels
+            // through the registered addr_update*_q stage), which lands no
+            // earlier than the alloc write-back, so the effective/array
+            // distinction can never change the release cycle.  Dropping the
+            // bypass here keeps the credit loop (release -> free_slots ->
+            // reserve_ready) out of the alloc_data*_q match cone.
             store_data_ready[release_owner_sel_q];
 
         release_candidate_entry = '0;
@@ -894,8 +1063,8 @@ module StoreQueue #(
 
             release_candidate_entry.store_data =
                 compute_aligned_data(
-                    raw_store_data[
-                        release_owner_sel_q
+                    effective_raw_store_data[
+                        release_owner_sel_q*32 +: 32
                     ],
                     entries[
                         release_owner_sel_q
@@ -964,7 +1133,7 @@ module StoreQueue #(
 
             store_data_ready_vec[i] =
                 valid_vec[i] &&
-                store_data_ready[i];
+                effective_store_data_ready[i];
 
             addr_flat[i*32 +: 32] =
                 entries[i].address;
@@ -978,7 +1147,9 @@ module StoreQueue #(
 
             store_data_flat[i*32 +: 32] =
                 compute_aligned_data(
-                    raw_store_data[i],
+                    effective_raw_store_data[
+                        i*32 +: 32
+                    ],
                     entries[i].raw_mask,
                     entries[i].address[1:0]
                 );
@@ -1507,9 +1678,10 @@ module StoreQueue #(
             addr_update1_q_data_value <= 32'h0;
             addr_update1_q_data_src_id <= '0;
         end else begin
-            addr_update0_q_valid <=
-                addr_update0_valid &&
-                addr_update0_ack;
+            if (addr_update0_valid && addr_update0_ack)
+                addr_update0_q_valid <= 1'b1;
+            else if (!addr_update0_valid)
+                addr_update0_q_valid <= 1'b0;
 
             if (
                 addr_update0_valid &&
@@ -1534,9 +1706,10 @@ module StoreQueue #(
                     addr_update0_data_src_id;
             end
 
-            addr_update1_q_valid <=
-                addr_update1_valid &&
-                addr_update1_ack;
+            if (addr_update1_valid && addr_update1_ack)
+                addr_update1_q_valid <= 1'b1;
+            else if (!addr_update1_valid)
+                addr_update1_q_valid <= 1'b0;
 
             if (
                 addr_update1_valid &&
@@ -1560,6 +1733,110 @@ module StoreQueue #(
                 addr_update1_q_data_src_id <=
                     addr_update1_data_src_id;
             end
+        end
+    end
+
+    // Fixed allocation-payload capture.  Every cycle, a reservation that
+    // arrives with its store data already available is latched here; the
+    // wide value is written into raw_store_data on the following edge by
+    // uop_id match (see update_sq_data_ready/value).  The register D cone
+    // is just the reservation inputs, so the credit/allocator/priority
+    // chain no longer feeds a variable-indexed wide write port.
+    // Deferred reservation write.  The reservation acceptance (r0_do/r1_do)
+    // stays combinational -- the credit given to the DQ/scheduler and the
+    // address-update ack still see the same-cycle acceptance, so the
+    // store-loop credit bubble the previous experiments hit cannot return.
+    // Only the physical entry creation is deferred one cycle: the allocated
+    // slot and the narrow header are latched at the acceptance edge and
+    // written into the array on the next edge.  This moves the endpoint of
+    // the credit loop (release -> free_slots -> reserve_ready -> r0_do/r1_do
+    // -> variable-indexed entry write) behind a fixed register; the entry is
+    // always present before the lane's address update lands, because the
+    // update travels through addr_update*_q (registered) and the reservation
+    // pipeline precedes the store's execution.
+    typedef struct packed {
+        logic                valid;
+        logic [INDEX_W-1:0]  alloc_sel;
+        uop_id_t             uop_id;
+        logic [31:0]         pc;
+        logic [3:0]          store_mask;
+        logic                has_addr;
+        logic [31:0]         address;
+        uop_id_t             src1_id;
+        logic                commit_now;
+`ifndef SYNTHESIS
+        logic [63:0]         serial;
+`endif
+    } sq_reserve_payload_t;
+
+    sq_reserve_payload_t reserve0_payload_q;
+    sq_reserve_payload_t reserve1_payload_q;
+
+    always_ff @(posedge clk or negedge rstn) begin
+        if (!rstn || flush) begin
+            reserve0_payload_q <= '0;
+            reserve1_payload_q <= '0;
+        end else begin
+            reserve0_payload_q.valid <= r0_do;
+            reserve0_payload_q.alloc_sel <= alloc0_sel;
+            reserve0_payload_q.uop_id <= r0_uop_id;
+            reserve0_payload_q.pc <= r0_pc;
+            reserve0_payload_q.store_mask <= r0_mask;
+            reserve0_payload_q.has_addr <= r0_has_addr;
+            reserve0_payload_q.address <= r0_addr;
+            reserve0_payload_q.src1_id <= r0_src1_id;
+            reserve0_payload_q.commit_now <= r0_commit_now;
+`ifndef SYNTHESIS
+            reserve0_payload_q.serial <= next_alloc_serial;
+`endif
+
+            reserve1_payload_q.valid <= r1_do;
+            reserve1_payload_q.alloc_sel <=
+                r0_do ? alloc1_sel : alloc0_sel;
+            reserve1_payload_q.uop_id <= r1_uop_id;
+            reserve1_payload_q.pc <= r1_pc;
+            reserve1_payload_q.store_mask <= r1_mask;
+            reserve1_payload_q.has_addr <= r1_has_addr;
+            reserve1_payload_q.address <= r1_addr;
+            reserve1_payload_q.src1_id <= r1_src1_id;
+            reserve1_payload_q.commit_now <= r1_commit_now;
+`ifndef SYNTHESIS
+            reserve1_payload_q.serial <=
+                next_alloc_serial + r0_do;
+`endif
+        end
+    end
+
+    always_ff @(posedge clk or negedge rstn) begin
+        if (!rstn || flush) begin
+            alloc_data0_q <= '0;
+            alloc_data1_q <= '0;
+        end else begin
+            alloc_data0_q.valid <=
+                r0_do &&
+                r0_initial_data_ready;
+
+            alloc_data0_q.uop_id <=
+                r0_uop_id;
+
+            alloc_data0_q.data_ready <=
+                r0_initial_data_ready;
+
+            alloc_data0_q.data_value <=
+                r0_initial_data_value;
+
+            alloc_data1_q.valid <=
+                r1_do &&
+                r1_initial_data_ready;
+
+            alloc_data1_q.uop_id <=
+                r1_uop_id;
+
+            alloc_data1_q.data_ready <=
+                r1_initial_data_ready;
+
+            alloc_data1_q.data_value <=
+                r1_initial_data_value;
         end
     end
 
@@ -1638,6 +1915,12 @@ module StoreQueue #(
                             addr_update1_q_valid,
                             addr_update1_q_uop_id,
                             addr_update1_q_data_ready,
+                            alloc_data0_q.valid,
+                            alloc_data0_q.uop_id,
+                            alloc_data0_q.data_ready,
+                            alloc_data1_q.valid,
+                            alloc_data1_q.uop_id,
+                            alloc_data1_q.data_ready,
                             complete0,
                             complete1,
                             commit_data_wakeup0_q,
@@ -1658,6 +1941,14 @@ module StoreQueue #(
                             addr_update1_q_uop_id,
                             addr_update1_q_data_ready,
                             addr_update1_q_data_value,
+                            alloc_data0_q.valid,
+                            alloc_data0_q.uop_id,
+                            alloc_data0_q.data_ready,
+                            alloc_data0_q.data_value,
+                            alloc_data1_q.valid,
+                            alloc_data1_q.uop_id,
+                            alloc_data1_q.data_ready,
+                            alloc_data1_q.data_value,
                             complete0,
                             complete1,
                             commit_data_wakeup0_q,
@@ -1721,6 +2012,12 @@ module StoreQueue #(
                             addr_update1_q_valid,
                             addr_update1_q_uop_id,
                             addr_update1_q_data_ready,
+                            alloc_data0_q.valid,
+                            alloc_data0_q.uop_id,
+                            alloc_data0_q.data_ready,
+                            alloc_data1_q.valid,
+                            alloc_data1_q.uop_id,
+                            alloc_data1_q.data_ready,
                             complete0,
                             complete1,
                             commit_data_wakeup0_q,
@@ -1741,6 +2038,14 @@ module StoreQueue #(
                             addr_update1_q_uop_id,
                             addr_update1_q_data_ready,
                             addr_update1_q_data_value,
+                            alloc_data0_q.valid,
+                            alloc_data0_q.uop_id,
+                            alloc_data0_q.data_ready,
+                            alloc_data0_q.data_value,
+                            alloc_data1_q.valid,
+                            alloc_data1_q.uop_id,
+                            alloc_data1_q.data_ready,
+                            alloc_data1_q.data_value,
                             complete0,
                             complete1,
                             commit_data_wakeup0_q,
@@ -1797,77 +2102,67 @@ module StoreQueue #(
 `endif
             end
 
-            if (r0_do) begin
-                entries[alloc0_sel] <=
+            if (reserve0_payload_q.valid) begin
+                entries[reserve0_payload_q.alloc_sel] <=
                     make_reserved_sq_entry(
-                        r0_pc,
-                        r0_uop_id,
-                        r0_mask,
-                        r0_has_addr,
-                        r0_addr
+                        reserve0_payload_q.pc,
+                        reserve0_payload_q.uop_id,
+                        reserve0_payload_q.store_mask,
+                        reserve0_payload_q.has_addr,
+                        reserve0_payload_q.address
                     );
 
-                store_data_ready[alloc0_sel] <=
-                    r0_initial_data_ready;
-
-                raw_store_data[alloc0_sel] <=
-                    r0_initial_data_value;
-
-                store_data_src_id[alloc0_sel] <=
-                    r0_src1_id;
-
-                committed[alloc0_sel] <=
-                    r0_commit_now;
-
-`ifndef SYNTHESIS
-                entry_serial[alloc0_sel] <=
-                    next_alloc_serial;
-`endif
-            end
-
-            if (r1_do) begin
-                entries[
-                    r0_do ?
-                        alloc1_sel :
-                        alloc0_sel
-                ] <= make_reserved_sq_entry(
-                    r1_pc,
-                    r1_uop_id,
-                    r1_mask,
-                    r1_has_addr,
-                    r1_addr
-                );
-
                 store_data_ready[
-                    r0_do ?
-                        alloc1_sel :
-                        alloc0_sel
-                ] <= r1_initial_data_ready;
-
-                raw_store_data[
-                    r0_do ?
-                        alloc1_sel :
-                        alloc0_sel
-                ] <= r1_initial_data_value;
+                    reserve0_payload_q.alloc_sel
+                ] <= 1'b0;
 
                 store_data_src_id[
-                    r0_do ?
-                        alloc1_sel :
-                        alloc0_sel
-                ] <= r1_src1_id;
+                    reserve0_payload_q.alloc_sel
+                ] <= reserve0_payload_q.src1_id;
 
                 committed[
-                    r0_do ?
-                        alloc1_sel :
-                        alloc0_sel
-                ] <= r1_commit_now;
+                    reserve0_payload_q.alloc_sel
+                ] <= reserve0_payload_q.commit_now;
+                // raw_store_data is intentionally not written on the
+                // reservation write-back edge; the wide data travels through
+                // alloc_data0_q and lands by uop_id match (see
+                // update_sq_data_ready/value).
 
 `ifndef SYNTHESIS
                 entry_serial[
-                    r0_do ?
-                        alloc1_sel :
-                        alloc0_sel
-                ] <= next_alloc_serial + r0_do;
+                    reserve0_payload_q.alloc_sel
+                ] <= reserve0_payload_q.serial;
+`endif
+            end
+
+            if (reserve1_payload_q.valid) begin
+                entries[reserve1_payload_q.alloc_sel] <=
+                    make_reserved_sq_entry(
+                        reserve1_payload_q.pc,
+                        reserve1_payload_q.uop_id,
+                        reserve1_payload_q.store_mask,
+                        reserve1_payload_q.has_addr,
+                        reserve1_payload_q.address
+                    );
+
+                store_data_ready[
+                    reserve1_payload_q.alloc_sel
+                ] <= 1'b0;
+
+                store_data_src_id[
+                    reserve1_payload_q.alloc_sel
+                ] <= reserve1_payload_q.src1_id;
+
+                committed[
+                    reserve1_payload_q.alloc_sel
+                ] <= reserve1_payload_q.commit_now;
+                // raw_store_data write removed here as well; see
+                // alloc_data1_q and the uop_id write-back next cycle.
+
+`ifndef SYNTHESIS
+                entry_serial[
+                    reserve1_payload_q.alloc_sel
+                ] <= reserve1_payload_q.serial;
 `endif
             end
 

@@ -158,6 +158,7 @@ module DispatchQueue #(
     wire fast_issue_found;
     reg free_found;
     reg second_free_found;
+    reg [3:0] free_count;
     reg [DQ_SEQ_W-1:0] next_alloc_seq;
     integer i;
     integer recover_count;
@@ -600,6 +601,27 @@ module DispatchQueue #(
             ? ({{(DQ_DEPTH-1){1'b0}}, 1'b1} << fast_pending_sel)
             : {DQ_DEPTH{1'b0}};
 
+    // Ownership mask.  Entries already claimed by a lane hold or an issue
+    // clear/pending stage must not be re-picked from the registered
+    // candidate masks.  The candidate registers no longer drop picked
+    // entries (the prefetch drop cone read execution-level backpressure
+    // into candidate_q/D); exclusion happens here, at the picker input.
+    wire [DQ_DEPTH-1:0] candidate_owned_mask =
+        main_hold_onehot |
+        fast_hold_onehot |
+        issue_pending_onehot |
+        fast_pending_onehot;
+
+    wire [DQ_DEPTH-1:0] main_candidate_q_available =
+        main_candidate_q &
+        valid &
+        ~candidate_owned_mask;
+
+    wire [DQ_DEPTH-1:0] fast_candidate_q_available =
+        fast_candidate_q &
+        valid &
+        ~candidate_owned_mask;
+
     wire main_payload_space;
     wire fast_payload_space;
     wire main_payload_capture;
@@ -1004,7 +1026,7 @@ module DispatchQueue #(
         ~main_hold_onehot;
 
     wire [DQ_DEPTH-1:0] main_candidate_q_lane0 =
-        main_candidate_q &
+        main_candidate_q_available &
         slot_lane0_only;
 
     wire [3:0] lane0_pair_pick = pick_oldest8(
@@ -1022,11 +1044,11 @@ module DispatchQueue #(
     wire [3:0] registered_main_pick =
         ROUND_ROBIN_SELECT
             ? pick_round_robin8(
-                main_candidate_q,
+                main_candidate_q_available,
                 main_rr_ptr
             )
             : pick_oldest8(
-                main_candidate_q,
+                main_candidate_q_available,
                 alloc_seq[0],
                 alloc_seq[1],
                 alloc_seq[2],
@@ -1088,11 +1110,11 @@ module DispatchQueue #(
     wire [3:0] registered_fast_pick =
         ROUND_ROBIN_SELECT
             ? pick_round_robin8(
-                fast_candidate_q,
+                fast_candidate_q_available,
                 fast_rr_ptr
             )
             : pick_oldest8(
-                fast_candidate_q,
+                fast_candidate_q_available,
                 alloc_seq[0],
                 alloc_seq[1],
                 alloc_seq[2],
@@ -1133,23 +1155,19 @@ module DispatchQueue #(
             ? fast_refill_candidate
             : fast_candidate;
 
-    wire [DQ_DEPTH-1:0] main_prefetch_drop =
-        (main_select_capture || main_refill_valid)
-            ? main_pick_onehot
-            : {DQ_DEPTH{1'b0}};
-
-    wire [DQ_DEPTH-1:0] fast_prefetch_drop =
-        (fast_select_capture || fast_refill_valid)
-            ? fast_pick_onehot
-            : {DQ_DEPTH{1'b0}};
-
+    // The candidate registers only record which entries qualified last
+    // cycle; ownership is tracked separately through candidate_owned_mask
+    // at the picker inputs.  Dropping picked entries here would pull the
+    // execution-level issue ready into candidate_q/D through the
+    // select/refill capture cone (fast_payload_space -> fast_issue_fire ->
+    // ExecutionLane backpressure).  Instead a held/pending entry stays in
+    // the registered mask but is excluded from the pickers, and a captured
+    // entry is excluded by its cleared valid bit.
     wire [DQ_DEPTH-1:0] main_candidate_next_q =
-        main_prefetch_source &
-        ~main_prefetch_drop;
+        main_prefetch_source;
 
     wire [DQ_DEPTH-1:0] fast_candidate_next_q =
-        fast_prefetch_source &
-        ~fast_prefetch_drop;
+        fast_prefetch_source;
 
     wire registered_select_collision =
         main_hold_valid &&
@@ -1159,7 +1177,7 @@ module DispatchQueue #(
     assign issue_found =
         main_hold_valid
             ? (
-                valid[main_hold_sel] &&
+                main_hold_entry_valid_q &&
                 !issue_pending_onehot[main_hold_sel] &&
                 !fast_pending_onehot[main_hold_sel]
             )
@@ -1173,7 +1191,7 @@ module DispatchQueue #(
     assign fast_issue_found =
         fast_hold_valid
             ? (
-                valid[fast_hold_sel] &&
+                fast_hold_entry_valid_q &&
                 !issue_pending_onehot[fast_hold_sel] &&
                 !fast_pending_onehot[fast_hold_sel] &&
                 !registered_select_collision
@@ -1193,9 +1211,11 @@ module DispatchQueue #(
         enq1_sel = 3'h0;
         free_found = 1'b0;
         second_free_found = 1'b0;
+        free_count = 4'h0;
 
         for (k = 0; k < DQ_DEPTH; k = k + 1) begin
             if (!valid[k]) begin
+                free_count = free_count + 4'h1;
                 if (!free_found) begin
                     free_found = 1'b1;
                     enq_sel = k[2:0];
@@ -1218,30 +1238,53 @@ module DispatchQueue #(
         issue_valid[1] &&
         issue_ready[1];
 
+    // Enqueue handshake uses the plain free-slot availability (the fire
+    // already reserved capacity one cycle earlier via the pending-adjusted
+    // dispatch-ready; the free slots can only grow between the fire and the
+    // enqueue since issue frees slots).
     assign enq_fire =
         enq_valid &&
-        enq_ready[0];
+        free_found;
 
     assign enq1_fire =
         enq1_valid &&
-        enq_ready[1];
+        free_found &&
+        second_free_found;
+
+    // Registered hold identity.  The store-grant/token arbitration used to
+    // read valid/is_store/uop_id through the variable hold index on the same
+    // cycle it drove the store_token_pending_q/CE enable, making
+    // fast_hold_sel -> store_token_pending_q/CE the module-critical cone.
+    // The held entry's store-ness and age are now captured together with the
+    // hold itself (the pick is already registered), so grant arbitration and
+    // token capture read only registers.
+    reg main_hold_is_store_q;
+    reg fast_hold_is_store_q;
+    reg main_hold_entry_valid_q;
+    reg fast_hold_entry_valid_q;
+    uop_id_t main_hold_uop_id_q;
+    uop_id_t fast_hold_uop_id_q;
+    logic [31:0] main_hold_pc_q;
+    logic [31:0] fast_hold_pc_q;
+    logic [3:0] main_hold_store_mask_q;
+    logic [3:0] fast_hold_store_mask_q;
+    uop_id_t main_hold_src1_id_q;
+    uop_id_t fast_hold_src1_id_q;
 
     wire main_hold_is_store =
         main_hold_valid &&
-        valid[main_hold_sel] &&
-        is_store[main_hold_sel];
+        main_hold_is_store_q;
 
     wire fast_hold_is_store =
         fast_hold_valid &&
-        valid[fast_hold_sel] &&
-        is_store[fast_hold_sel];
+        fast_hold_is_store_q;
 
     wire store_lane1_is_older =
         main_hold_is_store &&
         fast_hold_is_store &&
         uop_is_younger(
-            uop_id[main_hold_sel],
-            uop_id[fast_hold_sel]
+            main_hold_uop_id_q,
+            fast_hold_uop_id_q
         );
 
     wire main_store_needs_grant =
@@ -1579,7 +1622,7 @@ module DispatchQueue #(
             main_select_capture &&
             main_new_store_grant
         ) || (
-            main_store_grant_set &&
+            main_hold_store_grant_q &&
             !store_token_pending_valid_q[0]
         );
 
@@ -1588,7 +1631,7 @@ module DispatchQueue #(
             fast_select_capture &&
             fast_new_store_grant
         ) || (
-            fast_store_grant_set &&
+            fast_hold_store_grant_q &&
             !store_token_pending_valid_q[1]
         );
 
@@ -1652,13 +1695,13 @@ module DispatchQueue #(
                         src1_id[main_pick[2:0]];
                 end else begin
                     store_token_pending_q[0].uop_id <=
-                        uop_id[main_hold_sel];
+                        main_hold_uop_id_q;
                     store_token_pending_q[0].pc <=
-                        pc[main_hold_sel];
+                        main_hold_pc_q;
                     store_token_pending_q[0].store_mask <=
-                        ram_we[main_hold_sel];
+                        main_hold_store_mask_q;
                     store_token_pending_q[0].src1_id <=
-                        src1_id[main_hold_sel];
+                        main_hold_src1_id_q;
                 end
             end
 
@@ -1675,13 +1718,13 @@ module DispatchQueue #(
                         src1_id[fast_pick[2:0]];
                 end else begin
                     store_token_pending_q[1].uop_id <=
-                        uop_id[fast_hold_sel];
+                        fast_hold_uop_id_q;
                     store_token_pending_q[1].pc <=
-                        pc[fast_hold_sel];
+                        fast_hold_pc_q;
                     store_token_pending_q[1].store_mask <=
-                        ram_we[fast_hold_sel];
+                        fast_hold_store_mask_q;
                     store_token_pending_q[1].src1_id <=
-                        src1_id[fast_hold_sel];
+                        fast_hold_src1_id_q;
                 end
             end
 
@@ -1886,12 +1929,16 @@ module DispatchQueue #(
         end
     end
 
+    // Pending-adjusted dispatch-ready for the rename fire.  The registered
+    // dispatch stage makes the enqueue happen one cycle after the fire, so the
+    // fire at cycle N+1 must see the free slots minus the in-flight enqueue
+    // (enq_valid/enq1_valid = the registered fires from cycle N); otherwise a
+    // back-to-back fire could over-commit the queue and lose a uop.
     assign enq_ready[0] =
-        free_found;
+        (free_count >= (4'h1 + {3'h0, enq_valid} + {3'h0, enq1_valid}));
 
     assign enq_ready[1] =
-        free_found &&
-        second_free_found;
+        (free_count >= (4'h2 + {3'h0, enq_valid} + {3'h0, enq1_valid}));
 
     assign issue_valid[0] =
         issue_payload_valid_q &&
@@ -2923,9 +2970,21 @@ module DispatchQueue #(
             main_hold_valid <= 1'b0;
             main_hold_sel <= 3'h0;
             main_hold_store_grant_q <= 1'b0;
+            main_hold_is_store_q <= 1'b0;
+            main_hold_entry_valid_q <= 1'b0;
+            main_hold_uop_id_q <= '0;
+            main_hold_pc_q <= 32'h0;
+            main_hold_store_mask_q <= 4'h0;
+            main_hold_src1_id_q <= '0;
             fast_hold_valid <= 1'b0;
             fast_hold_sel <= 3'h0;
             fast_hold_store_grant_q <= 1'b0;
+            fast_hold_is_store_q <= 1'b0;
+            fast_hold_entry_valid_q <= 1'b0;
+            fast_hold_uop_id_q <= '0;
+            fast_hold_pc_q <= 32'h0;
+            fast_hold_store_mask_q <= 4'h0;
+            fast_hold_src1_id_q <= '0;
             main_rr_ptr <= 3'h0;
             fast_rr_ptr <= 3'h0;
             main_ownership_transfer_q <= 1'b0;
@@ -3043,6 +3102,12 @@ module DispatchQueue #(
                 main_hold_valid <= 1'b0;
                 main_hold_sel <= 3'h0;
                 main_hold_store_grant_q <= 1'b0;
+                main_hold_is_store_q <= 1'b0;
+                main_hold_entry_valid_q <= 1'b0;
+                main_hold_uop_id_q <= '0;
+                main_hold_pc_q <= 32'h0;
+                main_hold_store_mask_q <= 4'h0;
+                main_hold_src1_id_q <= '0;
             end
 
             if (
@@ -3060,6 +3125,12 @@ module DispatchQueue #(
                 fast_hold_valid <= 1'b0;
                 fast_hold_sel <= 3'h0;
                 fast_hold_store_grant_q <= 1'b0;
+                fast_hold_is_store_q <= 1'b0;
+                fast_hold_entry_valid_q <= 1'b0;
+                fast_hold_uop_id_q <= '0;
+                fast_hold_pc_q <= 32'h0;
+                fast_hold_store_mask_q <= 4'h0;
+                fast_hold_src1_id_q <= '0;
             end
 
             if (
@@ -3125,25 +3196,61 @@ module DispatchQueue #(
                     main_hold_valid <= 1'b1;
                     main_hold_sel <=
                         main_refill_pick[2:0];
+                    main_hold_entry_valid_q <=
+                        valid[main_refill_pick[2:0]];
+                    main_hold_is_store_q <=
+                        is_store[main_refill_pick[2:0]];
+                    main_hold_uop_id_q <=
+                        uop_id[main_refill_pick[2:0]];
+                    main_hold_pc_q <=
+                        pc[main_refill_pick[2:0]];
+                    main_hold_store_mask_q <=
+                        ram_we[main_refill_pick[2:0]];
+                    main_hold_src1_id_q <=
+                        src1_id[main_refill_pick[2:0]];
                 end else begin
                     main_hold_valid <= 1'b0;
                     main_hold_sel <= 3'h0;
+                    main_hold_entry_valid_q <= 1'b0;
+                    main_hold_is_store_q <= 1'b0;
+                    main_hold_uop_id_q <= '0;
+                    main_hold_pc_q <= 32'h0;
+                    main_hold_store_mask_q <= 4'h0;
+                    main_hold_src1_id_q <= '0;
                 end
             end else if (
                 main_hold_valid &&
                 (
-                    !valid[main_hold_sel] ||
+                    !main_hold_entry_valid_q ||
                     main_hold_store_blocked
                 )
             ) begin
                 main_hold_valid <= 1'b0;
                 main_hold_sel <= 3'h0;
                 main_hold_store_grant_q <= 1'b0;
+                main_hold_entry_valid_q <= 1'b0;
+                main_hold_is_store_q <= 1'b0;
+                main_hold_uop_id_q <= '0;
+                main_hold_pc_q <= 32'h0;
+                main_hold_store_mask_q <= 4'h0;
+                main_hold_src1_id_q <= '0;
             end else if (main_select_capture) begin
                 main_hold_valid <= 1'b1;
                 main_hold_sel <= main_pick[2:0];
                 main_hold_store_grant_q <=
                     main_new_store_grant;
+                main_hold_entry_valid_q <=
+                    valid[main_pick[2:0]];
+                main_hold_is_store_q <=
+                    is_store[main_pick[2:0]];
+                main_hold_uop_id_q <=
+                    uop_id[main_pick[2:0]];
+                main_hold_pc_q <=
+                    pc[main_pick[2:0]];
+                main_hold_store_mask_q <=
+                    ram_we[main_pick[2:0]];
+                main_hold_src1_id_q <=
+                    src1_id[main_pick[2:0]];
             end else if (main_store_grant_set) begin
                 main_hold_store_grant_q <= 1'b1;
             end
@@ -3152,6 +3259,12 @@ module DispatchQueue #(
                 fast_hold_valid <= 1'b0;
                 fast_hold_sel <= 3'h0;
                 fast_hold_store_grant_q <= 1'b0;
+                fast_hold_entry_valid_q <= 1'b0;
+                fast_hold_is_store_q <= 1'b0;
+                fast_hold_uop_id_q <= '0;
+                fast_hold_pc_q <= 32'h0;
+                fast_hold_store_mask_q <= 4'h0;
+                fast_hold_src1_id_q <= '0;
             end else if (fast_payload_capture) begin
                 fast_hold_store_grant_q <= 1'b0;
 
@@ -3159,25 +3272,61 @@ module DispatchQueue #(
                     fast_hold_valid <= 1'b1;
                     fast_hold_sel <=
                         fast_refill_pick[2:0];
+                    fast_hold_entry_valid_q <=
+                        valid[fast_refill_pick[2:0]];
+                    fast_hold_is_store_q <=
+                        is_store[fast_refill_pick[2:0]];
+                    fast_hold_uop_id_q <=
+                        uop_id[fast_refill_pick[2:0]];
+                    fast_hold_pc_q <=
+                        pc[fast_refill_pick[2:0]];
+                    fast_hold_store_mask_q <=
+                        ram_we[fast_refill_pick[2:0]];
+                    fast_hold_src1_id_q <=
+                        src1_id[fast_refill_pick[2:0]];
                 end else begin
                     fast_hold_valid <= 1'b0;
                     fast_hold_sel <= 3'h0;
+                    fast_hold_entry_valid_q <= 1'b0;
+                    fast_hold_is_store_q <= 1'b0;
+                    fast_hold_uop_id_q <= '0;
+                    fast_hold_pc_q <= 32'h0;
+                    fast_hold_store_mask_q <= 4'h0;
+                    fast_hold_src1_id_q <= '0;
                 end
             end else if (
                 fast_hold_valid &&
                 (
-                    !valid[fast_hold_sel] ||
+                    !fast_hold_entry_valid_q ||
                     fast_hold_store_blocked
                 )
             ) begin
                 fast_hold_valid <= 1'b0;
                 fast_hold_sel <= 3'h0;
                 fast_hold_store_grant_q <= 1'b0;
+                fast_hold_entry_valid_q <= 1'b0;
+                fast_hold_is_store_q <= 1'b0;
+                fast_hold_uop_id_q <= '0;
+                fast_hold_pc_q <= 32'h0;
+                fast_hold_store_mask_q <= 4'h0;
+                fast_hold_src1_id_q <= '0;
             end else if (fast_select_capture) begin
                 fast_hold_valid <= 1'b1;
                 fast_hold_sel <= fast_pick[2:0];
                 fast_hold_store_grant_q <=
                     fast_new_store_grant;
+                fast_hold_entry_valid_q <=
+                    valid[fast_pick[2:0]];
+                fast_hold_is_store_q <=
+                    is_store[fast_pick[2:0]];
+                fast_hold_uop_id_q <=
+                    uop_id[fast_pick[2:0]];
+                fast_hold_pc_q <=
+                    pc[fast_pick[2:0]];
+                fast_hold_store_mask_q <=
+                    ram_we[fast_pick[2:0]];
+                fast_hold_src1_id_q <=
+                    src1_id[fast_pick[2:0]];
             end else if (fast_store_grant_set) begin
                 fast_hold_store_grant_q <= 1'b1;
             end
