@@ -22,10 +22,13 @@ module Frontend (
     input  logic                    ex_is_br_jmp,
     input  logic                    ex_is_call,
     input  logic                    ex_is_ret,
+    input  logic                    ex_is_conditional,
+    input  logic                    ex_offset_negative,
     input  logic [31:0]             ex_pc,
     input  logic                    ex_real_taken,
     input  logic [31:0]             ex_real_target,
     input  logic [2:0]              ex_ras_ptr,
+    input  prediction_meta_t        ex_pred,
     output logic                    branch_mispredict,
 
     output logic [1:0]              fetch_valid,
@@ -42,7 +45,23 @@ module Frontend (
     input  logic                    ifetch1_valid,
     input  logic [31:0]             ifetch1_inst,
     output logic                    perf_bpu_wait,
-    output logic                    perf_icache_wait
+    output logic                    perf_icache_wait,
+    output logic                    perf_fetch_fire0,
+    output logic                    perf_fetch_fire1,
+    output logic                    perf_branch_fire,
+    output logic                    perf_branch_predicted_taken,
+    output logic                    perf_branch_actual_taken,
+    output logic                    perf_branch_mispredict,
+    output logic                    perf_branch_btb_hit,
+    output logic [31:0]             perf_branch_pc,
+    output logic                    perf_branch_conditional,
+    output logic                    perf_branch_backward,
+    output logic                    perf_branch_jirl,
+    output logic                    perf_direction_mispredict,
+    output logic                    perf_target_mispredict,
+    output logic                    perf_btb_update,
+    output logic                    perf_btb_update_conditional,
+    output logic                    perf_btb_update_backward
 );
 
     wire [31:0] pred_target;
@@ -52,8 +71,13 @@ module Frontend (
     wire [31:0] bpu_redirect_pc;
     wire        bpu_pred_taken;
     wire [ 9:0] bpu_pred_index;
+    wire [31:0] bpu_pred1_target;
+    wire        bpu_pred1_taken;
+    wire [ 9:0] bpu_pred1_index;
+    wire        bpu_pred1_btb_hit;
     wire [ 2:0] bpu_pred_ras_sp_before;
     wire [ 3:0] bpu_pred_ras_count_before;
+    wire        bpu_pred_btb_hit;
     wire [ 2:0] bpu_if_ras_ptr_unused;
     wire        bpu_pred_error;
 
@@ -67,6 +91,7 @@ module Frontend (
     wire [ 9:0] if_pred_index;
     wire [ 2:0] if_ras_sp_before;
     wire [ 3:0] if_ras_count_before;
+    wire        if_perf_btb_hit;
     wire        if1_valid;
     wire [31:0] if1_pc;
     wire [31:0] if1_inst;
@@ -77,6 +102,7 @@ module Frontend (
     wire [ 9:0] if1_pred_index;
     wire [ 2:0] if1_ras_sp_before;
     wire [ 3:0] if1_ras_count_before;
+    wire        if1_perf_btb_hit;
     wire        if_packet_ready;
     wire        if_packet_fire;
     wire [ 1:0] if_packet_pop_count;
@@ -91,6 +117,7 @@ module Frontend (
     wire [ 9:0] id_packet_pred_index;
     wire [ 2:0] id_packet_ras_sp_before;
     wire [ 3:0] id_packet_ras_count_before;
+    wire        id_packet_perf_btb_hit;
     wire        id1_packet_valid;
     wire [31:0] id1_packet_pc;
     wire [31:0] id1_packet_inst;
@@ -101,6 +128,7 @@ module Frontend (
     wire [ 9:0] id1_packet_pred_index;
     wire [ 2:0] id1_packet_ras_sp_before;
     wire [ 3:0] id1_packet_ras_count_before;
+    wire        id1_packet_perf_btb_hit;
 
     assign branch_mispredict = bpu_pred_error;
     assign if_packet_fire = if_valid & if_packet_ready & !flush;
@@ -111,7 +139,28 @@ module Frontend (
     // predictor/front-end wait is a valid predicted fetch packet held because
     // the IF/ID boundary cannot accept it.
     assign perf_bpu_wait = bpu_valid && !if_packet_ready;
-    assign perf_icache_wait = ifetch_rreq && !ifetch_valid;
+`ifndef SYNTHESIS
+    logic perf_outstanding_fetch_reg;
+    always_ff @(posedge clk or negedge rstn) begin
+        if (!rstn) begin
+            perf_outstanding_fetch_reg <= 1'b0;
+        end else if (flush) begin
+            perf_outstanding_fetch_reg <= 1'b0;
+        end else begin
+            if (ifetch_rreq && ifetch_ready && !ifetch_valid)
+                perf_outstanding_fetch_reg <= 1'b1;
+            else if (ifetch_valid)
+                perf_outstanding_fetch_reg <= 1'b0;
+        end
+    end
+    assign perf_icache_wait = perf_outstanding_fetch_reg || (ifetch_rreq && !ifetch_valid);
+    assign perf_fetch_fire0 = fetch_valid[0] && fetch_ready;
+    assign perf_fetch_fire1 = fetch_valid[1] && fetch_ready;
+`else
+    assign perf_icache_wait = 1'b0;
+    assign perf_fetch_fire0 = 1'b0;
+    assign perf_fetch_fire1 = 1'b0;
+`endif
 
     BranchPredUnit u_bpu (
         .cpu_clk        (clk),
@@ -123,25 +172,54 @@ module Frontend (
         .redirect_pc    (bpu_redirect_pc),
         .ifetch_valid   (ifetch_valid),
         .ifetch_inst    (ifetch_inst),
-        .id_valid       (issue_valid),
-        .id_fire        (issue_fire),
-        .id_pred_valid_in(issue_uop.pred.valid),
-        .id_pred_taken_in(issue_uop.pred.taken),
-        .id_pred_target_in(issue_uop.pred.target),
-        .id_pred_index_in(issue_uop.pred.index),
-        .id_ras_sp_before_in(issue_uop.pred.ras_sp_before),
-        .id_ras_count_before_in(issue_uop.pred.ras_count_before),
+        .id_valid       (1'b0),
+        .id_fire        (1'b0),
+        .id_pred_valid_in(1'b0),
+        .id_pred_taken_in(1'b0),
+        .id_pred_target_in(32'h0),
+        .id_pred_index_in(10'h0),
+        .id_ras_sp_before_in(3'h0),
+        .id_ras_count_before_in(4'h0),
+        .id_perf_btb_hit_in(1'b0),
+        .ex_pred_valid_in(ex_pred.valid),
+        .ex_pred_taken_in(ex_pred.taken),
+        .ex_pred_target_in(ex_pred.target),
+        .ex_pred_index_in(ex_pred.index),
+        .ex_ras_sp_before_in(ex_pred.ras_sp_before),
+        .ex_ras_count_before_in(ex_pred.ras_count_before),
+        .ex_perf_btb_hit_in(ex_pred.perf_btb_hit),
         .pl_suspend     (ex_stall),
         .pred_target    (pred_target),
         .pred_taken_out (bpu_pred_taken),
         .pred_index_out (bpu_pred_index),
+        .pred1_target    (bpu_pred1_target),
+        .pred1_taken_out (bpu_pred1_taken),
+        .pred1_index_out (bpu_pred1_index),
+        .pred1_btb_hit_out(bpu_pred1_btb_hit),
         .pred_ras_sp_before(bpu_pred_ras_sp_before),
         .pred_ras_count_before(bpu_pred_ras_count_before),
         .pred_error     (bpu_pred_error),
+        .perf_branch_fire(perf_branch_fire),
+        .perf_predicted_taken(perf_branch_predicted_taken),
+        .perf_actual_taken(perf_branch_actual_taken),
+        .perf_mispredict(perf_branch_mispredict),
+        .perf_pred_btb_hit_out(bpu_pred_btb_hit),
+        .perf_resolved_btb_hit(perf_branch_btb_hit),
+        .perf_resolved_pc(perf_branch_pc),
+        .perf_resolved_conditional(perf_branch_conditional),
+        .perf_resolved_backward(perf_branch_backward),
+        .perf_resolved_jirl(perf_branch_jirl),
+        .perf_direction_mispredict(perf_direction_mispredict),
+        .perf_target_mispredict(perf_target_mispredict),
+        .perf_btb_update(perf_btb_update),
+        .perf_btb_update_conditional(perf_btb_update_conditional),
+        .perf_btb_update_backward(perf_btb_update_backward),
         .ex_valid       (ex_valid),
         .ex_is_bj       (ex_is_br_jmp),
         .ex_is_call     (ex_is_call),
         .ex_is_ret      (ex_is_ret),
+        .ex_is_conditional(ex_is_conditional),
+        .ex_offset_negative(ex_offset_negative),
         .ex_pc          (ex_pc),
         .real_taken     (ex_real_taken),
         .real_target    (ex_real_target),
@@ -158,8 +236,13 @@ module Frontend (
         .pred_target    (pred_target),
         .pred_taken     (bpu_pred_taken),
         .pred_index     (bpu_pred_index),
+        .pred1_target   (bpu_pred1_target),
+        .pred1_taken    (bpu_pred1_taken),
+        .pred1_index    (bpu_pred1_index),
+        .pred1_btb_hit  (bpu_pred1_btb_hit),
         .pred_ras_sp_before(bpu_pred_ras_sp_before),
         .pred_ras_count_before(bpu_pred_ras_count_before),
+        .perf_pred_btb_hit(bpu_pred_btb_hit),
         .if_valid       (if_valid),
         .if_pc          (if_pc),
         .if_inst        (if_inst),
@@ -170,6 +253,7 @@ module Frontend (
         .if_pred_index  (if_pred_index),
         .if_ras_sp_before(if_ras_sp_before),
         .if_ras_count_before(if_ras_count_before),
+        .if_perf_btb_hit(if_perf_btb_hit),
         .if1_valid      (if1_valid),
         .if1_pc         (if1_pc),
         .if1_inst       (if1_inst),
@@ -180,6 +264,7 @@ module Frontend (
         .if1_pred_index (if1_pred_index),
         .if1_ras_sp_before(if1_ras_sp_before),
         .if1_ras_count_before(if1_ras_count_before),
+        .if1_perf_btb_hit(if1_perf_btb_hit),
         .bpu_valid      (bpu_valid),
         .bpu_pc         (bpu_pc),
         .bpu_redirect_valid(bpu_redirect_valid),
@@ -209,6 +294,7 @@ module Frontend (
         .in_pred_index      (if_pred_index),
         .in_ras_sp_before   (if_ras_sp_before),
         .in_ras_count_before(if_ras_count_before),
+        .in_perf_btb_hit     (if_perf_btb_hit),
         .in1_valid          (if1_valid),
         .in1_pc             (if1_pc),
         .in1_inst           (if1_inst),
@@ -219,6 +305,7 @@ module Frontend (
         .in1_pred_index     (if1_pred_index),
         .in1_ras_sp_before  (if1_ras_sp_before),
         .in1_ras_count_before(if1_ras_count_before),
+        .in1_perf_btb_hit     (if1_perf_btb_hit),
         .out_valid          (id_packet_valid),
         .out_ready          (fetch_ready),
         .out_pc             (id_packet_pc),
@@ -230,6 +317,7 @@ module Frontend (
         .out_pred_index     (id_packet_pred_index),
         .out_ras_sp_before  (id_packet_ras_sp_before),
         .out_ras_count_before(id_packet_ras_count_before),
+        .out_perf_btb_hit     (id_packet_perf_btb_hit),
         .out1_valid         (id1_packet_valid),
         .out1_pc            (id1_packet_pc),
         .out1_inst          (id1_packet_inst),
@@ -239,7 +327,8 @@ module Frontend (
         .out1_pred_target   (id1_packet_pred_target),
         .out1_pred_index    (id1_packet_pred_index),
         .out1_ras_sp_before (id1_packet_ras_sp_before),
-        .out1_ras_count_before(id1_packet_ras_count_before)
+        .out1_ras_count_before(id1_packet_ras_count_before),
+        .out1_perf_btb_hit     (id1_packet_perf_btb_hit)
     );
 
     always_comb begin
@@ -253,6 +342,7 @@ module Frontend (
         fetch_uop0.pred.index = id_packet_pred_index;
         fetch_uop0.pred.ras_sp_before = id_packet_ras_sp_before;
         fetch_uop0.pred.ras_count_before = id_packet_ras_count_before;
+        fetch_uop0.pred.perf_btb_hit = id_packet_perf_btb_hit;
 
         fetch_uop1 = '0;
         fetch_uop1.pc = id1_packet_pc;
@@ -264,6 +354,7 @@ module Frontend (
         fetch_uop1.pred.index = id1_packet_pred_index;
         fetch_uop1.pred.ras_sp_before = id1_packet_ras_sp_before;
         fetch_uop1.pred.ras_count_before = id1_packet_ras_count_before;
+        fetch_uop1.pred.perf_btb_hit = id1_packet_perf_btb_hit;
     end
 
 endmodule

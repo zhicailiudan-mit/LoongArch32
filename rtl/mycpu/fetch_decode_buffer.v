@@ -20,6 +20,7 @@ module FetchDecodeBuffer (
     input  wire [ 9:0]  in_pred_index,
     input  wire [ 2:0]  in_ras_sp_before,
     input  wire [ 3:0]  in_ras_count_before,
+    input  wire         in_perf_btb_hit,
     input  wire         in1_valid,
     input  wire [31:0]  in1_pc,
     input  wire [31:0]  in1_inst,
@@ -30,6 +31,7 @@ module FetchDecodeBuffer (
     input  wire [ 9:0]  in1_pred_index,
     input  wire [ 2:0]  in1_ras_sp_before,
     input  wire [ 3:0]  in1_ras_count_before,
+    input  wire         in1_perf_btb_hit,
 
     output reg          out_valid,
     input  wire         out_ready,
@@ -42,6 +44,7 @@ module FetchDecodeBuffer (
     output reg  [ 9:0]  out_pred_index,
     output reg  [ 2:0]  out_ras_sp_before,
     output reg  [ 3:0]  out_ras_count_before,
+    output reg          out_perf_btb_hit,
     output reg          out1_valid,
     output reg  [31:0]  out1_pc,
     output reg  [31:0]  out1_inst,
@@ -51,7 +54,8 @@ module FetchDecodeBuffer (
     output reg  [31:0]  out1_pred_target,
     output reg  [ 9:0]  out1_pred_index,
     output reg  [ 2:0]  out1_ras_sp_before,
-    output reg  [ 3:0]  out1_ras_count_before
+    output reg  [ 3:0]  out1_ras_count_before,
+    output reg          out1_perf_btb_hit
 );
 
     assign in_ready = !out_valid || out_ready;
@@ -68,6 +72,7 @@ module FetchDecodeBuffer (
             out_pred_index       <= 10'h0;
             out_ras_sp_before    <= 3'h0;
             out_ras_count_before <= 4'h0;
+            out_perf_btb_hit      <= 1'b0;
             out1_valid            <= 1'b0;
             out1_pc               <= 32'h0;
             out1_inst             <= 32'h0;
@@ -78,6 +83,7 @@ module FetchDecodeBuffer (
             out1_pred_index       <= 10'h0;
             out1_ras_sp_before    <= 3'h0;
             out1_ras_count_before <= 4'h0;
+            out1_perf_btb_hit      <= 1'b0;
         end
         else if (flush) begin
             out_valid <= 1'b0;
@@ -96,6 +102,7 @@ module FetchDecodeBuffer (
                 out_pred_index       <= in_pred_index;
                 out_ras_sp_before    <= in_ras_sp_before;
                 out_ras_count_before <= in_ras_count_before;
+                out_perf_btb_hit      <= in_perf_btb_hit;
             end
             if (in_valid && in1_valid) begin
                 out1_pc               <= in1_pc;
@@ -107,6 +114,7 @@ module FetchDecodeBuffer (
                 out1_pred_index       <= in1_pred_index;
                 out1_ras_sp_before    <= in1_ras_sp_before;
                 out1_ras_count_before <= in1_ras_count_before;
+                out1_perf_btb_hit      <= in1_perf_btb_hit;
             end
         end
     end

@@ -7,11 +7,20 @@
 `define ITyp_1R  3'b100     //               dst
 `define ITyp_Nil 3'b000
 
+// The board map selects BaseRAM/ExtRAM with physical address bit 22:
+//   0x1c000000..0x1c3fffff -> BaseRAM
+//   0x1c400000..0x1c7fffff -> ExtRAM
+// Keep the golden-reference helper on the same bank-aware map as the DUT.
 `define READ_SRAM(addr) \
-    {sram_uh.mem_array1[addr[21:2]], \
-     sram_uh.mem_array0[addr[21:2]], \
-     sram_lh.mem_array1[addr[21:2]], \
-     sram_lh.mem_array0[addr[21:2]]}
+    ((addr[22]) ? \
+        {ext_sram_uh.mem_array1[addr[21:2]], \
+         ext_sram_uh.mem_array0[addr[21:2]], \
+         ext_sram_lh.mem_array1[addr[21:2]], \
+         ext_sram_lh.mem_array0[addr[21:2]]} : \
+        {base_sram_uh.mem_array1[addr[21:2]], \
+         base_sram_uh.mem_array0[addr[21:2]], \
+         base_sram_lh.mem_array1[addr[21:2]], \
+         base_sram_lh.mem_array0[addr[21:2]]})
 
 // `define FM_DEBUG
 `define FORCE_MODIFY(target, condition, value) \

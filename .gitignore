@@ -18,7 +18,22 @@
 *.ip_user_files/
 *.runs/
 *.sim/
+verification/build/
+verification/xsim.dir/
+xsim.dir/
+*.pb
+*.vvp
 
 # OS files
 .DS_Store
 Thumbs.db
+rtl/mycpu/xsim.dir/
+rtl/mycpu/xvlog.pb
+*.sdb
+*.wdb
+*.jou
+*.log
+
+# Generated synthesis reports (summarize important numbers in docs instead)
+run_vivado/*_timing.rpt
+run_vivado/*_utilization.rpt

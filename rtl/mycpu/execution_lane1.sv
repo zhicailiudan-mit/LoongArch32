@@ -13,6 +13,10 @@ module ExecutionLane1 (
     input  logic                    recover_valid,
     input  logic                    system_flush,
     input  uop_id_t                 recover_id,
+    input  completion_t             store_data_complete0,
+    input  completion_t             store_data_complete1,
+    input  commit_t                 store_data_commit0,
+    input  commit_t                 store_data_commit1,
     input  logic                    result_stall,
     output logic                    issue_ready,
     input  logic                    issue_valid,
@@ -20,6 +24,8 @@ module ExecutionLane1 (
     input  logic [31:0]             issue_pc,
     input  logic [31:0]             issue_src0,
     input  logic [31:0]             issue_src1,
+    input  logic                    issue_src1_ready,
+    input  uop_id_t                 issue_src1_id,
     input  logic [31:0]             issue_imm,
     input  logic                    issue_reg_write,
     input  logic [4:0]              issue_arch_rd,
@@ -41,6 +47,8 @@ module ExecutionLane1 (
     logic [31:0]             pc_q;
     logic [31:0]             src0_q;
     logic [31:0]             src1_q;
+    logic                    src1_ready_q;
+    uop_id_t                 src1_id_q;
     logic [31:0]             imm_q;
     logic                    reg_write_q;
     logic [4:0]              arch_rd_q;
@@ -67,6 +75,53 @@ module ExecutionLane1 (
     wire [31:0]              lane_result = is_mdu_q ? muldiv_result :
                                                                alu_result;
 
+    wire valid_q_is_store =
+        valid_q &&
+        is_ld_st_q &&
+        (store_mask_q != `RAM_WE_N);
+
+    wire store_data_wake0 =
+        valid_q_is_store &&
+        !src1_ready_q &&
+        store_data_complete0.valid &&
+        store_data_complete0.reg_write &&
+        uop_id_equal(store_data_complete0.uop_id,
+                     src1_id_q);
+
+    wire store_data_wake1 =
+        valid_q_is_store &&
+        !src1_ready_q &&
+        store_data_complete1.valid &&
+        store_data_complete1.reg_write &&
+        uop_id_equal(store_data_complete1.uop_id,
+                     src1_id_q);
+
+    wire store_data_commit_wake0 =
+        valid_q_is_store &&
+        !src1_ready_q &&
+        store_data_commit0.valid &&
+        store_data_commit0.reg_write &&
+        uop_id_equal(store_data_commit0.uop_id,
+                     src1_id_q);
+
+    wire store_data_commit_wake1 =
+        valid_q_is_store &&
+        !src1_ready_q &&
+        store_data_commit1.valid &&
+        store_data_commit1.reg_write &&
+        uop_id_equal(store_data_commit1.uop_id,
+                     src1_id_q);
+
+    wire store_data_wake =
+        store_data_wake0 || store_data_wake1 ||
+        store_data_commit_wake0 || store_data_commit_wake1;
+
+    wire [31:0] store_data_wake_value =
+        store_data_wake0 ? store_data_complete0.value :
+        store_data_wake1 ? store_data_complete1.value :
+        store_data_commit_wake0 ? store_data_commit0.value :
+                                  store_data_commit1.value;
+
     assign issue_ready = !valid_q || result_fire;
 
     logic ldst_unalign;
@@ -85,6 +140,8 @@ module ExecutionLane1 (
         execute_result.pc = pc_q;
         execute_result.src0_value = src0_q;
         execute_result.src1_value = src1_q;
+        execute_result.store_data_ready = src1_ready_q;
+        execute_result.store_data_src_id = src1_id_q;
         execute_result.imm = imm_q;
         execute_result.alu_result = lane_result;
         execute_result.reg_write = reg_write_q;
@@ -126,6 +183,8 @@ module ExecutionLane1 (
             pc_q             <= 32'h0;
             src0_q           <= 32'h0;
             src1_q           <= 32'h0;
+            src1_ready_q     <= 1'b0;
+            src1_id_q        <= '0;
             imm_q            <= 32'h0;
             reg_write_q      <= 1'b0;
             arch_rd_q        <= 5'h0;
@@ -156,6 +215,8 @@ module ExecutionLane1 (
                 pc_q        <= issue_pc;
                 src0_q      <= issue_src0;
                 src1_q      <= issue_src1;
+                src1_ready_q <= issue_src1_ready;
+                src1_id_q   <= issue_src1_id;
                 imm_q       <= issue_imm;
                 reg_write_q <= issue_reg_write;
                 arch_rd_q   <= issue_arch_rd;
@@ -166,6 +227,11 @@ module ExecutionLane1 (
                 store_mask_q <= issue_store_mask;
                 load_ext_op_q <= issue_load_ext_op;
                 is_ld_st_q <= issue_is_ld_st;
+            end else if (store_data_wake) begin
+                // The Store is resident in lane1 because SQ has not accepted
+                // it yet.  Capture its data producer completion locally.
+                src1_q       <= store_data_wake_value;
+                src1_ready_q <= 1'b1;
             end
 
             complete_valid     <= result_fire && !is_ld_st_q;

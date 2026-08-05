@@ -15,6 +15,11 @@ module ExecutionLane0 (
     input  logic                  system_flush,
     input  uop_id_t               recover_id,
 
+    input  completion_t           store_data_complete0,
+    input  completion_t           store_data_complete1,
+    input  commit_t               store_data_commit0,
+    input  commit_t               store_data_commit1,
+
     input  logic                  issue0_valid,
     input  logic                  issue0_fire,
     input  issue_uop_t            issue0,
@@ -57,6 +62,60 @@ module ExecutionLane0 (
         (system_flush || !recover_valid ||
          uop_is_younger(issue0_q.uop_id, recover_id));
 
+    // An address-ready Store is allowed to leave the DispatchQueue before its
+    // data producer completes.  While the Store is held at this execution
+    // boundary by LSU backpressure, continue snooping both completion lanes.
+    //
+    // Matching uses the complete epoch+ROB-tag identity.  Once ready becomes
+    // true, the captured value remains authoritative and cannot be replaced by
+    // a later wrapped ROB tag.
+    wire issue0_q_is_store =
+        issue0_valid_q &&
+        issue0_q.is_ld_st &&
+        (issue0_q.store_mask != `RAM_WE_N);
+
+    wire store_data_wake0 =
+        issue0_q_is_store &&
+        !issue0_q.src1_ready &&
+        store_data_complete0.valid &&
+        store_data_complete0.reg_write &&
+        uop_id_equal(store_data_complete0.uop_id,
+                     issue0_q.src1_id);
+
+    wire store_data_wake1 =
+        issue0_q_is_store &&
+        !issue0_q.src1_ready &&
+        store_data_complete1.valid &&
+        store_data_complete1.reg_write &&
+        uop_id_equal(store_data_complete1.uop_id,
+                     issue0_q.src1_id);
+
+    wire store_data_commit_wake0 =
+        issue0_q_is_store &&
+        !issue0_q.src1_ready &&
+        store_data_commit0.valid &&
+        store_data_commit0.reg_write &&
+        uop_id_equal(store_data_commit0.uop_id,
+                     issue0_q.src1_id);
+
+    wire store_data_commit_wake1 =
+        issue0_q_is_store &&
+        !issue0_q.src1_ready &&
+        store_data_commit1.valid &&
+        store_data_commit1.reg_write &&
+        uop_id_equal(store_data_commit1.uop_id,
+                     issue0_q.src1_id);
+
+    wire store_data_wake =
+        store_data_wake0 || store_data_wake1 ||
+        store_data_commit_wake0 || store_data_commit_wake1;
+
+    wire [31:0] store_data_wake_value =
+        store_data_wake0 ? store_data_complete0.value :
+        store_data_wake1 ? store_data_complete1.value :
+        store_data_commit_wake0 ? store_data_commit0.value :
+                                  store_data_commit1.value;
+
     // Branch recovery is published as one registered event.  Target and ROB
     // tag are sampled together with the resolution result; ROB/RAT/frontend
     // therefore never observe a recovery pulse paired with the next uop's
@@ -85,6 +144,12 @@ module ExecutionLane0 (
         end else if (!pipeline_flush && !lane0_result_stall && !muldiv_hold) begin
             issue0_valid_q <= issue0_fire;
             issue0_q       <= issue0;
+        end else if (store_data_wake) begin
+            // The resident Store has not yet transferred into SQ.  Preserve
+            // the completion here so the one-cycle wakeup cannot fall into
+            // the DQ-to-SQ ownership gap.
+            issue0_q.src1_value <= store_data_wake_value;
+            issue0_q.src1_ready <= 1'b1;
         end
     end
 
@@ -99,7 +164,11 @@ module ExecutionLane0 (
         .cpu_clk (cpu_clk),
         .cpu_rstn(cpu_rstn),
         .flush   (kill_issue0),
-        .alu_op  (issue0_q.alu_op),
+        // Do not let an invalid execute slot start the pipelined multiplier.
+        // issue0_q may contain a non-handshaken queue payload even when
+        // issue0_valid_q is clear; starting that ghost operation makes the
+        // next real multiply consume its stale DSP result.
+        .alu_op  (issue0_valid_q ? issue0_q.alu_op : 5'h0),
         .a       (ex_a),
         .b       (ex_b),
         .result  (muldiv_result),
@@ -169,6 +238,8 @@ module ExecutionLane0 (
         execute_result.pc              = issue0_q.pc;
         execute_result.src0_value      = issue0_q.src0_value;
         execute_result.src1_value      = issue0_q.src1_value;
+        execute_result.store_data_ready = issue0_q.src1_ready;
+        execute_result.store_data_src_id = issue0_q.src1_id;
         execute_result.imm             = issue0_q.imm;
         execute_result.alu_result      = ex_alu_result;
         execute_result.reg_write       = issue0_q.reg_write;
@@ -190,5 +261,6 @@ module ExecutionLane0 (
         execute_result.writeback_value = (issue0_q.result_sel == `WD_ALU) ?
                                           ex_alu_result : 32'h1234_5678;
         execute_result.select_ram      = (issue0_q.load_ext_op != `N_RAM_EXT);
+        execute_result.pred            = issue0_q.pred;
     end
 endmodule

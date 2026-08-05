@@ -27,7 +27,7 @@ module sram_model(Address, DataIO, OE_n, CE_n,WE_n, LB_n, UB_n);
 
 // Port Signal Definitions
 
-input [19:0] Address;
+input [20:0] Address;
 inout [15:0] DataIO ;
 input OE_n,CE_n,WE_n, LB_n, UB_n;
 
@@ -79,16 +79,16 @@ time read_address_time,read_CE_n_start_time=0,read_WE_n_start_time=0,read_OE_n_s
 reg   activate_cebar=0,activate_webar,activate_wecebar=0;
 reg   initiate_write1,initiate_write2,initiate_write3;
 reg   WE_dly;
-reg   [19:0] Address_write1,Address_write2;
-reg   [7:0] dummy_array0 [1048575:0];
-reg   [15:8] dummy_array1 [1048575:0];
-reg   [7:0] mem_array0 [1048575:0];
-reg   [15:8] mem_array1 [1048575:0];
+reg   [20:0] Address_write1,Address_write2;
+reg   [7:0] dummy_array0 [2097151:0];
+reg   [15:8] dummy_array1 [2097151:0];
+reg   [7:0] mem_array0 [2097151:0];
+reg   [15:8] mem_array1 [2097151:0];
 reg   [15:0] dataIO1;
 
             //For Read Access       
 reg   [15:0] data_read;
-reg   [19:0] Address_read1,Address_read2 ;
+reg   [20:0] Address_read1,Address_read2 ;
 reg   initiate_read1,initiate_read2;
 
 

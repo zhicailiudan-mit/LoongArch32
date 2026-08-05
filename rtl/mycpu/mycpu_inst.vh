@@ -32,13 +32,13 @@
 `define IMPL_SLL_W      1
 `define IMPL_SRA_W      1
 `define IMPL_SRL_W      1
-`define IMPL_DIV_W      0 // supervisor build: divider removed
-`define IMPL_DIV_WU     0 // supervisor build: divider removed
+`define IMPL_DIV_W      0 //DIV
+`define IMPL_DIV_WU     0 //DIV
 `define IMPL_MUL_W      1 //MUL
 `define IMPL_MULH_W     1 //MUL
 `define IMPL_MULH_WU    1 //MUL
-`define IMPL_MOD_W      0 // supervisor build: divider removed
-`define IMPL_MOD_WU     0 // supervisor build: divider removed
+`define IMPL_MOD_W      0 //DIV
+`define IMPL_MOD_WU     0 //DIV
 `define IMPL_BLT        1 //B
 `define IMPL_BGE        1 //B
 `define IMPL_BLTU       1 //B

@@ -57,6 +57,8 @@ module tb_dcache;
         .data_wposted  (data_wposted),
         .data_wresp    (data_wresp),
         .dev_wrdy      (dev_wrdy),
+        .dev_wdone     (1'b1),
+        .dev_widle     (1'b1),
         .cpu_wen       (cpu_wen),
         .cpu_waddr     (cpu_waddr),
         .cpu_wdata     (cpu_wdata),
@@ -176,8 +178,8 @@ module tb_dcache;
                     done_seen = 1'b1;
             end
             tb_expect(done_seen, "DCache CACOP maintenance completes");
-            $display("[UNIT] maintenance mode=%0d index=%0d line_enabled=%0b",
-                     mode, address[9:5], dut.line_enabled[address[9:5]]);
+            $display("[UNIT] maintenance mode=%0d index=%0d line_enabled0=%0b line_enabled1=%0b",
+                     mode, address[9:5], dut.line_enabled0[address[9:5]], dut.line_enabled1[address[9:5]]);
         end
     endtask
 

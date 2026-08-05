@@ -45,6 +45,9 @@ package cpu_types_pkg;
         logic [9:0]  index;
         logic [2:0]  ras_sp_before;
         logic [3:0]  ras_count_before;
+        // Observation-only: BTB lookup result sampled with this instruction.
+        // It is never consumed by functional control.
+        logic        perf_btb_hit;
     } prediction_meta_t;
 
     // Frontend packet in the same field order as the existing IF_ID packet:
@@ -63,6 +66,14 @@ package cpu_types_pkg;
         SYS_CSRXCHG  = 3'd4,
         SYS_CSRRD    = 3'd5
     } system_op_e;
+
+    typedef enum logic [2:0] {
+        PROD_UNKNOWN = 3'd0,
+        PROD_ALU     = 3'd1,
+        PROD_LOAD    = 3'd2,
+        PROD_MULDIV  = 3'd3,
+        PROD_BRANCH  = 3'd4
+    } producer_type_e;
 
     typedef struct packed {
         logic [31:0] pc;
@@ -94,6 +105,8 @@ package cpu_types_pkg;
         logic [31:0] pc;
         logic [31:0] src0_value;
         logic [31:0] src1_value;
+        logic        src1_ready;
+        uop_id_t     src1_id;
         logic [4:0]  arch_rs1;
         logic [4:0]  arch_rs2;
         logic        src0_used;
@@ -151,6 +164,8 @@ package cpu_types_pkg;
         logic [2:0]              load_ext_op;
         logic                    reg_write;
         logic [4:0]              arch_rd;
+        logic                    store_data_ready;
+        uop_id_t                 store_data_src_id;
     } lsu_entry_t;
 
     typedef struct packed {
@@ -184,6 +199,8 @@ package cpu_types_pkg;
         logic [31:0]             pc;
         logic [31:0]             src0_value;
         logic [31:0]             src1_value;
+        logic                    store_data_ready;
+        uop_id_t                 store_data_src_id;
         logic [31:0]             imm;
         logic [31:0]             alu_result;
         logic                    reg_write;
@@ -203,6 +220,7 @@ package cpu_types_pkg;
         logic [31:0]             branch_target;
         logic [31:0]             writeback_value;
         logic                    select_ram;
+        prediction_meta_t        pred;
     } execute_result_t;
 
     // Existing external data-access request/response pins, grouped without
@@ -212,6 +230,7 @@ package cpu_types_pkg;
         logic [31:0] addr;
         logic [3:0]  wen;
         logic [31:0] wdata;
+        logic [2:0]  load_tid;
     } memory_request_t;
 
     typedef struct packed {
@@ -221,6 +240,7 @@ package cpu_types_pkg;
         logic        wready;
         logic        wposted;
         logic        wresp;
+        logic [2:0]  load_tid;
     } memory_response_t;
 
     typedef struct packed {

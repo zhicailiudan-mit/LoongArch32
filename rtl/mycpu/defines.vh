@@ -4,10 +4,16 @@
 `define ENABLE_ICACHE
 `define ENABLE_DCACHE
 `define ENABLE_BPU
+//`define ENABLE_DCACHE_NEXTLINE_PREFETCH
+
+// The out-of-order backend can retire two architectural register writes per
+// cycle.  Enable the matching two-wide simulation checker by default.  Comment
+// this define only when running an unmodified, legacy one-wide testbench.
+`define DUAL_COMMIT_TRACE
 
 // Backend sizing shared by ROB, RAT, issue queue and pipeline tags.
-`define ROB_DEPTH 16
-`define ROB_TAG_W 4
+`define ROB_DEPTH 32
+`define ROB_TAG_W 5
 `define UOP_EPOCH_W 2
 `define UOP_ID_W (`UOP_EPOCH_W + `ROB_TAG_W)
 

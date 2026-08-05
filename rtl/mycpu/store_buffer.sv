@@ -62,7 +62,7 @@ module StoreBuffer #(parameter integer DEPTH = 4) (
         integer b;
         integer idx;
 
-        accept_ready = rstn && ((count < DEPTH) || pop_do);
+        accept_ready = rstn && (count < DEPTH);
         head_valid = (count != 0);
         head_entry = '0;
         if (head_valid)
@@ -111,16 +111,31 @@ module StoreBuffer #(parameter integer DEPTH = 4) (
         end else begin
             case ({push_do, pop_do})
                 2'b10: begin
+`ifndef SYNTHESIS
+`ifdef LSU_VERBOSE_TRACE
+                    $display("[%t] SB PUSH: PC=0x%8h, addr=0x%8h, uop_id=%d, count=%d", $time, accept_entry.pc, accept_entry.address, accept_entry.uop_id, count);
+`endif
+`endif
                     entries[write_ptr] <= accepted_entry_aligned;
                     write_ptr <= ptr_next(write_ptr);
                     count <= count + 1'b1;
                 end
                 2'b01: begin
+`ifndef SYNTHESIS
+`ifdef LSU_VERBOSE_TRACE
+                    $display("[%t] SB POP: PC=0x%8h, addr=0x%8h, uop_id=%d, count=%d", $time, entries[read_ptr].pc, entries[read_ptr].address, entries[read_ptr].uop_id, count);
+`endif
+`endif
                     entries[read_ptr].valid <= 1'b0;
                     read_ptr <= ptr_next(read_ptr);
                     count <= count - 1'b1;
                 end
                 2'b11: begin
+`ifndef SYNTHESIS
+`ifdef LSU_VERBOSE_TRACE
+                    $display("[%t] SB PUSH+POP: push PC=0x%8h, pop PC=0x%8h, count=%d", $time, accept_entry.pc, entries[read_ptr].pc, count);
+`endif
+`endif
                     entries[write_ptr] <= accepted_entry_aligned;
                     write_ptr <= ptr_next(write_ptr);
                     read_ptr <= ptr_next(read_ptr);
@@ -141,7 +156,7 @@ module StoreBuffer #(parameter integer DEPTH = 4) (
         if (rstn) begin
             if (pop && (count == 0))
                 $error("StoreBuffer pop while empty");
-            if ((count == DEPTH) && accept_valid && !pop_do)
+            if ((count == DEPTH) && push_do && !pop_do)
                 $error("StoreBuffer push while full without pop");
             if (count_next > DEPTH)
                 $error("StoreBuffer count overflow");

@@ -34,19 +34,7 @@ THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 `include "mycpu_inst.vh"
 `include "defines.vh"
-
-// 修改 SRAM 初始化文件路径
-// Keep the image overridable from the simulator command line.  The previous
-// absolute path pointed at an obsolete checkout and silently loaded an older
-// instruction stream (for example DIV.W instead of MUL.W at 0x1c02bd58).
-`ifndef SRAM_INIT_FILE
-`define SRAM_INIT_FILE        "C:/Users/wanlinc/Desktop/Me/Loogn cpu v1/func_test/func/obj/inst_ram.mif"
-`endif
-
-// 修改 Trace 文件路径（注意末尾的反斜杠）
-`define TRACE_REF_FILE        "C:/Users/wanlinc/Desktop/Me/Loogn cpu v1/func_test/gettrace/golden_trace.txt"
-`define TRACE_REF_WDATA_FILE  "C:/Users/wanlinc/Desktop/Me/Loogn cpu v1/func_test/gettrace/golden_trace_wdata.txt"
-`define TRACE_REF_BJ_FILE     "C:/Users/wanlinc/Desktop/Me/Loogn cpu v1/func_test/gettrace/golden_trace_bj.txt"
+`include "C:/Users/wanlinc/Desktop/Me/Loogn cpu v1/func_test/soc_verify/test_profile.vh"
 `define CONFREG_NUM_REG      soc_lite.u_confreg.num_data
 `define CONFREG_OPEN_TRACE   soc_lite.u_confreg.open_trace
 `define CONFREG_NUM_MONITOR  soc_lite.u_confreg.num_monitor
@@ -58,13 +46,19 @@ module tb_top( );
     reg resetn = 1'b0;
     reg clk = 1'b0;
 
-    //sram
-    wire [19:0] sram_addr;
-    wire [31:0] sram_data;
-    wire        sram_oen;
-    wire        sram_cen;
-    wire        sram_wen;
-    wire [ 3:0] sram_ben;
+    // Board-compatible independent BaseRAM and ExtRAM models.
+    wire [19:0] base_sram_addr;
+    wire [31:0] base_sram_data;
+    wire        base_sram_oen;
+    wire        base_sram_cen;
+    wire        base_sram_wen;
+    wire [ 3:0] base_sram_ben;
+    wire [19:0] ext_sram_addr;
+    wire [31:0] ext_sram_data;
+    wire        ext_sram_oen;
+    wire        ext_sram_cen;
+    wire        ext_sram_wen;
+    wire [ 3:0] ext_sram_ben;
     //goio
     wire [15:0] led;
     wire [1 :0] led_rg0;
@@ -82,13 +76,19 @@ module tb_top( );
         .resetn     (resetn), 
         .clk        (clk   ),
 
-        //------sram-------
-        .sram_addr  (sram_addr),
-        .sram_data  (sram_data),
-        .sram_oen   (sram_oen ),      // output enable
-        .sram_cen   (sram_cen ),      // chip select
-        .sram_wen   (sram_wen ),      // write enable
-        .sram_ben   (sram_ben ),      // byte enable
+        //------BaseRAM / ExtRAM-------
+        .base_sram_addr (base_sram_addr),
+        .base_sram_data (base_sram_data),
+        .base_sram_oen  (base_sram_oen ),
+        .base_sram_cen  (base_sram_cen ),
+        .base_sram_wen  (base_sram_wen ),
+        .base_sram_ben  (base_sram_ben ),
+        .ext_sram_addr  (ext_sram_addr),
+        .ext_sram_data  (ext_sram_data),
+        .ext_sram_oen   (ext_sram_oen ),
+        .ext_sram_cen   (ext_sram_cen ),
+        .ext_sram_wen   (ext_sram_wen ),
+        .ext_sram_ben   (ext_sram_ben ),
         
         //------gpio-------
         .num_csn    (num_csn    ),
@@ -102,30 +102,50 @@ module tb_top( );
         .btn_step   (btn_step   )
     );
 
-    // Upper half-word
-    sram_model sram_uh (
-        .Address    (sram_addr[19:0] ),     // input [19:0]
-        .DataIO     (sram_data[31:16]),     // inout [15:0]
-        .OE_n       (sram_oen        ),     // input [0:0]
-        .CE_n       (sram_cen        ),     // input [0:0]
-        .WE_n       (sram_wen        ),     // input [0:0]
-        .UB_n       (sram_ben[3]     ),     // input [0:0]
-        .LB_n       (sram_ben[2]     )      // input [0:0]
+    // BaseRAM upper/lower half-word
+    sram_model base_sram_uh (
+        .Address    ({1'b0, base_sram_addr}),
+        .DataIO     (base_sram_data[31:16]),
+        .OE_n       (base_sram_oen       ),
+        .CE_n       (base_sram_cen       ),
+        .WE_n       (base_sram_wen       ),
+        .UB_n       (base_sram_ben[3]    ),
+        .LB_n       (base_sram_ben[2]    )
     );
-    // Lower half-word
-    sram_model sram_lh (
-        .Address    (sram_addr[19:0] ),     // input [19:0]
-        .DataIO     (sram_data[15:0] ),     // inout [15:0]
-        .OE_n       (sram_oen        ),     // input [0:0]
-        .CE_n       (sram_cen        ),     // input [0:0]
-        .WE_n       (sram_wen        ),     // input [0:0]
-        .UB_n       (sram_ben[1]     ),     // input [0:0]
-        .LB_n       (sram_ben[0]     )      // input [0:0]
+    sram_model base_sram_lh (
+        .Address    ({1'b0, base_sram_addr}),
+        .DataIO     (base_sram_data[15:0] ),
+        .OE_n       (base_sram_oen         ),
+        .CE_n       (base_sram_cen         ),
+        .WE_n       (base_sram_wen         ),
+        .UB_n       (base_sram_ben[1]      ),
+        .LB_n       (base_sram_ben[0]      )
+    );
+    // ExtRAM upper/lower half-word
+    sram_model ext_sram_uh (
+        .Address    ({1'b0, ext_sram_addr}),
+        .DataIO     (ext_sram_data[31:16]),
+        .OE_n       (ext_sram_oen       ),
+        .CE_n       (ext_sram_cen       ),
+        .WE_n       (ext_sram_wen       ),
+        .UB_n       (ext_sram_ben[3]    ),
+        .LB_n       (ext_sram_ben[2]    )
+    );
+    sram_model ext_sram_lh (
+        .Address    ({1'b0, ext_sram_addr}),
+        .DataIO     (ext_sram_data[15:0] ),
+        .OE_n       (ext_sram_oen         ),
+        .CE_n       (ext_sram_cen         ),
+        .WE_n       (ext_sram_wen         ),
+        .UB_n       (ext_sram_ben[1]      ),
+        .LB_n       (ext_sram_ben[0]      )
     );
 
     // initialize sram
     reg [31:0] tmp_data;
     integer sram_init_file, sram_file_size = 0;
+    integer bank_word_index;
+    localparam integer SRAM_BANK_WORDS = 1 << 20;
     initial begin
         sram_init_file = $fopen(`SRAM_INIT_FILE, "r");
         if (!sram_init_file) begin
@@ -134,10 +154,18 @@ module tb_top( );
         end else begin
             while (!$feof(sram_init_file)) begin
                 if ($fscanf(sram_init_file, "%b", tmp_data) == 1) begin
-                    sram_uh.mem_array1[sram_file_size] = tmp_data[31:24];
-                    sram_uh.mem_array0[sram_file_size] = tmp_data[23:16];
-                    sram_lh.mem_array1[sram_file_size] = tmp_data[15: 8];
-                    sram_lh.mem_array0[sram_file_size] = tmp_data[ 7: 0];
+                    if (sram_file_size < SRAM_BANK_WORDS) begin
+                        base_sram_uh.mem_array1[sram_file_size] = tmp_data[31:24];
+                        base_sram_uh.mem_array0[sram_file_size] = tmp_data[23:16];
+                        base_sram_lh.mem_array1[sram_file_size] = tmp_data[15: 8];
+                        base_sram_lh.mem_array0[sram_file_size] = tmp_data[ 7: 0];
+                    end else begin
+                        bank_word_index = sram_file_size - SRAM_BANK_WORDS;
+                        ext_sram_uh.mem_array1[bank_word_index] = tmp_data[31:24];
+                        ext_sram_uh.mem_array0[bank_word_index] = tmp_data[23:16];
+                        ext_sram_lh.mem_array1[bank_word_index] = tmp_data[15: 8];
+                        ext_sram_lh.mem_array0[bank_word_index] = tmp_data[ 7: 0];
+                    end
                     sram_file_size = sram_file_size + 1;
                 end
             end
@@ -157,6 +185,26 @@ module tb_top( );
     wire [31:0] debug_wb_pc       = soc_lite.u_cpu.u_mycpu.debug_wb_pc;
     wire [4 :0] debug_wb_rf_wnum  = soc_lite.u_cpu.u_mycpu.debug_wb_rf_rd;
     wire [31:0] debug_wb_rf_wdata = soc_lite.u_cpu.u_mycpu.debug_wb_rf_wdata;
+
+`ifdef DUAL_COMMIT_TRACE
+    // Two-wide simulation-only retirement stream.  Packets are registered in
+    // MyCpu so both slots remain stable across this checker's #2 sample delay.
+    wire        debug_trace0_valid = soc_lite.u_cpu.u_mycpu.debug_trace0_obs;
+    // END_PC is an architectural commit marker, not necessarily a register
+    // write.  Keep the observable-write valid above for Golden comparison,
+    // but use the full commit valid when locating the end marker.
+    wire        debug_trace0_commit_valid =
+        soc_lite.u_cpu.u_mycpu.debug_trace0_q.valid;
+    wire [31:0] debug_trace0_pc    = soc_lite.u_cpu.u_mycpu.debug_trace0_q.pc;
+    wire [ 4:0] debug_trace0_rd    = soc_lite.u_cpu.u_mycpu.debug_trace0_q.arch_rd;
+    wire [31:0] debug_trace0_data  = soc_lite.u_cpu.u_mycpu.debug_trace0_q.value;
+    wire        debug_trace1_valid = soc_lite.u_cpu.u_mycpu.debug_trace1_obs;
+    wire        debug_trace1_commit_valid =
+        soc_lite.u_cpu.u_mycpu.debug_trace1_q.valid;
+    wire [31:0] debug_trace1_pc    = soc_lite.u_cpu.u_mycpu.debug_trace1_q.pc;
+    wire [ 4:0] debug_trace1_rd    = soc_lite.u_cpu.u_mycpu.debug_trace1_q.arch_rd;
+    wire [31:0] debug_trace1_data  = soc_lite.u_cpu.u_mycpu.debug_trace1_q.value;
+`endif
 
     wire [ 3:0] debug_wdata_we   = soc_lite.u_cpu.u_mycpu.debug_wdata_we;
     wire [31:0] debug_wdata_pc   = soc_lite.u_cpu.u_mycpu.debug_wdata_pc;
@@ -214,17 +262,58 @@ module tb_top( );
     reg [31:0] ref_bj_pc    ;
     reg [31:0] ref_bj_target;
 
+    reg debug_wb_err;
+
+`ifdef DUAL_COMMIT_TRACE
+    // Consume exactly one valid Golden Register-Write record and compare it
+    // with one architectural commit.  Blocking assignments are intentional:
+    // two calls in one cycle must consume two consecutive Golden records.
+    task automatic check_one_reg_commit;
+        input [31:0] dut_pc;
+        input [ 4:0] dut_rd;
+        input [31:0] dut_wdata;
+        begin
+            trace_cmp_flag = 1'b0;
+            while (!trace_cmp_flag && !($feof(trace_ref))) begin
+                $fscanf(trace_ref, "%h %h %h %h", trace_cmp_flag,
+                        ref_wb_pc, ref_wb_rf_wnum, ref_wb_rf_wdata);
+            end
+
+            if (!trace_cmp_flag) begin
+                $display("[TRACE FATAL] Golden register-write trace ended before DUT commit at PC=0x%8h", dut_pc);
+                debug_wb_err = 1'b1;
+                $fatal(1, "[TRACE FATAL] Golden register-write trace exhausted!");
+            end else if ((dut_pc !== ref_wb_pc) ||
+                         (dut_rd !== ref_wb_rf_wnum) ||
+                         (dut_wdata !== ref_wb_rf_wdata)) begin
+                $display("--------------------------------------------------------------");
+                $display("[%t] Error!!! - Register Write", $time);
+                $display("    reference: PC = 0x%8h, wb_rf_wnum = 0x%2h, wb_rf_wdata = 0x%8h",
+                         ref_wb_pc, ref_wb_rf_wnum, ref_wb_rf_wdata);
+                $display("    mycpu    : PC = 0x%8h, wb_rf_wnum = 0x%2h, wb_rf_wdata = 0x%8h",
+                         dut_pc, dut_rd, dut_wdata);
+                $display("--------------------------------------------------------------");
+                debug_wb_err = 1'b1;
+                #40;
+                $finish;
+            end
+        end
+    endtask
+`endif
+
     reg  resetn_r;
     wire first_rd = !resetn_r & resetn;
     always @(posedge soc_clk) begin
         resetn_r <= resetn;
 
+`ifndef DUAL_COMMIT_TRACE
         if (first_rd || |debug_wb_rf_we && debug_wb_rf_wnum!=5'd0 && !debug_end && `CONFREG_OPEN_TRACE) begin
             trace_cmp_flag = 1'b0;
             while (!trace_cmp_flag && !($feof(trace_ref)))
                 $fscanf(trace_ref, "%h %h %h %h", trace_cmp_flag,
                         ref_wb_pc, ref_wb_rf_wnum, ref_wb_rf_wdata);
         end
+`endif
 
         if (first_rd || |debug_wdata_we && !debug_end && `CONFREG_OPEN_TRACE) begin
             trace_cmp_wdata_flag = 1'b0;
@@ -260,12 +349,28 @@ module tb_top( );
                                    ref_wdata[7 : 0] & {8{  ref_wdata_we[0]}}};
 
     //compare result in rsing edge 
-    reg debug_wb_err;
     always @(posedge soc_clk) begin
         #2;
         if(!resetn) begin
             debug_wb_err <= 1'b0;
         end else begin
+`ifdef DUAL_COMMIT_TRACE
+            // Architectural order is mandatory: commit0 is older than commit1.
+            // END_PC itself need not write a register.  Once it appears in
+            // commit0, commit1 is beyond the test's architectural boundary
+            // and must not consume another Golden record.
+            if (!debug_end && `CONFREG_OPEN_TRACE) begin
+                if (debug_trace0_valid && (debug_trace0_pc != `END_PC))
+                    check_one_reg_commit(debug_trace0_pc, debug_trace0_rd,
+                                         debug_trace0_data);
+                if (debug_trace1_valid &&
+                    !(debug_trace0_commit_valid &&
+                      (debug_trace0_pc == `END_PC)) &&
+                    (debug_trace1_pc != `END_PC))
+                    check_one_reg_commit(debug_trace1_pc, debug_trace1_rd,
+                                         debug_trace1_data);
+            end
+`else
             if (|debug_wb_rf_we && debug_wb_rf_wnum!=5'd0 && !debug_end && `CONFREG_OPEN_TRACE) begin
                 if (  (debug_wb_pc!==ref_wb_pc) || (debug_wb_rf_wnum!==ref_wb_rf_wnum)
                     ||(debug_wb_rf_wdata_v!==ref_wb_rf_wdata_v) ) begin
@@ -281,8 +386,13 @@ module tb_top( );
                     $finish;
                 end
             end
+`endif
 
             if (|debug_wdata_we && !debug_end && `CONFREG_OPEN_TRACE) begin
+`ifdef LSU_VERBOSE_TRACE
+                $display("[%t] STORE TRACE: mycpu(PC=0x%8h, addr=0x%8h, data=0x%8h) vs ref(PC=0x%8h, addr=0x%8h, data=0x%8h)",
+                         $time, debug_wdata_pc, debug_wdata_addr, debug_wdata_v, ref_wdata_pc, ref_wdata_addr, ref_wdata_v);
+`endif
                 if (  (debug_wdata_pc!==ref_wdata_pc) || (debug_wdata_addr!==ref_wdata_addr)
                     ||(debug_wdata_v!==ref_wdata_v) ) begin
                     $display("--------------------------------------------------------------");
@@ -445,12 +555,12 @@ module tb_top( );
 
      // Branches and jumps are restricted to the main issue port, so this is
      // the new-architecture equivalent of the old single ID-stage monitor.
-     wire     id_valid = soc_lite.u_cpu.u_mycpu.main_issue_fire;
-     wire     id_is_b  = soc_lite.u_cpu.u_mycpu.main_issue.is_br_jmp &&
-                         (soc_lite.u_cpu.u_mycpu.main_issue.npc_op == `NPC_ALU);
-     wire     id_is_j  = soc_lite.u_cpu.u_mycpu.main_issue.is_br_jmp &&
-                         (soc_lite.u_cpu.u_mycpu.main_issue.npc_op != `NPC_ALU);
-     wire [31:0] id_pc = soc_lite.u_cpu.u_mycpu.main_issue.pc;
+     wire     id_valid = soc_lite.u_cpu.u_mycpu.issue0_fire;
+     wire     id_is_b  = soc_lite.u_cpu.u_mycpu.issue0.is_br_jmp &&
+                         (soc_lite.u_cpu.u_mycpu.issue0.npc_op == `NPC_ALU);
+     wire     id_is_j  = soc_lite.u_cpu.u_mycpu.issue0.is_br_jmp &&
+                         (soc_lite.u_cpu.u_mycpu.issue0.npc_op != `NPC_ALU);
+     wire [31:0] id_pc = soc_lite.u_cpu.u_mycpu.issue0.pc;
      integer bpu_track;
      initial bpu_track = $fopen("bpu_track.txt", "w");
      always @(posedge soc_clk) begin
@@ -465,7 +575,17 @@ module tb_top( );
 
     //test end
     wire global_err = debug_wb_err || (err_count!=8'd0);
+`ifdef DUAL_COMMIT_TRACE
+    // Do not collapse the retirement pair when detecting the architectural
+    // end marker: END_PC may be a non-register-writing instruction and may be
+    // in the younger commit1 slot.
+    wire trace_end_pc =
+        (debug_trace0_commit_valid && (debug_trace0_pc == `END_PC)) ||
+        (debug_trace1_commit_valid && (debug_trace1_pc == `END_PC));
+    wire test_end = trace_end_pc || (uart_display && uart_data==8'hff);
+`else
     wire test_end = (debug_wb_pc==`END_PC) || (uart_display && uart_data==8'hff);
+`endif
     always @(posedge soc_clk) begin
         if (!resetn) begin
             debug_end <= 1'b0;
@@ -641,7 +761,9 @@ module tb_top( );
     `define MYCPU_RF    soc_lite.u_cpu.u_mycpu.ID.u_RF.r
     `define MYCPU_PC    soc_lite.u_cpu.u_mycpu.IF.u_PC.pc
     reg         mycpu_suspend_r;
-    wire        sram_writing = soc_lite.u_cpu.sram_bus_en & (|(soc_lite.u_cpu.sram_bus_we));
+    wire        sram_writing =
+        (soc_lite.u_cpu.base_sram_bus_en && (|soc_lite.u_cpu.base_sram_bus_we)) ||
+        (soc_lite.u_cpu.ext_sram_bus_en  && (|soc_lite.u_cpu.ext_sram_bus_we));
     reg  [ 3:0] ref_wdata_we_r = 4'h0;
     reg  [31:0] ref_wdata_addr_r;
     reg  [31:0] ref_wdata_r;
@@ -651,22 +773,37 @@ module tb_top( );
         if (wb_rf_unimpl & !mycpu_suspend_r) `MYCPU_RF[ref_wb_rf_wnum] <= ref_wb_rf_wdata;
 
         // Update memory cell when an unimpl. inst finished its memory access
-        if (mem_st_unimpl & (ref_wdata_addr[31:16] != 16'hBFAF)) begin
+        if (mem_st_unimpl && (ref_wdata_addr[31:24] != 8'h1f) &&
+            (ref_wdata_addr[31:16] != 16'hBFAF)) begin
             if (sram_writing) begin     // Wait for the unfinished writing
                 ref_wdata_we_r   <= ref_wdata_we;
                 ref_wdata_addr_r <= ref_wdata_addr;
                 ref_wdata_r      <= ref_wdata;
             end else begin
-                if (ref_wdata_we[3]) sram_uh.mem_array1[ref_wdata_addr[21:2]] <= ref_wdata[31:24];
-                if (ref_wdata_we[2]) sram_uh.mem_array0[ref_wdata_addr[21:2]] <= ref_wdata[23:16];
-                if (ref_wdata_we[1]) sram_lh.mem_array1[ref_wdata_addr[21:2]] <= ref_wdata[15: 8];
-                if (ref_wdata_we[0]) sram_lh.mem_array0[ref_wdata_addr[21:2]] <= ref_wdata[ 7: 0];
+                if (!ref_wdata_addr[22]) begin
+                    if (ref_wdata_we[3]) base_sram_uh.mem_array1[ref_wdata_addr[21:2]] <= ref_wdata[31:24];
+                    if (ref_wdata_we[2]) base_sram_uh.mem_array0[ref_wdata_addr[21:2]] <= ref_wdata[23:16];
+                    if (ref_wdata_we[1]) base_sram_lh.mem_array1[ref_wdata_addr[21:2]] <= ref_wdata[15: 8];
+                    if (ref_wdata_we[0]) base_sram_lh.mem_array0[ref_wdata_addr[21:2]] <= ref_wdata[ 7: 0];
+                end else begin
+                    if (ref_wdata_we[3]) ext_sram_uh.mem_array1[ref_wdata_addr[21:2]] <= ref_wdata[31:24];
+                    if (ref_wdata_we[2]) ext_sram_uh.mem_array0[ref_wdata_addr[21:2]] <= ref_wdata[23:16];
+                    if (ref_wdata_we[1]) ext_sram_lh.mem_array1[ref_wdata_addr[21:2]] <= ref_wdata[15: 8];
+                    if (ref_wdata_we[0]) ext_sram_lh.mem_array0[ref_wdata_addr[21:2]] <= ref_wdata[ 7: 0];
+                end
             end
         end else if ((|ref_wdata_we_r) & !sram_writing) begin
-            if (ref_wdata_we_r[3]) sram_uh.mem_array1[ref_wdata_addr_r[21:2]] <= ref_wdata_r[31:24];
-            if (ref_wdata_we_r[2]) sram_uh.mem_array0[ref_wdata_addr_r[21:2]] <= ref_wdata_r[23:16];
-            if (ref_wdata_we_r[1]) sram_lh.mem_array1[ref_wdata_addr_r[21:2]] <= ref_wdata_r[15: 8];
-            if (ref_wdata_we_r[0]) sram_lh.mem_array0[ref_wdata_addr_r[21:2]] <= ref_wdata_r[ 7: 0];
+            if (!ref_wdata_addr_r[22]) begin
+                if (ref_wdata_we_r[3]) base_sram_uh.mem_array1[ref_wdata_addr_r[21:2]] <= ref_wdata_r[31:24];
+                if (ref_wdata_we_r[2]) base_sram_uh.mem_array0[ref_wdata_addr_r[21:2]] <= ref_wdata_r[23:16];
+                if (ref_wdata_we_r[1]) base_sram_lh.mem_array1[ref_wdata_addr_r[21:2]] <= ref_wdata_r[15: 8];
+                if (ref_wdata_we_r[0]) base_sram_lh.mem_array0[ref_wdata_addr_r[21:2]] <= ref_wdata_r[ 7: 0];
+            end else begin
+                if (ref_wdata_we_r[3]) ext_sram_uh.mem_array1[ref_wdata_addr_r[21:2]] <= ref_wdata_r[31:24];
+                if (ref_wdata_we_r[2]) ext_sram_uh.mem_array0[ref_wdata_addr_r[21:2]] <= ref_wdata_r[23:16];
+                if (ref_wdata_we_r[1]) ext_sram_lh.mem_array1[ref_wdata_addr_r[21:2]] <= ref_wdata_r[15: 8];
+                if (ref_wdata_we_r[0]) ext_sram_lh.mem_array0[ref_wdata_addr_r[21:2]] <= ref_wdata_r[ 7: 0];
+            end
             ref_wdata_we_r <= 4'h0;
         end
 
@@ -697,11 +834,19 @@ module tb_top( );
         wire sram_WAW_f = sram_WAW_warning_f & mem_st_unimpl & (ref_wdata_addr[31:16] != 16'hBFAF) &
                                                                (WAW_mem_waddr_r[31:2] == ref_wdata_addr[31:2]);
 
-        `define SRAM_BUS_WE     soc_lite.u_cpu.sram_bus_we
-        `define SRAM_BUS_WADDR  soc_lite.u_cpu.sram_bus_addr
-        `define SRAM_BUS_WDATA  soc_lite.u_cpu.sram_bus_wdata
-        wire sram_bus_en = soc_lite.u_cpu.sram_bus_en;
-        wire sram_WAW_en = sram_WAW_f_r & sram_bus_en & (|`SRAM_BUS_WE) & (`SRAM_BUS_WADDR == WAW_mem_waddr_r >> 2);
+        `define SRAM_BUS_WE_BASE   soc_lite.u_cpu.base_sram_bus_we
+        `define SRAM_BUS_ADDR_BASE soc_lite.u_cpu.base_sram_bus_addr
+        `define SRAM_BUS_WDATA_BASE soc_lite.u_cpu.base_sram_bus_wdata
+        `define SRAM_BUS_WE_EXT    soc_lite.u_cpu.ext_sram_bus_we
+        `define SRAM_BUS_ADDR_EXT  soc_lite.u_cpu.ext_sram_bus_addr
+        `define SRAM_BUS_WDATA_EXT soc_lite.u_cpu.ext_sram_bus_wdata
+        wire sram_WAW_en = sram_WAW_f_r &&
+            ((!WAW_mem_waddr_r[22] && soc_lite.u_cpu.base_sram_bus_en &&
+              (|`SRAM_BUS_WE_BASE) &&
+              (`SRAM_BUS_ADDR_BASE == (WAW_mem_waddr_r >> 2))) ||
+             ( WAW_mem_waddr_r[22] && soc_lite.u_cpu.ext_sram_bus_en &&
+              (|`SRAM_BUS_WE_EXT) &&
+              (`SRAM_BUS_ADDR_EXT == (WAW_mem_waddr_r >> 2))));
         reg  sram_WAW_en_r;
         wire sram_WAW_end = sram_WAW_en_r & !sram_WAW_en;   // negedge sram_WAW_en
         always @(negedge soc_clk) sram_WAW_en_r <= !resetn ? 1'b0 : sram_WAW_en;
@@ -747,8 +892,10 @@ module tb_top( );
                                       WAW_id_we_r[2] ? WAW_id_wdata_r[23:16] : WAW_mem_wdata_r[23:16],
                                       WAW_id_we_r[1] ? WAW_id_wdata_r[15: 8] : WAW_mem_wdata_r[15: 8],
                                       WAW_id_we_r[0] ? WAW_id_wdata_r[ 7: 0] : WAW_mem_wdata_r[ 7: 0]};
-        `FORCE_MODIFY(`SRAM_BUS_WE   , sram_WAW_en, sram_WAW_we   )
-        `FORCE_MODIFY(`SRAM_BUS_WDATA, sram_WAW_en, sram_WAW_wdata)
+        `FORCE_MODIFY(`SRAM_BUS_WE_BASE, sram_WAW_en && !WAW_mem_waddr_r[22], sram_WAW_we)
+        `FORCE_MODIFY(`SRAM_BUS_WDATA_BASE, sram_WAW_en && !WAW_mem_waddr_r[22], sram_WAW_wdata)
+        `FORCE_MODIFY(`SRAM_BUS_WE_EXT, sram_WAW_en && WAW_mem_waddr_r[22], sram_WAW_we)
+        `FORCE_MODIFY(`SRAM_BUS_WDATA_EXT, sram_WAW_en && WAW_mem_waddr_r[22], sram_WAW_wdata)
         
     `endif
 

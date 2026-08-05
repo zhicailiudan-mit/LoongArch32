@@ -18,8 +18,8 @@ module tb_scheduler_lane_isolation;
     logic rob_head_valid;
     logic [`ROB_TAG_W-1:0] rob_head_tag;
     logic system_inflight;
-    logic main_issue_valid, main_issue_ready, main_issue_fire;
-    issue_uop_t main_issue;
+    logic issue0_valid, issue0_ready, issue0_fire;
+    issue_uop_t issue0;
     logic system_issue_valid, system_issue_ready, system_issue_fire;
     issue_uop_t system_issue;
     logic issue1_valid, issue1_ready, issue1_fire;
@@ -38,7 +38,7 @@ module tb_scheduler_lane_isolation;
         .dispatch1_src1_ready(d1s1r), .dispatch1_src1_tag(d1s1t),
         .complete0, .complete1, .commit0, .commit1,
         .rob_head_valid, .rob_head_tag, .system_inflight,
-        .main_issue_valid, .main_issue_ready, .main_issue_fire, .main_issue,
+        .issue0_valid, .issue0_ready, .issue0_fire, .issue0,
         .system_issue_valid, .system_issue_ready, .system_issue_fire,
         .system_issue,
         .issue1_valid, .issue1_ready, .issue1_fire, .issue1, .occupancy
@@ -73,7 +73,7 @@ module tb_scheduler_lane_isolation;
         d0s0t = 0; d0s1t = 0; d1s0t = 0; d1s1t = 0;
         complete0 = '0; complete1 = '0; commit0 = '0; commit1 = '0;
         rob_head_valid = 0; rob_head_tag = 0; system_inflight = 0;
-        main_issue_ready = 0;
+        issue0_ready = 0;
         issue1_ready = 1;
         system_issue_ready = 1;
 
@@ -88,7 +88,7 @@ module tb_scheduler_lane_isolation;
         @(posedge clk);
         dispatch0_valid = 0;
         #1;
-        if (!issue1_valid || issue1.rob_tag != 4'd1 || main_issue_valid)
+        if (!issue1_valid || issue1.rob_tag != 4'd1 || issue0_valid)
             fail("fast integer did not bypass blocked lane0 to lane1");
         @(posedge clk);
 
@@ -102,15 +102,15 @@ module tb_scheduler_lane_isolation;
         dispatch0_valid = 0;
         dispatch1_valid = 0;
         #1;
-        if (!main_issue_valid || main_issue.rob_tag != 4'd2)
+        if (!issue0_valid || issue0.rob_tag != 4'd2)
             fail("MUL was not retained on lane0");
         if (!issue1_valid || issue1.rob_tag != 4'd3)
             fail("younger integer did not continue on lane1 beside MUL");
         @(posedge clk);
 
-        main_issue_ready = 1;
+        issue0_ready = 1;
         #1;
-        if (!main_issue_valid || main_issue.rob_tag != 4'd2)
+        if (!issue0_valid || issue0.rob_tag != 4'd2)
             fail("held MUL payload changed before lane0 handshake");
         @(posedge clk);
         #1;
@@ -130,12 +130,12 @@ module tb_scheduler_lane_isolation;
         dispatch0_valid = 0;
         dispatch1_valid = 0;
         #1;
-        if (!main_issue_valid || main_issue.rob_tag != 4'd5 ||
-            !main_issue.is_ld_st)
+        if (!issue0_valid || issue0.rob_tag != 4'd5 ||
+            !issue0.is_ld_st)
             fail("younger LSU was not routed to its only capable lane");
         if (!issue1_valid || issue1.rob_tag != 4'd4 || issue1.is_ld_st)
             fail("oldest ALU was not paired onto lane1 beside LSU");
-        if (!main_issue_fire || !issue1_fire)
+        if (!issue0_fire || !issue1_fire)
             fail("resource-aware ALU+LSU pair did not fire simultaneously");
         @(posedge clk);
         #1;
@@ -145,7 +145,7 @@ module tb_scheduler_lane_isolation;
         // MDU is now legal on lane1. With lane0 backpressured, the older ALU
         // remains stable there while the younger multiply progresses on its
         // independent lane-local multiplier.
-        main_issue_ready = 0;
+        issue0_ready = 0;
         drive_uop(dispatch0_uop, 4'd6, `ALU_ADD);
         drive_uop(dispatch1_uop, 4'd7, `ALU_MULL);
         dispatch0_valid = 1;
@@ -154,15 +154,15 @@ module tb_scheduler_lane_isolation;
         dispatch0_valid = 0;
         dispatch1_valid = 0;
         #1;
-        if (!main_issue_valid || main_issue.rob_tag != 4'd6 || main_issue_fire)
+        if (!issue0_valid || issue0.rob_tag != 4'd6 || issue0_fire)
             fail("backpressured lane0 did not hold the older ALU");
         if (!issue1_fire || issue1.rob_tag != 4'd7 ||
             issue1.alu_op != `ALU_MULL)
             fail("younger multiply did not progress on lane1");
         @(posedge clk);
-        main_issue_ready = 1;
+        issue0_ready = 1;
         #1;
-        if (!main_issue_valid || main_issue.rob_tag != 4'd6)
+        if (!issue0_valid || issue0.rob_tag != 4'd6)
             fail("paired ALU payload changed under lane0 backpressure");
         @(posedge clk);
         #1;
@@ -179,7 +179,7 @@ module tb_scheduler_lane_isolation;
         dispatch0_valid = 0;
         dispatch1_valid = 0;
         #1;
-        if (!main_issue_fire || main_issue.rob_tag != 4'd13)
+        if (!issue0_fire || issue0.rob_tag != 4'd13)
             fail("older multiply did not issue on main MDU lane");
         if (!issue1_fire || issue1.rob_tag != 4'd14)
             fail("younger multiply did not issue on second MDU lane");
@@ -203,16 +203,16 @@ module tb_scheduler_lane_isolation;
         dispatch0_valid = 0;
         dispatch1_valid = 0;
         #1;
-        if (!main_issue_fire || main_issue.rob_tag != 4'd8)
+        if (!issue0_fire || issue0.rob_tag != 4'd8)
             fail("older ALU did not issue ahead of younger branch");
-        if ((main_issue_valid && main_issue.rob_tag == 4'd9) ||
+        if ((issue0_valid && issue0.rob_tag == 4'd9) ||
             (issue1_valid && issue1.rob_tag == 4'd9))
             fail("younger branch issued before reaching ROB head");
         @(posedge clk);
         rob_head_tag = 4'd9;
         #1;
-        if (!main_issue_valid || main_issue.rob_tag != 4'd9 ||
-            !main_issue.is_br_jmp)
+        if (!issue0_valid || issue0.rob_tag != 4'd9 ||
+            !issue0.is_br_jmp)
             fail("branch did not become eligible at ROB head");
         @(posedge clk);
         #1;
@@ -230,8 +230,8 @@ module tb_scheduler_lane_isolation;
         @(posedge clk);
         dispatch1_valid = 0;
         #1;
-        if (!main_issue_valid || !main_issue_fire ||
-            main_issue.rob_tag != 4'd10 || !main_issue.is_ld_st)
+        if (!issue0_valid || !issue0_fire ||
+            issue0.rob_tag != 4'd10 || !issue0.is_ld_st)
             fail("dispatch1 LSU was not steered to the shared LSU path");
         if (issue1_valid && issue1.is_ld_st)
             fail("dispatch1 LSU leaked into the integer-only execution path");
@@ -255,15 +255,15 @@ module tb_scheduler_lane_isolation;
         dispatch0_valid = 0;
         dispatch1_valid = 0;
         #1;
-        if (!main_issue_fire || main_issue.rob_tag != 4'd11 ||
-            !main_issue.is_ld_st)
+        if (!issue0_fire || issue0.rob_tag != 4'd11 ||
+            !issue0.is_ld_st)
             fail("older member of dual-LSU pair did not issue first");
         if (issue1_fire)
             fail("single-entry LSU accepted a second memory uop in one cycle");
         @(posedge clk);
         #1;
-        if (!main_issue_fire || main_issue.rob_tag != 4'd12 ||
-            !main_issue.is_ld_st)
+        if (!issue0_fire || issue0.rob_tag != 4'd12 ||
+            !issue0.is_ld_st)
             fail("younger dual-LSU member was lost or did not issue second");
         @(posedge clk);
         #1;

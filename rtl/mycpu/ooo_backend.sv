@@ -41,30 +41,72 @@ module OooBackend (
     output commit_t                      commit0,
     output commit_t                      commit1,
 
+    output completion_t                  store_data_complete0,
+    output completion_t                  store_data_complete1,
+
+    // Store Reservation Interface
+    output logic                         reserve0_valid,
+    input  logic                         reserve0_ready,
+    output uop_id_t                      reserve0_uop_id,
+    output logic [31:0]                  reserve0_pc,
+    output logic [3:0]                   reserve0_store_mask,
+    output logic                         reserve0_src1_ready,
+    output logic [31:0]                  reserve0_src1_value,
+    output uop_id_t                      reserve0_src1_id,
+
+    output logic                         reserve1_valid,
+    input  logic                         reserve1_ready,
+    output uop_id_t                      reserve1_uop_id,
+    output logic [31:0]                  reserve1_pc,
+    output logic [3:0]                   reserve1_store_mask,
+    output logic                         reserve1_src1_ready,
+    output logic [31:0]                  reserve1_src1_value,
+    output uop_id_t                      reserve1_src1_id,
+    input  logic [1:0]                   store_reserve_credit,
+
     output logic [`ROB_TAG_W:0]          perf_rob_occupancy,
-    output logic [2:0]                   perf_issue_occupancy,
+    output logic [3:0]                   perf_issue_occupancy,
     output logic                         perf_rob_block,
     output logic                         perf_issue_queue_block,
-    output logic                         perf_source_wait,
-    output logic                         perf_serializing_block
+    output logic                         perf_true_source_wait,
+    output logic                         perf_source_wait_dep_load,
+    output logic                         perf_source_wait_dep_muldiv,
+    output logic                         perf_source_wait_dep_alu,
+    output logic                         perf_source_wait_dep_branch,
+    output logic                         perf_source_wait_store_addr,
+    output logic                         perf_source_wait_store_data,
+    output logic                         perf_iq_no_ready,
+    output logic                         perf_lsu_order,
+    output logic                         perf_serializing,
+    output logic                         perf_dispatch_fire0,
+    output logic                         perf_dispatch_fire1,
+    output logic                         perf_serializing_block,
+
+    output logic                         rob_head_valid,
+    output uop_id_t                      rob_head_id
 );
 
     wire decoded_uop_t decode_uop [0:1];
     wire dispatch_uop_t dispatch [0:1];
+    wire dispatch_uop_t dispatch_q [0:1];
     wire [1:0] dispatch_valid;
+    wire dispatch0_fire_q;
+    wire dispatch1_fire_q;
+    wire dispatch0_fire_comb;
+    wire dispatch1_fire_comb;
     wire [1:0] scheduler_dispatch_ready;
     wire [1:0] rob_alloc_ready;
     wire uop_id_t rob_alloc_id [0:1];
     wire [`ROB_DEPTH-1:0] rob_live_mask;
     wire [`ROB_TAG_W:0] rob_occupancy;
-    wire [2:0] scheduler_occupancy;
-    wire rob_head_valid;
+    wire [3:0] scheduler_occupancy;
     wire [`ROB_TAG_W-1:0] rob_head_tag;
-    wire uop_id_t rob_head_id;
     wire uop_id_t rob_query_id [0:3];
     wire rob_query_done [0:3];
     wire [31:0] rob_query_value [0:3];
     wire completion_t complete [0:1];
+    completion_t scheduler_complete0;
+    completion_t scheduler_system_complete;
     wire issue_uop_t alloc_uop [0:1];
     wire commit_t commit_internal [0:1];
     reg system_inflight;
@@ -73,6 +115,18 @@ module OooBackend (
     assign decode_uop[1] = decode_uop1;
     assign alloc_uop[0] = dispatch[0].uop;
     assign alloc_uop[1] = dispatch[1].uop;
+
+    // Keep ordinary lane-0 wakeup independent of the system-completion
+    // arbitration used by the ROB.  The system packet is routed separately
+    // and registered locally at the DispatchQueue boundary.
+    always_comb begin
+        scheduler_complete0 = main_complete;
+        scheduler_complete0.valid = main_complete.valid &&
+                                    rob_live_mask[main_complete.uop_id.rob_tag];
+        scheduler_system_complete = complete[0];
+        scheduler_system_complete.valid = complete[0].valid &&
+                                          system_complete.valid;
+    end
 
     always @(posedge clk or negedge rstn) begin
         if (!rstn)
@@ -103,11 +157,18 @@ module OooBackend (
         .rob_query_value          (rob_query_value),
         .rob_query_id             (rob_query_id),
         .complete                 (complete),
-        .dispatch                 (dispatch)
+        .dispatch                 (dispatch),
+        .dispatch_q               (dispatch_q),
+        .dispatch0_fire_q         (dispatch0_fire_q),
+        .dispatch1_fire_q         (dispatch1_fire_q),
+        .dispatch0_fire_comb      (dispatch0_fire_comb),
+        .dispatch1_fire_comb      (dispatch1_fire_comb)
     );
 
     assign dispatch_valid[0] = dispatch[0].valid;
     assign dispatch_valid[1] = dispatch[1].valid;
+    assign perf_dispatch_fire0 = dispatch_valid[0] && scheduler_dispatch_ready[0];
+    assign perf_dispatch_fire1 = dispatch_valid[1] && scheduler_dispatch_ready[1];
 
     Scheduler u_scheduler (
         .clk                  (clk),
@@ -117,22 +178,23 @@ module OooBackend (
         .system_flush         (system_flush),
         .recover_id           (recover_id),
         .barrier_release      (system_complete.valid),
-        .dispatch0_valid      (dispatch[0].valid),
+        .dispatch0_valid      (dispatch0_fire_q),
         .dispatch0_ready      (scheduler_dispatch_ready[0]),
-        .dispatch0_uop        (dispatch[0].uop),
-        .dispatch0_src0_ready (dispatch[0].src0_ready),
-        .dispatch0_src0_id    (dispatch[0].src0_id),
-        .dispatch0_src1_ready (dispatch[0].src1_ready),
-        .dispatch0_src1_id    (dispatch[0].src1_id),
-        .dispatch1_valid      (dispatch[1].valid),
+        .dispatch0_uop        (dispatch_q[0].uop),
+        .dispatch0_src0_ready (dispatch_q[0].src0_ready),
+        .dispatch0_src0_id    (dispatch_q[0].src0_id),
+        .dispatch0_src1_ready (dispatch_q[0].src1_ready),
+        .dispatch0_src1_id    (dispatch_q[0].src1_id),
+        .dispatch1_valid      (dispatch1_fire_q),
         .dispatch1_ready      (scheduler_dispatch_ready[1]),
-        .dispatch1_uop        (dispatch[1].uop),
-        .dispatch1_src0_ready (dispatch[1].src0_ready),
-        .dispatch1_src0_id    (dispatch[1].src0_id),
-        .dispatch1_src1_ready (dispatch[1].src1_ready),
-        .dispatch1_src1_id    (dispatch[1].src1_id),
-        .complete0            (complete[0]),
+        .dispatch1_uop        (dispatch_q[1].uop),
+        .dispatch1_src0_ready (dispatch_q[1].src0_ready),
+        .dispatch1_src0_id    (dispatch_q[1].src0_id),
+        .dispatch1_src1_ready (dispatch_q[1].src1_ready),
+        .dispatch1_src1_id    (dispatch_q[1].src1_id),
+        .complete0            (scheduler_complete0),
         .complete1            (complete[1]),
+        .system_complete      (scheduler_system_complete),
         .commit0              (commit_internal[0]),
         .commit1              (commit_internal[1]),
         .rob_head_valid       (rob_head_valid),
@@ -150,8 +212,35 @@ module OooBackend (
         .issue1_valid         (issue1_valid),
         .issue1_ready         (issue1_ready),
         .issue1_fire          (issue1_fire),
-        .issue1              (issue1),
-        .occupancy            (scheduler_occupancy)
+        .issue1               (issue1),
+        .occupancy            (scheduler_occupancy),
+        .reserve0_valid       (reserve0_valid),
+        .reserve0_ready       (reserve0_ready),
+        .reserve0_uop_id      (reserve0_uop_id),
+        .reserve0_pc          (reserve0_pc),
+        .reserve0_store_mask  (reserve0_store_mask),
+        .reserve0_src1_ready  (reserve0_src1_ready),
+        .reserve0_src1_value  (reserve0_src1_value),
+        .reserve0_src1_id     (reserve0_src1_id),
+        .reserve1_valid       (reserve1_valid),
+        .reserve1_ready       (reserve1_ready),
+        .reserve1_uop_id      (reserve1_uop_id),
+        .reserve1_pc          (reserve1_pc),
+        .reserve1_store_mask  (reserve1_store_mask),
+        .reserve1_src1_ready  (reserve1_src1_ready),
+        .reserve1_src1_value  (reserve1_src1_value),
+        .reserve1_src1_id     (reserve1_src1_id),
+        .store_reserve_credit (store_reserve_credit),
+        .perf_true_source_wait(perf_true_source_wait),
+        .perf_source_wait_dep_load(perf_source_wait_dep_load),
+        .perf_source_wait_dep_muldiv(perf_source_wait_dep_muldiv),
+        .perf_source_wait_dep_alu(perf_source_wait_dep_alu),
+        .perf_source_wait_dep_branch(perf_source_wait_dep_branch),
+        .perf_source_wait_store_addr(perf_source_wait_store_addr),
+        .perf_source_wait_store_data(perf_source_wait_store_data),
+        .perf_iq_no_ready(perf_iq_no_ready),
+        .perf_lsu_order       (perf_lsu_order),
+        .perf_serializing     (perf_serializing)
     );
 
     CompletionRouter u_completion_router (
@@ -168,7 +257,7 @@ module OooBackend (
         .rstn         (rstn),
         .recover_valid(recover_valid),
         .recover_id   (recover_id),
-        .alloc_valid  (dispatch_valid),
+        .alloc_valid  ({dispatch1_fire_comb, dispatch0_fire_comb}),
         .alloc_ready  (rob_alloc_ready),
         .alloc_id     (rob_alloc_id),
         .alloc_uop    (alloc_uop),
@@ -186,6 +275,8 @@ module OooBackend (
 
     assign commit0 = commit_internal[0];
     assign commit1 = commit_internal[1];
+    assign store_data_complete0 = complete[0];
+    assign store_data_complete1 = complete[1];
     assign perf_rob_occupancy = rob_occupancy;
     assign perf_issue_occupancy = scheduler_occupancy;
     assign perf_rob_block = (decode_valid[0] && !rob_alloc_ready[0]) ||
@@ -193,9 +284,6 @@ module OooBackend (
     assign perf_issue_queue_block =
                             (dispatch[0].valid && !scheduler_dispatch_ready[0]) ||
                             (dispatch[1].valid && !scheduler_dispatch_ready[1]);
-    assign perf_source_wait = (scheduler_occupancy != 0) &&
-                              !issue0_valid && !issue1_valid &&
-                              !system_issue_valid && !system_inflight;
     assign perf_serializing_block = system_inflight;
 
 endmodule
