@@ -1,1 +1,0 @@
-xsim {tb_lsu_mutation_sim} -testplusarg SEED=20260716 -testplusarg CYCLES=1000 -testplusarg TEST=mutation -testplusarg MIN_COVERAGE=90 -testplusarg STOP_ON_ERROR=1 -testplusarg STAGE=5 -autoloadwcfg -runall

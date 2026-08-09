@@ -1,9 +1,0 @@
-0.7
-2020.2
-Oct 13 2023
-20:47:58
-C:/Users/wanlinc/Desktop/Me/Loogn cpu v1/func_test/soc_verify/rtl/mycpu/backend_rename.vh,1783912762,verilog,,,,,,,,,,,,
-C:/Users/wanlinc/Desktop/Me/Loogn cpu v1/func_test/soc_verify/rtl/mycpu/cpu_types_pkg.sv,1784121910,systemVerilog,C:/Users/wanlinc/Desktop/Me/Loogn cpu v1/func_test/soc_verify/rtl/mycpu/privilege_system.sv;C:/Users/wanlinc/Desktop/Me/Loogn cpu v1/func_test/soc_verify/verification/unit/tb_privilege_supervisor.sv,C:/Users/wanlinc/Desktop/Me/Loogn cpu v1/func_test/soc_verify/rtl/mycpu/privilege_system.sv,C:/Users/wanlinc/Desktop/Me/Loogn cpu v1/func_test/soc_verify/rtl/mycpu/defines.vh,$unit_cpu_types_pkg_sv_3461101094;cpu_types_pkg,,,C:\Users\wanlinc\Desktop\Me\Loogn cpu v1\func_test\soc_verify\rtl\mycpu;C:\Users\wanlinc\Desktop\Me\Loogn cpu v1\func_test\soc_verify\verification\common,,,,,
-C:/Users/wanlinc/Desktop/Me/Loogn cpu v1/func_test/soc_verify/rtl/mycpu/defines.vh,1784281086,verilog,,,C:/Users/wanlinc/Desktop/Me/Loogn cpu v1/func_test/soc_verify/rtl/mycpu/backend_rename.vh,,,,,,,,,
-C:/Users/wanlinc/Desktop/Me/Loogn cpu v1/func_test/soc_verify/rtl/mycpu/privilege_system.sv,1784280157,systemVerilog,,C:/Users/wanlinc/Desktop/Me/Loogn cpu v1/func_test/soc_verify/verification/unit/tb_privilege_supervisor.sv,,PrivilegeSystem,,,C:\Users\wanlinc\Desktop\Me\Loogn cpu v1\func_test\soc_verify\rtl\mycpu;C:\Users\wanlinc\Desktop\Me\Loogn cpu v1\func_test\soc_verify\verification\common,,,,,
-C:/Users/wanlinc/Desktop/Me/Loogn cpu v1/func_test/soc_verify/verification/unit/tb_privilege_supervisor.sv,1784281795,systemVerilog,,,,tb_privilege_supervisor,,,C:\Users\wanlinc\Desktop\Me\Loogn cpu v1\func_test\soc_verify\rtl\mycpu;C:\Users\wanlinc\Desktop\Me\Loogn cpu v1\func_test\soc_verify\verification\common,,,,,

@@ -1,24 +1,47 @@
-# Vivado Project Gitignore
-
-# Logs
+# Generic build products
+*.bin
+*.o
+*.elf
+*.dcp
+*.veo
+*.vho
+*.hwh
+*.hdf
+*.bit
+*.ltx
+*.rpt
 *.jou
 *.log
-*.str
+*.wdb
+*.wcfg
+*.pb
+a.out
 
-# Backup and temp files
-*.backup.*
-*~
-*.dmp
-*.temp
+# Generated IP and netlists
+ipshared/
+*_netlist.*
+*_stub.*
 
-# Cache and build outputs
-.Xil/
-*.cache/
-*.hw/
-*.ip_user_files/
-*.runs/
-*.sim/
+# Vivado/XSim project output
+/.lint/
+**/.Xil/
+**/*.cache/
+**/*.hw/
+**/*.ip_user_files/
+**/*.runs/
+**/*.sim/
+**/xsim.dir/
+**/project/
+**/project_*/
+**/thinpad_top.tmp/
+**/thinpad_top.cache/
+**/thinpad_top.hw/
+**/thinpad_top.ip_user_files/
+**/thinpad_top.runs/
+**/thinpad_top.sim/
+**/min_area_pfile.tmp
 
-# OS files
-.DS_Store
-Thumbs.db
+# Local timing probes and scratch output
+**/_codex_*
+**/probe_results/
+**/probe_ips_*/

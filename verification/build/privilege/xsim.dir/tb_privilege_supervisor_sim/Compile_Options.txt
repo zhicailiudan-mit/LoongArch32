@@ -1,1 +1,0 @@
-"tb_privilege_supervisor" -s "tb_privilege_supervisor_sim" -debug "typical" -timescale "1ns/1ps" --override_timeunit --override_timeprecision -L "xil_defaultlib" -L "unisims_ver" -L "unimacro_ver" 

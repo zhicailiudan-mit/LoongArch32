@@ -1,1 +1,0 @@
-"tb_rob16_extended" -s "tb_rob16_extended_sim" -debug "typical" -timescale "1ns/1ps" --override_timeunit --override_timeprecision -L "xil_defaultlib" -L "unisims_ver" -L "unimacro_ver" 

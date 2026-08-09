@@ -1,1 +1,0 @@
-"tb_instruction_decoder" -s "tb_instruction_decoder_sim" -debug "typical" -timescale "1ns/1ps" --override_timeunit --override_timeprecision -L "xil_defaultlib" -L "unisims_ver" -L "unimacro_ver" 

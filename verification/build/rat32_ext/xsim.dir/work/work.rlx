@@ -1,8 +1,0 @@
-0.7
-2020.2
-Oct 13 2023
-20:47:58
-C:/Users/wanlinc/Desktop/Me/Loogn cpu v1/func_test/soc_verify/rtl/mycpu/RAT32.v,1784002197,systemVerilog,,C:/Users/wanlinc/Desktop/Me/Loogn cpu v1/func_test/soc_verify/verification/unit/tb_rat32_extended.sv,C:/Users/wanlinc/Desktop/Me/Loogn cpu v1/func_test/soc_verify/rtl/mycpu/defines.vh,RAT32,,,C:\Users\wanlinc\Desktop\Me\Loogn cpu v1\func_test\soc_verify\rtl\mycpu;C:\Users\wanlinc\Desktop\Me\Loogn cpu v1\func_test\soc_verify\verification\common,,,,,
-C:/Users/wanlinc/Desktop/Me/Loogn cpu v1/func_test/soc_verify/rtl/mycpu/backend_rename.vh,1783912762,verilog,,,,,,,,,,,,
-C:/Users/wanlinc/Desktop/Me/Loogn cpu v1/func_test/soc_verify/rtl/mycpu/defines.vh,1784003738,verilog,,,C:/Users/wanlinc/Desktop/Me/Loogn cpu v1/func_test/soc_verify/rtl/mycpu/backend_rename.vh,,,,,,,,,
-C:/Users/wanlinc/Desktop/Me/Loogn cpu v1/func_test/soc_verify/verification/unit/tb_rat32_extended.sv,1784200593,systemVerilog,,,C:/Users/wanlinc/Desktop/Me/Loogn cpu v1/func_test/soc_verify/rtl/mycpu/defines.vh,tb_rat32_extended,,,C:\Users\wanlinc\Desktop\Me\Loogn cpu v1\func_test\soc_verify\rtl\mycpu;C:\Users\wanlinc\Desktop\Me\Loogn cpu v1\func_test\soc_verify\verification\common,,,,,
