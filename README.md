@@ -1,32 +1,64 @@
-# LoongArch32 SoC
+# LoongArch32 SoC | 龙芯杯提交作品
 
-哈尔滨工业大学（深圳）龙芯杯 2026 个人赛初赛提交工程。仓库保留的是比赛提交版本，重点展示 LoongArch32 处理器、缓存、乱序后端以及 ThinPad SoC 集成代码；未完成时序收敛和功能回归。
+哈尔滨工业大学（深圳）龙芯杯 2026 个人赛初赛提交工程。
 
-## Repository layout
+这是我在本科阶段完成的第一项较完整的计算机系统工程实践，目标是将 LoongArch32 处理器集成到 ThinPad SoC 中，并完成 FPGA/Vivado 流程适配。项目最终结果没有达到预期，当前版本也没有完成完整功能回归和时序收敛；因此，本仓库不把它包装成获奖或已经成熟的处理器，而是保留为一份真实的处理器设计、工程实践和复盘记录。
+
+## 项目内容
+
+工程主要包含以下部分：
+
+- LoongArch32 双发射乱序处理器核心；
+- 前端取指、译码、分支预测和重定向恢复；
+- 寄存器重命名、ROB、Dispatch Queue、调度器和执行单元；
+- Load/Store Unit、Load Queue、Store Queue、访存桥和完成路径；
+- 指令缓存、数据缓存以及片上存储器接口；
+- ThinPad 板级顶层、时钟/存储器 IP 和 Vivado 工程流程。
+
+## 目录结构
 
 ```text
-src/soc/                 Synthesizable SoC RTL; top module: thinpad_top
-src/soc/mycpu/           CPU core, frontend, backend, cache and memory system
-src/soc/xilinx_ip/       Xilinx IP configuration files (.xci/.xcix)
-run_vivado/constraints/  Board pin, clock and timing constraints
-run_vivado/flow/         Vivado project, implementation and timing helpers
-run_vivado/simulation/   Board/SRAM simulation models supplied by the template
-asm/                     LoongArch assembly example and build files
+src/soc/                 可综合 SoC RTL；顶层模块为 thinpad_top
+src/soc/mycpu/           CPU 前端、乱序后端、缓存和访存系统
+src/soc/xilinx_ip/       Xilinx IP 配置文件（.xci/.xcix）
+run_vivado/constraints/  板级引脚、时钟和时序约束
+run_vivado/flow/         Vivado 建工程、综合实现和时序辅助脚本
+run_vivado/simulation/   板级和 SRAM 仿真模型
+asm/                     LoongArch 汇编示例和编译文件
 ```
 
-## Building the Vivado project
+## Vivado 工程
 
-The project-generation script expects to be launched from Vivado's Tcl console:
+在 Vivado Tcl Console 中执行：
 
 ```tcl
 cd run_vivado
 source flow/create_vivado_project.tcl
 ```
 
-The script targets the `xc7a200tfbg676-2` device and sets `thinpad_top` as the top-level module. Implementation and bitstream helper scripts are in `run_vivado/flow/`.
+工程脚本目标器件为 `xc7a200tfbg676-2`，顶层模块为 `thinpad_top`。综合、实现、生成 bitstream 和辅助检查脚本位于 `run_vivado/flow/`。
 
-## Notes
+## 当前状态与证据边界
 
-- Generated Vivado/XSim directories, reports, waveforms, checkpoints and binaries are intentionally excluded from version control.
-- Timing and functional behavior depend on the Vivado version, board constraints and the exact RTL revision. Check the generated reports before drawing performance conclusions.
-- The repository is kept as a clean submission snapshot; experimental debugging work belongs outside this public repository.
+- 这是比赛提交版本，不是已经完成时序收敛的版本；当前版本的 WNS 不能作为正时序裕量结果对外宣称。
+- 仓库中的 RTL、约束和流程文件保留了工程输入；Vivado/XSim 生成目录、报告、波形、checkpoint 和二进制文件不纳入版本控制。
+- “代码能够静态编译”“定向测试通过”“完整 Trace 通过”“实现后时序通过”是不同等级的证据，不能相互替代。
+- 若要复现实验，应在指定器件、约束和 Vivado 版本下重新生成工程，并以新的日志和报告为准。
+
+## 工程反思
+
+参赛过程中使用了 AI 辅助阅读代码、整理日志、编写脚本和提出修改候选。但这次经历也让我明确：在乱序处理器这类高耦合工程中，AI 不能替代工程判断和验证，生成代码的速度也不能等同于项目进展。
+
+这次项目留下的主要方法论是：
+
+1. 先建立可复现、可回退的功能基线，再做性能和时序优化。
+2. 一个阶段只推进一个高风险结构性实验，并明确停止条件。
+3. 每个结论都区分事实、推断和未经验证的假设。
+4. 只保留一个权威工程状态，用 Git 和实验记录保存上下文，而不是依赖聊天记忆。
+5. 截止时间前冻结功能，把时间留给回归、打包和意外问题。
+
+这份仓库的价值不在于一个比赛名次，而在于记录一次从处理器设计、AI 协作到工程管理的完整实践，以及一次没有达到目标之后如何重新建立可靠工作方式。
+
+## 版本管理说明
+
+本仓库只保留提交工程。实验性调试代码、仿真生成物和本地时序探针应放在独立的工作目录，不应直接混入公开提交树。
